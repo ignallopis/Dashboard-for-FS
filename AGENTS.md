@@ -57,5 +57,37 @@ def load_data(path: str) -> pl.DataFrame:
 ## Interactive charts
 - All charts use `template="plotly_dark"`
 - Every chart that shows multi-lap data must include a lap selector
-- The dashboard supports loading multiple CSV files simultaneously
-- Track section filters are defined interactively via GPS map selections (`VN_latitude` vs `VN_longitude`)
+- The dashboard supports loading multiple CSV files simultaneously; a run selector switches between them and all charts update accordingly
+- Track section filters are defined interactively by the user drawing selections on a GPS map (`VN_latitude` vs `VN_longitude`)
+
+## Dashboard run selector
+```python
+from pathlib import Path
+import streamlit as st
+
+csv_files = list(Path("data/").glob("*.csv"))
+selected = st.selectbox("Select run", csv_files)
+df = load_data(selected)
+```
+
+## GG diagram
+- Axes: `ay` (lateral, x) vs `ax` (longitudinal, y), equal scale
+- One color per lap; fastest lap = purple, rest = RdYlGn gradient
+- Pool indices stored in `customdata` per point for cross-chart linking
+- No lap legend on the GG diagram itself; lap selector is shared globally
+
+## Cross-chart interaction pattern
+- Selecting points on any chart stores pool indices in `st.session_state`
+- A version counter (`_gg_ver`, `_cross_ver`) triggers `st.rerun()` to sync all charts
+- `zone_mask`: boolean array over pool indices from track map selection, passed as `extra_mask` to distance charts
+- `extra_mask` parameter in `add_dist_traces` ANDs with per-lap mask to filter plotted points
+
+## Lap selector
+- Sorted fastest → slowest by laptime
+- Color squares shown next to each lap label using `st.markdown(..., unsafe_allow_html=True)`
+- Format (single CSV): `L{lap}  ({laptime:.2f}s)`
+- Format (multi CSV): `{run} · L{lap}  ({laptime:.2f}s)`
+
+## Vehicle signals
+Full signal list and descriptions are in `.claude/Variables_CSV.pdf`.
+Read it when you need to understand what a signal means or what units it uses.
