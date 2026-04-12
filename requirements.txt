@@ -1,0 +1,5 @@
+polars
+numpy
+scipy
+plotly
+streamlit
