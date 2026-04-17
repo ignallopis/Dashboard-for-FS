@@ -1,93 +1,73 @@
-# CAT17x Data Analysis — Agent Context
+# Codex Agent — CAT17x
 
-## Role
-Expert in motorsport data analysis for a Formula Student electric team (4WD).
-Goal: extract actionable insights from vehicle telemetry data to improve
-car performance, validate control systems and support setup decisions.
+## Project
+Formula Student 4WD electric telemetry analysis.
+One motor per wheel (FL, FR, RL, RR).
+No hay frenada hidraulica,solo regenerativa
+Active systems: Torque Vectoring (TV), Traction Control (TC), Regenerative Braking (RB).
+Optimal slip ratio: +0.20 acceleration (TC), −0.20 braking (RB).
 
-## The car
-- 4WD electric, one motor per wheel
-- Active control systems: Torque Vectoring (TV), Traction Control (TC),
-  Regenerative Braking (RB), Power Control (PC)
-- Optimal SR acceleration: +0.20 (TC)
-- Optimal SR braking: -0.20 (RB)
 
-## Analysis categories
-- Powertrain
-- Vehicle dynamics
-- Vehicle Controls: Torque Vectoring (TV), Traction Control (TC), Regenerative Braking (RB)
-- Driver Performance
+## Data loading
+- Entry point: `utils.load_data(path)` — handles filtering and adds `dt_s` column;
+  raises `ValueError` if the CSV has no valid laps (trigger `lapcount` first).
+- Lap detection: `src.lapcount.csv_needs_lap_detection(path)` + `detect_and_write_laps(path)`
+  auto-detect laps from GPS and overwrite the CSV with `laps` / `laptime` columns.
+  The dashboard runs this at startup for every CSV in `data/` that lacks laps.
+  `detect_and_write_laps` sweeps a fallback ladder of `(min_vel, gate_half_width)`
+  pairs because the start gate is placed at the first high-speed GPS sample —
+  too-low `min_vel` puts the gate on the paddock push-off, not on the real line.
+- No utilizar en los calculos lap 0 y la ultima vuelta
+- Signal reference: `.claude/Variables_CSV.pdf`
+- Boolean columns are float64 — compare with `== 1.0`
+- Full signal list and units in `Variables_CSV.pdf`
 
-## Data
-- CSV at 100 Hz, TimeStamp in seconds
-- Standard filter: `laps > 0 AND laptime.is_not_nan()`
-- Boolean CSV columns are float64: compare with `== 1.0`
-- TimeStamp in seconds (not ms)
-
-## Libraries
-- **Polars** — data manipulation (not pandas)
-- **Plotly** — all charts (interactive, `template="plotly_dark"`)
-- **Streamlit** — dashboard
-- **NumPy / SciPy** — numerical computation
-
-## Code style
-- All code and comments in English
-- Functions with type hints
-- One function = one metric
-- Units in variable names: `torque_nm`, `velocity_ms`, `temp_c`
+## Stack
+Polars (not pandas), Plotly dark theme, Streamlit, NumPy, SciPy
 
 ## Project structure
-- `app.py` — main Streamlit dashboard
-- `utils.py` — shared utilities
-- `src/powertrain.py`, `src/dynamics.py`, `src/tc.py`, `src/tv.py`, `src/rb.py`, `src/pilot.py`
+- `data/` — CSV files
+- `src/dashboard.py` — Streamlit entry point: `streamlit run src/dashboard.py`
+- `src/tc.py` — TC metrics and figures
+- `src/tv.py` — TV metrics and figures
+- `src/dynamics.py` — dynamics metrics and figures
+- `src/driver.py` — driver performance metrics and figures
+- `src/powertrain.py` — powertrain metrics and figures
+- `src/lapcount.py` — lap detection from GPS
+- `utils.py` — colours, dark theme, shared data helpers
 
-## Load data pattern
-```python
-import polars as pl
+## Code conventions
+- English code and comments, type hints, units in variable names
+- One function = one metric or one figure
+- `src/` modules return `go.Figure` — never render directly
+- `src/dashboard.py` is the only file that calls `st.plotly_chart()`
+- Colours and theme constants live in `utils.py`
 
-def load_data(path: str) -> pl.DataFrame:
-    df = pl.read_csv(path)
-    df = df.filter((pl.col("laps") > 0) & pl.col("laptime").is_not_nan())
-    df = df.with_columns(
-        pl.col("TimeStamp").diff().fill_null(0.01).alias("dt_s")
-    )
-    return df
-```
+## Dashboard
+- Sidebar: CSV file selector, lap selector, active systems filter
+- Tabs: Dynamics | Powertrain | TC | TV | RB | Driver
+- Each tab groups all relevant signals and metrics for that system
+- Plots share x-axis (distance [m]), stacked vertically within each tab
 
-## Interactive charts
-- All charts use `template="plotly_dark"`
-- Every chart that shows multi-lap data must include a lap selector
-- The dashboard supports loading multiple CSV files simultaneously; a run selector switches between them and all charts update accordingly
-- Track section filters are defined interactively by the user drawing selections on a GPS map (`VN_latitude` vs `VN_longitude`)
+## Analysis categories and key signals
+- **Powertrain**: motor torques, currents, temperatures, power per wheel, SoC
+- **Dynamics**: vx, ax, ay, slip ratio, slip angle, tyre forces, GG diagram
+- **TC**: slip ratio per wheel vs ±0.20 reference, TC torque limits, TC enable
+- **TV**: yaw rate error, Mz tracking (desired vs actual), torque distribution
+- **RB**: regenerative torque per wheel, brake balance, SR vs −0.20 reference
+- **Driver**: lap times, delta, throttle, brake, steering
+  - Throttle KPIs (`src/driver.py`): histogram, full-throttle time (TP > 95 %),
+    throttle speed = median |dTP/dt| with TP < 100 % and brake released.
+    Median is used because mean is dominated by 100 Hz transients.
+  - All driver figures take a `dfs` dict and overlay multiple runs (driver-vs-driver).
 
-## Dashboard run selector
-```python
-from pathlib import Path
-import streamlit as st
+## Visual constants
+- Wheel colours: FL=#4DB3F2, FR=#F28C40, RL=#73D973, RR=#D973D9
+- Lap colours: purple (fastest) → RdYlGn gradient → red (slowest)
+- Reference lines: SR=+0.20 (TC), SR=−0.20 (RB)
+- Dark theme constants in `utils.py`
 
-csv_files = list(Path("data/").glob("*.csv"))
-selected = st.selectbox("Select run", csv_files)
-df = load_data(selected)
-```
-
-## GG diagram
-- Axes: `ay` (lateral, x) vs `ax` (longitudinal, y), equal scale
-- One color per lap; fastest lap = purple, rest = RdYlGn gradient
-- Pool indices stored in `customdata` per point for cross-chart linking
-- No lap legend on the GG diagram itself; lap selector is shared globally
-
-## Cross-chart interaction pattern
-- Selecting points on any chart stores pool indices in `st.session_state`
-- A version counter (`_gg_ver`, `_cross_ver`) triggers `st.rerun()` to sync all charts
-- `zone_mask`: boolean array over pool indices from track map selection, passed as `extra_mask` to distance charts
-- `extra_mask` parameter in `add_dist_traces` ANDs with per-lap mask to filter plotted points
-
-## Lap selector
-- Sorted fastest → slowest by laptime
-- Color squares shown next to each lap label using `st.markdown(..., unsafe_allow_html=True)`
-- Format (single CSV): `L{lap}  ({laptime:.2f}s)`
-- Format (multi CSV): `{run} · L{lap}  ({laptime:.2f}s)`
-
-## Vehicle signals
-Full signal list and descriptions are in `.claude/Variables_CSV.pdf`.
-Read it when you need to understand what a signal means or what units it uses.
+## Behaviour
+- Flag any function that renders directly instead of returning `go.Figure`
+- Challenge physical correctness of metrics against signal definitions
+- Flag anything overcomplicated for a Formula Student team
