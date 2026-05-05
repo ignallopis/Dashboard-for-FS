@@ -11,8 +11,10 @@ Two ways to use it:
   every CSV that does not have them yet.
 """
 from __future__ import annotations
+import os
 import pathlib
-from typing import Any
+import tempfile
+from typing import Any, Literal
 
 import numpy as np
 import polars as pl
@@ -20,8 +22,23 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.ndimage import uniform_filter1d
 
+from utils import cols_to_numpy, read_telemetry_csv
+
 # ── Default detection parameters ──────────────────────────────────────────────
 _EARTH_RADIUS_M = 6_378_137.0
+_LAPCOUNT_ALGO_VERSION = 3
+_LAPCOUNT_VERSION_COL = 'lapcount_version'
+_LAPCOUNT_MIN_VEL_COL = 'lapcount_min_vel_mps'
+_LAPCOUNT_GATE_HALF_WIDTH_COL = 'lapcount_gate_half_width_m'
+_LAPCOUNT_GATE_TIME_COL = 'lapcount_gate_time_s'
+_LAPCOUNT_DETECTED_LAPS_COL = 'lapcount_detected_laps'
+_LAPCOUNT_GATE_LON0_COL = 'lapcount_gate_lon0_deg'
+_LAPCOUNT_GATE_LAT0_COL = 'lapcount_gate_lat0_deg'
+_LAPCOUNT_GATE_LON1_COL = 'lapcount_gate_lon1_deg'
+_LAPCOUNT_GATE_LAT1_COL = 'lapcount_gate_lat1_deg'
+_LAPCOUNT_MODE_COL = 'lapcount_mode'
+
+LapCountMode = Literal['circuit', 'acceleration', 'skidpad']
 
 AUTO_PARAMS: dict[str, Any] = {
     'sample_hz':       100,       # fallback sample rate if dt cannot be computed
@@ -32,6 +49,21 @@ AUTO_PARAMS: dict[str, Any] = {
     'max_lap_time':    200.0,     # [s]  reject crossings slower than this
     'dir_window':      10,        # samples used to estimate gate tangent direction
     'smooth_window':   5,         # moving-average window for GPS smoothing
+}
+
+ACCELERATION_PARAMS: dict[str, Any] = {
+    **AUTO_PARAMS,
+    'min_vel': 1.0,          # [m/s] ROS lapcount default
+    'dist_max': 3.0,         # [m]   ROS finish-line distance tolerance
+    'accel_distance': 75.0,  # [m]   Formula Student acceleration finish
+}
+
+SKIDPAD_PARAMS: dict[str, Any] = {
+    **AUTO_PARAMS,
+    'min_vel': 1.0,          # [m/s] ROS lapcount default
+    'rearm_distance': 3.0,   # [m]   equivalent to ROS distMax near-line latch
+    'dist_max': 3.0,         # [m]   ROS finish-line distance tolerance
+    'min_lap_time': 1.0,
 }
 
 # Progressive fallbacks tried when the default params yield no laps.
@@ -51,11 +83,114 @@ _AUTO_FALLBACKS: tuple[dict[str, Any], ...] = (
 def gps_to_local_xy(lat: np.ndarray, lon: np.ndarray
                      ) -> tuple[np.ndarray, np.ndarray]:
     """Convert GPS (lat, lon) to local ENU (x, y) in metres relative to first sample."""
-    lat0 = lat[0]
-    lon0 = lon[0]
-    x = np.deg2rad(lon - lon0) * _EARTH_RADIUS_M * np.cos(np.deg2rad(lat0))
-    y = np.deg2rad(lat - lat0) * _EARTH_RADIUS_M
+    x, y = gps_to_local_xy_from_origin(lat, lon, float(lat[0]), float(lon[0]))
     return x, y
+
+
+def gps_to_local_xy_from_origin(
+    lat_deg: np.ndarray,
+    lon_deg: np.ndarray,
+    lat0_deg: float,
+    lon0_deg: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert GPS (lat, lon) to local ENU (x, y) in metres from a given origin."""
+    x = np.deg2rad(lon_deg - lon0_deg) * _EARTH_RADIUS_M * np.cos(np.deg2rad(lat0_deg))
+    y = np.deg2rad(lat_deg - lat0_deg) * _EARTH_RADIUS_M
+    return x, y
+
+
+def _haversine_distance_m(
+    lat0_deg: float,
+    lon0_deg: float,
+    lat1_deg: float,
+    lon1_deg: float,
+) -> float:
+    """Great-circle distance between two GPS points in metres."""
+    lat0 = np.deg2rad(lat0_deg)
+    lat1 = np.deg2rad(lat1_deg)
+    dlat = lat1 - lat0
+    dlon = np.deg2rad(lon1_deg - lon0_deg)
+    a = (
+        np.sin(dlat / 2.0) ** 2
+        + np.cos(lat0) * np.cos(lat1) * np.sin(dlon / 2.0) ** 2
+    )
+    return float(_EARTH_RADIUS_M * 2.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a)))
+
+
+def _first_finite_value(df: pl.DataFrame, column: str) -> float | None:
+    """Return the first finite numeric value from *column*, or None."""
+    if column not in df.columns:
+        return None
+    values = cols_to_numpy(df, [column])[column]
+    finite = values[np.isfinite(values)]
+    if len(finite) == 0:
+        return None
+    return float(finite[0])
+
+
+def _normalise_lapcount_mode(mode: str | None) -> LapCountMode:
+    """Map dashboard/event labels to the lapcount strategy used for detection."""
+    if mode is None:
+        return 'circuit'
+    key = mode.strip().lower().replace('-', '_').replace(' ', '_')
+    aliases: dict[str, LapCountMode] = {
+        'auto': 'circuit',
+        'autox': 'circuit',
+        'auto_x': 'circuit',
+        'circuit': 'circuit',
+        'endurance': 'circuit',
+        'trackdrive': 'circuit',
+        'track_drive': 'circuit',
+        'accel': 'acceleration',
+        'acceleration': 'acceleration',
+        'skidpad': 'skidpad',
+        'skid_pad': 'skidpad',
+    }
+    try:
+        return aliases[key]
+    except KeyError as exc:
+        valid = ', '.join(sorted(aliases))
+        raise ValueError(f'Unknown lapcount mode {mode!r}. Expected one of: {valid}.') from exc
+
+
+def _trajectory_tangent_at_index(
+    xg: np.ndarray,
+    yg: np.ndarray,
+    idx: int,
+    window: int,
+) -> np.ndarray:
+    """Return the local trajectory tangent near *idx*."""
+    N = len(xg)
+    i1 = max(0, int(idx) - int(window))
+    i2 = min(N - 1, int(idx) + int(window))
+    dx = float(xg[i2] - xg[i1])
+    dy = float(yg[i2] - yg[i1])
+    norm = float(np.hypot(dx, dy))
+    if norm < 1e-6:
+        raise ValueError('Cannot determine heading direction from GPS.')
+    return np.array([dx, dy], dtype=float) / norm
+
+
+def _gate_lonlat_from_local(
+    prep: dict[str, Any],
+    finish_x: float,
+    finish_y: float,
+    t_hat: np.ndarray,
+    half_width_m: float,
+) -> tuple[float, float, float, float]:
+    """Return a local gate line as lon0, lat0, lon1, lat1."""
+    gate_t = np.array([-half_width_m, half_width_m], dtype=float)
+    gate_x = finish_x + gate_t * t_hat[0]
+    gate_y = finish_y + gate_t * t_hat[1]
+    gate_lat, gate_lon = local_xy_to_gps(
+        gate_x, gate_y, prep['lat0_deg'], prep['lon0_deg'],
+    )
+    return (
+        float(gate_lon[0]),
+        float(gate_lat[0]),
+        float(gate_lon[1]),
+        float(gate_lat[1]),
+    )
 
 
 def local_xy_to_gps(
@@ -78,9 +213,10 @@ def _prepare_detection_inputs(df: pl.DataFrame) -> dict[str, Any]:
     if missing:
         raise KeyError(f'missing required columns: {", ".join(missing)}')
 
-    t_abs_full = df['TimeStamp'].to_numpy().astype(float)
-    lat_full = df['VN_latitude'].to_numpy().astype(float)
-    lon_full = df['VN_longitude'].to_numpy().astype(float)
+    cols = cols_to_numpy(df, ["TimeStamp", "VN_latitude", "VN_longitude"])
+    t_abs_full = cols["TimeStamp"]
+    lat_full = cols["VN_latitude"]
+    lon_full = cols["VN_longitude"]
     gps_valid = (
         np.isfinite(t_abs_full)
         & np.isfinite(lat_full)
@@ -134,26 +270,38 @@ def _run_detection_attempts(
     speed_gps: np.ndarray,
     t: np.ndarray,
     params: dict | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float, np.ndarray, dict[str, Any]] | None:
-    """Try the configured parameter ladder and return the selected gate metadata."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, float, float, np.ndarray, dict[str, Any]] | None:
+    """Try the configured parameter ladder and return the best gate metadata.
+
+    With auto params we keep the fallback order as a strictness ladder, but we do
+    not stop at the first non-zero result. Some runs produce a few false-acceptable
+    crossings with the strict gate and the full lap set with the next fallback, so
+    we select the attempt with the highest crossing count and keep the first one on
+    ties.
+    """
     attempts: tuple[dict[str, Any], ...]
     if params is None:
         attempts = _AUTO_FALLBACKS
     else:
         attempts = ({**AUTO_PARAMS, **params},)
 
-    last_result: tuple[np.ndarray, np.ndarray, np.ndarray, float, float, np.ndarray, dict[str, Any]] | None = None
+    best_result: tuple[np.ndarray, np.ndarray, np.ndarray, int, float, float, np.ndarray, dict[str, Any]] | None = None
+    best_crossings = -1
     for override in attempts:
         cand = {**AUTO_PARAMS, **override}
         try:
             result = detect_laps(xg, yg, speed_gps, t, cand)
         except ValueError:
             continue
-        last_result = (*result, cand)
-        if len(result[0]) > 0 or params is not None:
-            return last_result
+        full_result = (*result, cand)
+        n_crossings = int(len(result[0]))
+        if params is not None:
+            return full_result
+        if n_crossings > best_crossings:
+            best_result = full_result
+            best_crossings = n_crossings
 
-    return last_result
+    return best_result
 
 
 def lap_detection_gate_from_df(
@@ -161,14 +309,61 @@ def lap_detection_gate_from_df(
     params: dict | None = None,
 ) -> dict[str, Any] | None:
     """Return the detected lap gate in GPS coordinates for map overlays."""
+    if params is None and _LAPCOUNT_VERSION_COL in df.columns:
+        version = _first_finite_value(df, _LAPCOUNT_VERSION_COL)
+        if version is not None and int(version) == _LAPCOUNT_ALGO_VERSION:
+            lon0 = _first_finite_value(df, _LAPCOUNT_GATE_LON0_COL)
+            lat0 = _first_finite_value(df, _LAPCOUNT_GATE_LAT0_COL)
+            lon1 = _first_finite_value(df, _LAPCOUNT_GATE_LON1_COL)
+            lat1 = _first_finite_value(df, _LAPCOUNT_GATE_LAT1_COL)
+            gate_half_width_m = _first_finite_value(df, _LAPCOUNT_GATE_HALF_WIDTH_COL)
+            gate_time_s = _first_finite_value(df, _LAPCOUNT_GATE_TIME_COL)
+            min_vel_mps = _first_finite_value(df, _LAPCOUNT_MIN_VEL_COL)
+            mode_s = (
+                str(df[_LAPCOUNT_MODE_COL].drop_nulls()[0])
+                if _LAPCOUNT_MODE_COL in df.columns and len(df[_LAPCOUNT_MODE_COL].drop_nulls()) > 0
+                else 'circuit'
+            )
+            if None not in (lon0, lat0, lon1, lat1):
+                finish_lon = 0.5 * (float(lon0) + float(lon1))
+                finish_lat = 0.5 * (float(lat0) + float(lat1))
+                if gate_half_width_m is None:
+                    gate_half_width_m = 0.5 * _haversine_distance_m(
+                        float(lat0), float(lon0), float(lat1), float(lon1),
+                    )
+                return {
+                    'finish_lat': finish_lat,
+                    'finish_lon': finish_lon,
+                    'gate_lat': np.array([float(lat0), float(lat1)], dtype=float),
+                    'gate_lon': np.array([float(lon0), float(lon1)], dtype=float),
+                    'crossing_idx': np.array([], dtype=int),
+                    'crossing_times_s': np.array([], dtype=float),
+                    'lap_durations_s': np.array([], dtype=float),
+                    'gate_idx': None,
+                    'gate_time_s': gate_time_s,
+                    'gate_half_width_m': float(gate_half_width_m),
+                    'rearm_distance_m': float(AUTO_PARAMS['rearm_distance']),
+                    'min_vel_mps': min_vel_mps,
+                    'lapcount_version': int(version),
+                    'lapcount_mode': mode_s,
+                }
+
     prep = _prepare_detection_inputs(df)
+    if params is None and _LAPCOUNT_MIN_VEL_COL in df.columns and _LAPCOUNT_GATE_HALF_WIDTH_COL in df.columns:
+        min_vel = _first_finite_value(df, _LAPCOUNT_MIN_VEL_COL)
+        gate_half_width = _first_finite_value(df, _LAPCOUNT_GATE_HALF_WIDTH_COL)
+        if min_vel is not None and gate_half_width is not None:
+            params = {
+                'min_vel': float(min_vel),
+                'gate_half_width': float(gate_half_width),
+            }
     result = _run_detection_attempts(
         prep['xg'], prep['yg'], prep['speed_gps'], prep['t'], params=params,
     )
     if result is None:
         return None
 
-    crossing_idx, crossing_times, lap_durations, finish_x, finish_y, t_hat, used_params = result
+    crossing_idx, crossing_times, lap_durations, gate_idx, finish_x, finish_y, t_hat, used_params = result
     gate_span_m = float(used_params['gate_half_width']) * 1.5
     gate_t = np.array([-gate_span_m, gate_span_m], dtype=float)
     gate_x = finish_x + gate_t * t_hat[0]
@@ -189,9 +384,13 @@ def lap_detection_gate_from_df(
         'crossing_idx': crossing_idx,
         'crossing_times_s': crossing_times,
         'lap_durations_s': lap_durations,
+        'gate_idx': int(gate_idx),
+        'gate_time_s': float(prep['t'][gate_idx]),
         'gate_half_width_m': float(used_params['gate_half_width']),
         'rearm_distance_m': float(used_params['rearm_distance']),
         'min_vel_mps': float(used_params['min_vel']),
+        'lapcount_version': int(_LAPCOUNT_ALGO_VERSION),
+        'lapcount_mode': 'circuit',
     }
 
 
@@ -200,7 +399,7 @@ def lap_detection_gate_from_csv(
     params: dict | None = None,
 ) -> dict[str, Any] | None:
     """Load a CSV and return its lap-detection gate for dashboard overlays."""
-    return lap_detection_gate_from_df(pl.read_csv(str(csv_path)), params=params)
+    return lap_detection_gate_from_df(read_telemetry_csv(str(csv_path)), params=params)
 
 
 # ── Lap detection ─────────────────────────────────────────────────────────────
@@ -208,13 +407,14 @@ def lap_detection_gate_from_csv(
 def detect_laps(xg: np.ndarray, yg: np.ndarray,
                 speed: np.ndarray, t: np.ndarray,
                 params: dict
-                ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float, np.ndarray]:
+                ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, float, float, np.ndarray]:
     """Detect lap crossings from smoothed GPS trajectory.
 
     Returns:
         crossing_idx   – sample indices of each valid crossing
         crossing_times – time [s] of each crossing
         lap_durations  – duration [s] of each completed lap
+        gate_idx       – sample index used to anchor the start/finish gate
         finish_x, finish_y – gate centre in local XY
         t_hat          – unit tangent vector of the gate
     """
@@ -246,7 +446,7 @@ def detect_laps(xg: np.ndarray, yg: np.ndarray,
     crossing_idx: list[int]   = []
     crossing_times: list[float] = []
     lap_durations: list[float]  = []
-    last_cross_time = 0.0
+    last_cross_time = float(t[start_idx])
     armed = False
 
     for k in range(start_idx + 1, N):
@@ -273,77 +473,502 @@ def detect_laps(xg: np.ndarray, yg: np.ndarray,
         np.array(crossing_idx, dtype=int),
         np.array(crossing_times),
         np.array(lap_durations),
+        start_idx,
         finish_x, finish_y, t_hat,
     )
 
 
-def build_lap_samples(crossing_idx: np.ndarray,
+def build_lap_samples(gate_idx: int,
+                      crossing_idx: np.ndarray,
                       lap_durations: np.ndarray,
                       N: int
                       ) -> tuple[np.ndarray, np.ndarray]:
-    """Build per-sample ``laps`` and ``laptime`` arrays (NaN before first crossing)."""
+    """Build per-sample ``laps`` and ``laptime`` arrays from the detected gate.
+
+    Samples before the gate anchor are labelled as lap 0. Complete laps start at
+    the gate anchor (lap 1) and each subsequent crossing starts the next lap.
+    Samples after the last detected crossing are left NaN because that trailing
+    segment is an incomplete lap.
+    """
     laps_s    = np.full(N, np.nan)
     laptime_s = np.full(N, np.nan)
 
-    if len(crossing_idx) == 0:
+    if N <= 0:
         return laps_s, laptime_s
 
-    laps_s[:crossing_idx[0]] = 0  # formation lap → 0
+    gate_idx = int(np.clip(gate_idx, 0, N - 1))
+    laps_s[:gate_idx] = 0
 
-    for i, (cidx, ldur) in enumerate(zip(crossing_idx, lap_durations)):
-        end = int(crossing_idx[i + 1]) - 1 if i < len(crossing_idx) - 1 else N - 1
-        laps_s[cidx:end + 1]    = i + 1
-        laptime_s[cidx:end + 1] = ldur
+    if len(crossing_idx) == 0:
+        laps_s[gate_idx:] = 0
+        return laps_s, laptime_s
+
+    start = gate_idx
+    for lap_id, (cidx, ldur) in enumerate(zip(crossing_idx, lap_durations), start=1):
+        end = int(np.clip(cidx, start, N))
+        if end > start:
+            laps_s[start:end]    = float(lap_id)
+            laptime_s[start:end] = float(ldur)
+        start = end
 
     return laps_s, laptime_s
+
+
+def build_manual_lap_samples(
+    crossing_idx: np.ndarray,
+    lap_durations: np.ndarray,
+    N: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build per-sample laps from a user-defined gate line.
+
+    The gate exists independently of the telemetry start, so lap 0 spans from
+    the file start until the first crossing. Full laps begin at the first
+    accepted crossing and end at the next one.
+    """
+    laps_s = np.full(N, np.nan)
+    laptime_s = np.full(N, np.nan)
+    if N <= 0:
+        return laps_s, laptime_s
+    if len(crossing_idx) == 0:
+        laps_s[:] = 0
+        return laps_s, laptime_s
+
+    first_cross = int(np.clip(crossing_idx[0], 0, N))
+    laps_s[:first_cross] = 0
+
+    if len(crossing_idx) < 2 or len(lap_durations) == 0:
+        return laps_s, laptime_s
+
+    for lap_id, ldur in enumerate(lap_durations, start=1):
+        start = int(np.clip(crossing_idx[lap_id - 1], 0, N))
+        end = int(np.clip(crossing_idx[lap_id], start, N))
+        if end > start:
+            laps_s[start:end] = float(lap_id)
+            laptime_s[start:end] = float(ldur)
+
+    return laps_s, laptime_s
+
+
+def detect_acceleration_run(
+    xg: np.ndarray,
+    yg: np.ndarray,
+    speed: np.ndarray,
+    t: np.ndarray,
+    params: dict,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int, float, float, np.ndarray]:
+    """Detect the 75 m Formula Student acceleration run.
+
+    This mirrors the ROS mission 0 logic: once the car reaches ``min_vel``, the
+    finish line is placed ``accel_distance`` metres ahead in the current heading
+    direction and the run ends when the trace crosses that line within
+    ``dist_max`` metres of its centre.
+    """
+    moving = np.where(speed > params['min_vel'])[0]
+    if len(moving) == 0:
+        raise ValueError('No movement found — check GPS or min_vel.')
+    start_idx = int(moving[0])
+
+    heading_hat = _trajectory_tangent_at_index(
+        xg, yg, start_idx, int(params['dir_window']),
+    )
+    finish_x = float(xg[start_idx] + float(params['accel_distance']) * heading_hat[0])
+    finish_y = float(yg[start_idx] + float(params['accel_distance']) * heading_hat[1])
+    t_hat = np.array([-heading_hat[1], heading_hat[0]], dtype=float)
+
+    signed_dist = (xg - finish_x) * heading_hat[0] + (yg - finish_y) * heading_hat[1]
+    dist_to_finish = np.hypot(xg - finish_x, yg - finish_y)
+    finish_idx: int | None = None
+    for k in range(start_idx + 1, len(xg)):
+        crossed = (signed_dist[k - 1] <= 0.0) and (signed_dist[k] > 0.0)
+        in_window = float(dist_to_finish[k]) <= float(params['dist_max'])
+        if crossed and in_window:
+            finish_idx = k
+            break
+
+    if finish_idx is None:
+        after_finish = np.where(signed_dist[start_idx + 1:] > 0.0)[0]
+        if len(after_finish) == 0:
+            raise ValueError('Acceleration finish line was not reached.')
+        candidates = after_finish + start_idx + 1
+        finish_idx = int(candidates[int(np.argmin(dist_to_finish[candidates]))])
+
+    duration_s = float(t[finish_idx] - t[start_idx])
+    if duration_s <= 0.0 or not np.isfinite(duration_s):
+        raise ValueError('Acceleration run has invalid duration.')
+
+    return (
+        np.array([finish_idx], dtype=int),
+        np.array([float(t[finish_idx])], dtype=float),
+        np.array([duration_s], dtype=float),
+        start_idx,
+        finish_idx,
+        finish_x,
+        finish_y,
+        t_hat,
+    )
+
+
+def build_acceleration_samples(
+    start_idx: int,
+    finish_idx: int,
+    duration_s: float,
+    N: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build one timed segment for acceleration: lap 1 is start to 75 m."""
+    laps_s = np.full(N, np.nan)
+    laptime_s = np.full(N, np.nan)
+    if N <= 0:
+        return laps_s, laptime_s
+
+    start = int(np.clip(start_idx, 0, N - 1))
+    end = int(np.clip(finish_idx, start + 1, N))
+    laps_s[:start] = 0.0
+    laps_s[start:end] = 1.0
+    laptime_s[start:end] = float(duration_s)
+    return laps_s, laptime_s
+
+
+def _manual_gate_geometry(
+    prep: dict[str, Any],
+    gate_line_lonlat: tuple[tuple[float, float], tuple[float, float]],
+) -> tuple[float, float, np.ndarray, float]:
+    """Convert a manual gate line in GPS to local XY geometry for one run."""
+    gate_lon = np.array([gate_line_lonlat[0][0], gate_line_lonlat[1][0]], dtype=float)
+    gate_lat = np.array([gate_line_lonlat[0][1], gate_line_lonlat[1][1]], dtype=float)
+    if not np.all(np.isfinite(gate_lon)) or not np.all(np.isfinite(gate_lat)):
+        raise ValueError('Manual gate line must contain finite GPS coordinates.')
+
+    gate_x, gate_y = gps_to_local_xy_from_origin(
+        gate_lat, gate_lon, prep['lat0_deg'], prep['lon0_deg'],
+    )
+    dx = float(gate_x[1] - gate_x[0])
+    dy = float(gate_y[1] - gate_y[0])
+    norm = float(np.hypot(dx, dy))
+    if norm < 2.0:
+        raise ValueError('Manual gate line is too short to define a finish line.')
+    t_hat = np.array([dx, dy], dtype=float) / norm
+    finish_x = float((gate_x[0] + gate_x[1]) * 0.5)
+    finish_y = float((gate_y[0] + gate_y[1]) * 0.5)
+    return finish_x, finish_y, t_hat, norm * 0.5
+
+
+def detect_laps_from_manual_gate(
+    xg: np.ndarray,
+    yg: np.ndarray,
+    t: np.ndarray,
+    finish_x: float,
+    finish_y: float,
+    t_hat: np.ndarray,
+    params: dict,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Detect laps from a user-defined finish line."""
+    n_hat = np.array([-t_hat[1], t_hat[0]], dtype=float)
+    signed_dist = (xg - finish_x) * n_hat[0] + (yg - finish_y) * n_hat[1]
+    along_dist = (xg - finish_x) * t_hat[0] + (yg - finish_y) * t_hat[1]
+
+    crossing_idx: list[int] = []
+    crossing_times: list[float] = []
+    lap_durations: list[float] = []
+    last_cross_time: float | None = None
+    armed = False
+
+    for k in range(1, len(xg)):
+        dist_to_gate = float(np.hypot(xg[k] - finish_x, yg[k] - finish_y))
+        if not armed:
+            if dist_to_gate > params['rearm_distance']:
+                armed = True
+            continue
+
+        crossed = (signed_dist[k - 1] <= 0.0) and (signed_dist[k] > 0.0)
+        in_gate = abs(float(along_dist[k])) <= float(params['gate_half_width'])
+        if not (crossed and in_gate):
+            continue
+
+        if last_cross_time is None:
+            crossing_idx.append(k)
+            crossing_times.append(float(t[k]))
+            last_cross_time = float(t[k])
+            armed = False
+            continue
+
+        lap_t_cand = float(t[k] - last_cross_time)
+        valid_time = params['min_lap_time'] <= lap_t_cand <= params['max_lap_time']
+        if not valid_time:
+            continue
+
+        crossing_idx.append(k)
+        crossing_times.append(float(t[k]))
+        lap_durations.append(lap_t_cand)
+        last_cross_time = float(t[k])
+        armed = False
+
+    return (
+        np.array(crossing_idx, dtype=int),
+        np.array(crossing_times, dtype=float),
+        np.array(lap_durations, dtype=float),
+    )
+
+
+def detect_skidpad_laps_from_gate(
+    xg: np.ndarray,
+    yg: np.ndarray,
+    t: np.ndarray,
+    finish_x: float,
+    finish_y: float,
+    t_hat: np.ndarray,
+    params: dict,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Detect skidpad crossings from a centre gate, matching ROS mission 1."""
+    n_hat = np.array([-t_hat[1], t_hat[0]], dtype=float)
+    signed_dist = (xg - finish_x) * n_hat[0] + (yg - finish_y) * n_hat[1]
+
+    crossing_idx: list[int] = []
+    crossing_times: list[float] = []
+    lap_durations: list[float] = []
+    last_cross_time: float | None = None
+    changed = True
+
+    for k in range(1, len(xg)):
+        crossed = (signed_dist[k - 1] < 0.0) and (signed_dist[k] > 0.0)
+        near_centre = (
+            float(np.hypot(xg[k] - finish_x, yg[k] - finish_y))
+            < float(params['dist_max'])
+        )
+
+        if (not changed) and crossed and near_centre:
+            crossing_idx.append(k)
+            crossing_times.append(float(t[k]))
+            changed = True
+
+            if last_cross_time is not None:
+                lap_t_cand = float(t[k] - last_cross_time)
+                valid_time = params['min_lap_time'] <= lap_t_cand <= params['max_lap_time']
+                if valid_time:
+                    lap_durations.append(lap_t_cand)
+            last_cross_time = float(t[k])
+        else:
+            changed = False
+
+    return (
+        np.array(crossing_idx, dtype=int),
+        np.array(crossing_times, dtype=float),
+        np.array(lap_durations, dtype=float),
+    )
+
+
+def _run_manual_gate_detection(
+    prep: dict[str, Any],
+    gate_line_lonlat: tuple[tuple[float, float], tuple[float, float]],
+    params: dict | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float, np.ndarray, dict[str, Any]]:
+    """Detect laps from a user-defined GPS gate line, trying both orientations."""
+    base_params = {**AUTO_PARAMS, **(params or {})}
+    finish_x, finish_y, t_hat, gate_half_width = _manual_gate_geometry(prep, gate_line_lonlat)
+    gate_params = {**base_params, 'gate_half_width': float(gate_half_width)}
+
+    best_result: tuple[np.ndarray, np.ndarray, np.ndarray, float, float, np.ndarray, dict[str, Any]] | None = None
+    best_laps = -1
+    best_crossings = -1
+    for cand_t_hat in (t_hat, -t_hat):
+        crossing_idx, crossing_times, lap_durations = detect_laps_from_manual_gate(
+            prep['xg'], prep['yg'], prep['t'], finish_x, finish_y, cand_t_hat, gate_params,
+        )
+        n_laps = int(len(lap_durations))
+        n_crossings = int(len(crossing_idx))
+        if (n_laps > best_laps) or (n_laps == best_laps and n_crossings > best_crossings):
+            best_result = (
+                crossing_idx, crossing_times, lap_durations,
+                finish_x, finish_y, cand_t_hat, gate_params,
+            )
+            best_laps = n_laps
+            best_crossings = n_crossings
+
+    if best_result is None:
+        raise ValueError('Manual gate line could not be evaluated.')
+    return best_result
+
+
+def _run_skidpad_detection(
+    prep: dict[str, Any],
+    gate_line_lonlat: tuple[tuple[float, float], tuple[float, float]],
+    params: dict | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float, np.ndarray, dict[str, Any]]:
+    """Detect skidpad laps from the user-provided centre line."""
+    base_params = {**SKIDPAD_PARAMS, **(params or {})}
+    finish_x, finish_y, t_hat, gate_half_width = _manual_gate_geometry(prep, gate_line_lonlat)
+    gate_params = {**base_params, 'gate_half_width': float(gate_half_width)}
+
+    best_result: tuple[np.ndarray, np.ndarray, np.ndarray, float, float, np.ndarray, dict[str, Any]] | None = None
+    best_laps = -1
+    best_crossings = -1
+    for cand_t_hat in (t_hat, -t_hat):
+        crossing_idx, crossing_times, lap_durations = detect_skidpad_laps_from_gate(
+            prep['xg'], prep['yg'], prep['t'], finish_x, finish_y, cand_t_hat, gate_params,
+        )
+        n_laps = int(len(lap_durations))
+        n_crossings = int(len(crossing_idx))
+        if (n_laps > best_laps) or (n_laps == best_laps and n_crossings > best_crossings):
+            best_result = (
+                crossing_idx, crossing_times, lap_durations,
+                finish_x, finish_y, cand_t_hat, gate_params,
+            )
+            best_laps = n_laps
+            best_crossings = n_crossings
+
+    if best_result is None:
+        raise ValueError('Skidpad gate line could not be evaluated.')
+    return best_result
+
+
+def _write_csv_atomic(df: pl.DataFrame, csv_path: str | pathlib.Path) -> None:
+    """Write *df* to *csv_path* atomically to avoid partial CSV corruption."""
+    path = pathlib.Path(csv_path)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f'.{path.stem}.',
+        suffix='.tmp',
+        dir=str(path.parent),
+    )
+    os.close(fd)
+    tmp_path = pathlib.Path(tmp_name)
+    try:
+        df.write_csv(str(tmp_path))
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 # ── Public API for auto-detection ─────────────────────────────────────────────
 
 def csv_needs_lap_detection(csv_path: str | pathlib.Path) -> bool:
-    """Return True if the CSV lacks detected laps (missing column or max <= 0)."""
+    """Return True if the CSV lacks detected laps or uses a stale detector."""
     path = str(csv_path)
     try:
-        head = pl.read_csv(path, n_rows=0)
+        head = read_telemetry_csv(path, n_rows=1)
     except Exception:
         return True
-    if 'laps' not in head.columns:
+    required_cols = {'laps', 'laptime', _LAPCOUNT_VERSION_COL}
+    if not required_cols.issubset(head.columns):
         return True
     try:
-        laps = pl.read_csv(path, columns=['laps'])['laps']
+        cols = read_telemetry_csv(path, columns=['laps', _LAPCOUNT_VERSION_COL])
     except Exception:
         return True
+    laps = cols['laps']
     max_lap = laps.max()
     if max_lap is None:
         return True
     try:
-        return float(max_lap) <= 0.0
+        if float(max_lap) <= 0.0:
+            return True
     except (TypeError, ValueError):
         return True
+    version_s = cols[_LAPCOUNT_VERSION_COL].drop_nulls()
+    if len(version_s) == 0:
+        return True
+    try:
+        version = int(float(version_s[0]))
+    except (TypeError, ValueError):
+        return True
+    return version != _LAPCOUNT_ALGO_VERSION
 
 
-def detect_and_write_laps(csv_path: str | pathlib.Path,
-                          params: dict | None = None) -> int:
+def detect_and_write_laps(
+    csv_path: str | pathlib.Path,
+    params: dict | None = None,
+    gate_line_lonlat: tuple[tuple[float, float], tuple[float, float]] | None = None,
+    mode: str | None = None,
+) -> int:
     """Auto-detect laps and overwrite the CSV with ``laps`` / ``laptime`` columns.
 
     Returns the number of detected laps (0 if detection yielded nothing).
     """
     path = str(csv_path)
+    lap_mode = _normalise_lapcount_mode(mode)
 
-    df = pl.read_csv(path)
+    df = read_telemetry_csv(path)
     prep = _prepare_detection_inputs(df)
-    result = _run_detection_attempts(
-        prep['xg'], prep['yg'], prep['speed_gps'], prep['t'], params=params,
-    )
 
     crossing_idx_valid = np.array([], dtype=int)
-    lap_durations = np.array([])
-    if result is not None:
-        crossing_idx_valid, _, lap_durations, *_ = result
+    lap_durations = np.array([], dtype=float)
+    gate_idx_valid = 0
+    used_params = {**AUTO_PARAMS}
+    gate_time_s = np.nan
+    gate_lon0 = np.nan
+    gate_lat0 = np.nan
+    gate_lon1 = np.nan
+    gate_lat1 = np.nan
+    detected_laps = 0
 
-    laps_valid, laptime_valid = build_lap_samples(
-        crossing_idx_valid, lap_durations, len(prep['valid_idx']),
-    )
+    if lap_mode == 'acceleration':
+        accel_params = {**ACCELERATION_PARAMS, **(params or {})}
+        (
+            crossing_idx_valid,
+            _crossing_times,
+            lap_durations,
+            start_idx_valid,
+            finish_idx_valid,
+            finish_x,
+            finish_y,
+            t_hat,
+        ) = detect_acceleration_run(
+            prep['xg'], prep['yg'], prep['speed_gps'], prep['t'], accel_params,
+        )
+        duration_s = float(lap_durations[0]) if len(lap_durations) > 0 else np.nan
+        laps_valid, laptime_valid = build_acceleration_samples(
+            start_idx_valid, finish_idx_valid, duration_s, len(prep['valid_idx']),
+        )
+        used_params = accel_params
+        gate_time_s = float(prep['t'][start_idx_valid])
+        gate_lon0, gate_lat0, gate_lon1, gate_lat1 = _gate_lonlat_from_local(
+            prep, finish_x, finish_y, t_hat, float(used_params['dist_max']),
+        )
+        detected_laps = int(len(lap_durations))
+    elif lap_mode == 'skidpad':
+        if gate_line_lonlat is None:
+            raise ValueError(
+                'Skidpad lap detection requires gate_line_lonlat. '
+                'The ROS lapcount receives this line from SkidpadData; '
+                'offline CSV detection needs the equivalent user-defined gate.'
+            )
+        skidpad_result = _run_skidpad_detection(prep, gate_line_lonlat, params=params)
+        crossing_idx_valid, _, lap_durations, _fx, _fy, _t_hat, used_params = skidpad_result
+        laps_valid, laptime_valid = build_manual_lap_samples(
+            crossing_idx_valid, lap_durations, len(prep['valid_idx']),
+        )
+        gate_lon0 = float(gate_line_lonlat[0][0])
+        gate_lat0 = float(gate_line_lonlat[0][1])
+        gate_lon1 = float(gate_line_lonlat[1][0])
+        gate_lat1 = float(gate_line_lonlat[1][1])
+        used_params = {**used_params, 'min_vel': np.nan}
+        detected_laps = int(len(lap_durations))
+    elif gate_line_lonlat is None:
+        result = _run_detection_attempts(
+            prep['xg'], prep['yg'], prep['speed_gps'], prep['t'], params=params,
+        )
+        if result is not None:
+            crossing_idx_valid, _, lap_durations, gate_idx_valid, *_tail, used_params = result
+            gate_time_s = float(prep['t'][gate_idx_valid])
+        laps_valid, laptime_valid = build_lap_samples(
+            gate_idx_valid, crossing_idx_valid, lap_durations, len(prep['valid_idx']),
+        )
+        detected_laps = int(len(lap_durations))
+    else:
+        manual_result = _run_manual_gate_detection(prep, gate_line_lonlat, params=params)
+        crossing_idx_valid, _, lap_durations, _fx, _fy, _t_hat, used_params = manual_result
+        laps_valid, laptime_valid = build_manual_lap_samples(
+            crossing_idx_valid, lap_durations, len(prep['valid_idx']),
+        )
+        gate_lon0 = float(gate_line_lonlat[0][0])
+        gate_lat0 = float(gate_line_lonlat[0][1])
+        gate_lon1 = float(gate_line_lonlat[1][0])
+        gate_lat1 = float(gate_line_lonlat[1][1])
+        used_params = {**used_params, 'min_vel': np.nan}
+        detected_laps = int(len(lap_durations))
+
     laps_arr = np.full(int(prep['N']), np.nan)
     laptime_arr = np.full(int(prep['N']), np.nan)
     laps_arr[prep['valid_idx']] = laps_valid
@@ -352,16 +977,26 @@ def detect_and_write_laps(csv_path: str | pathlib.Path,
     df = df.with_columns([
         pl.Series('laps',    laps_arr),
         pl.Series('laptime', laptime_arr),
+        pl.Series(_LAPCOUNT_VERSION_COL, np.full(int(prep['N']), _LAPCOUNT_ALGO_VERSION, dtype=np.int32)),
+        pl.Series(_LAPCOUNT_MIN_VEL_COL, np.full(int(prep['N']), float(used_params['min_vel']))),
+        pl.Series(_LAPCOUNT_GATE_HALF_WIDTH_COL, np.full(int(prep['N']), float(used_params['gate_half_width']))),
+        pl.Series(_LAPCOUNT_GATE_TIME_COL, np.full(int(prep['N']), gate_time_s)),
+        pl.Series(_LAPCOUNT_DETECTED_LAPS_COL, np.full(int(prep['N']), detected_laps, dtype=np.int32)),
+        pl.Series(_LAPCOUNT_GATE_LON0_COL, np.full(int(prep['N']), gate_lon0)),
+        pl.Series(_LAPCOUNT_GATE_LAT0_COL, np.full(int(prep['N']), gate_lat0)),
+        pl.Series(_LAPCOUNT_GATE_LON1_COL, np.full(int(prep['N']), gate_lon1)),
+        pl.Series(_LAPCOUNT_GATE_LAT1_COL, np.full(int(prep['N']), gate_lat1)),
+        pl.Series(_LAPCOUNT_MODE_COL, np.full(int(prep['N']), lap_mode)),
     ])
-    df.write_csv(path)
-    return int(len(crossing_idx_valid))
+    _write_csv_atomic(df, path)
+    return detected_laps
 
 
 # ── CLI plot helper (manual debugging) ────────────────────────────────────────
 
 def _plot_detection(csv_path: str) -> None:
     """Re-run detection and show a GPS+speed plot for debugging."""
-    df = pl.read_csv(csv_path)
+    df = read_telemetry_csv(csv_path)
     prep = _prepare_detection_inputs(df)
     result = _run_detection_attempts(
         prep['xg'], prep['yg'], prep['speed_gps'], prep['t'], params=None,
@@ -369,7 +1004,7 @@ def _plot_detection(csv_path: str) -> None:
     if result is None:
         raise ValueError('No lap gate could be determined from the GPS trace.')
 
-    crossing_idx, crossing_times, lap_durations, finish_x, finish_y, t_hat, used_params = result
+    crossing_idx, crossing_times, lap_durations, gate_idx, finish_x, finish_y, t_hat, used_params = result
 
     fig = make_subplots(
         rows=2, cols=1,
@@ -400,6 +1035,8 @@ def _plot_detection(csv_path: str) -> None:
                   row=2, col=1)
     fig.add_hline(y=used_params['min_vel'], line=dict(color='red', dash='dash'),
                   annotation_text='min_vel', row=2, col=1)
+    fig.add_vline(x=float(prep['t'][gate_idx]), line=dict(color='red', dash='dot', width=1),
+                  row=2, col=1)
     for ct in crossing_times:
         fig.add_vline(x=ct, line=dict(color='#4DB3F2', dash='dash', width=1),
                       row=2, col=1)

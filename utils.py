@@ -16,9 +16,18 @@ WHEEL_COLORS  = {'FL': '#4DB3F2', 'FR': '#F28C40', 'RL': '#73D973', 'RR': '#D973
 WHEEL_SYMBOLS = {'FL': 'circle',  'FR': 'square',  'RL': 'triangle-up', 'RR': 'diamond'}
 PerLapAxisMode = Literal['laps', 'laptime']
 COMPLETE_LAPS_MARKER = '__complete_laps_only'
+PHASE_MASK_COLUMNS = {
+    "BRAKE": "phase_brake",
+    "CORNER": "phase_corner",
+    "STRAIGHT": "phase_straight",
+}
 LOGIC_START_TIME_BY_CSV = {
     'Abel_FSG.csv': 40.8651,
 }
+_FILTERING_ACCEL_FALLBACKS = (
+    ("Filtering_VN_ax", "VN_ax"),
+    ("Filtering_VN_ay", "VN_ay"),
+)
 
 
 # ── Figure helpers ────────────────────────────────────────────────────────────
@@ -103,6 +112,31 @@ def per_lap_axis(
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
 
+def read_telemetry_csv(
+    path: str,
+    *,
+    columns: list[str] | tuple[str, ...] | None = None,
+    n_rows: int | None = None,
+) -> pl.DataFrame:
+    """Read a telemetry CSV with robust type inference for mixed numeric columns."""
+    kwargs: dict[str, object] = {"infer_schema_length": 10_000}
+    if columns is not None:
+        kwargs["columns"] = list(columns)
+    if n_rows is not None:
+        kwargs["n_rows"] = n_rows
+    return pl.read_csv(path, **kwargs)
+
+
+def ensure_filtering_accel_columns_df(df: pl.DataFrame) -> pl.DataFrame:
+    """Backfill filtered accel columns from raw VN channels when absent."""
+    exprs: list[pl.Expr] = []
+    for target_col, fallback_col in _FILTERING_ACCEL_FALLBACKS:
+        if target_col not in df.columns and fallback_col in df.columns:
+            exprs.append(pl.col(fallback_col).alias(target_col))
+    if not exprs:
+        return df
+    return df.with_columns(exprs)
+
 def keep_min_duration_segments(mask: np.ndarray,
                                 min_duration: float,
                                 dt: float) -> np.ndarray:
@@ -163,6 +197,19 @@ def _laps_filter_applied_dict(data: dict[str, np.ndarray]) -> bool:
 def _laps_filter_applied_df(df: pl.DataFrame) -> bool:
     """Return True when *df* is already restricted to the desired laps."""
     return COMPLETE_LAPS_MARKER in df.columns
+
+
+def cols_to_numpy(
+    df: pl.DataFrame,
+    cols: list[str],
+    *,
+    dtype: type = float,
+) -> dict[str, np.ndarray]:
+    """Return a dict of numpy arrays for the requested columns."""
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing columns: {missing}")
+    return {c: df[c].to_numpy().astype(dtype) for c in cols}
 
 
 def ensure_detected_laps_df(df: pl.DataFrame) -> pl.DataFrame:
@@ -369,21 +416,36 @@ def select_laps_df(df: pl.DataFrame, lap_ids: list[int] | np.ndarray) -> pl.Data
     )
 
 
-def lap_dist_from_gps(df: pl.DataFrame) -> np.ndarray:
-    """Haversine cumulative distance [m] per lap, reset to 0 at each lap start.
+def _dist_m_from_dist_km(df: pl.DataFrame) -> np.ndarray | None:
+    if "dist_km" not in df.columns or "laps" not in df.columns:
+        return None
 
-    Requires columns: VN_latitude, VN_longitude, laps.
-    Returns an array of the same length as *df* (zeros where GPS is unavailable).
-    """
+    dist_km = df["dist_km"].to_numpy().astype(float)
+    laps = df["laps"].to_numpy().astype(float)
+    if len(dist_km) == 0:
+        return None
+
+    dist_m = dist_km * 1000.0
+    out = np.zeros(len(dist_m), dtype=float)
+    for lap_id in np.unique(laps[np.isfinite(laps)]):
+        mask = laps == lap_id
+        vals = dist_m[mask]
+        if vals.size and np.any(np.isfinite(vals)):
+            out[mask] = vals - np.nanmin(vals)
+    return out
+
+
+def _dist_m_from_gps(df: pl.DataFrame) -> np.ndarray:
+    """Haversine cumulative distance [m] per lap, reset to 0 at each lap start."""
     gps_cols = ("VN_latitude", "VN_longitude", "laps")
     if any(c not in df.columns for c in gps_cols):
         return np.zeros(len(df))
 
-    lat  = df["VN_latitude"].to_numpy().astype(float)
-    lng  = df["VN_longitude"].to_numpy().astype(float)
+    lat = df["VN_latitude"].to_numpy().astype(float)
+    lng = df["VN_longitude"].to_numpy().astype(float)
     laps = df["laps"].to_numpy().astype(float)
 
-    R    = 6_371_000.0
+    R = 6_371_000.0
     dist = np.zeros(len(lat))
     for lap_id in np.unique(laps[np.isfinite(laps)]):
         idx = np.where(laps == lap_id)[0]
@@ -391,13 +453,27 @@ def lap_dist_from_gps(df: pl.DataFrame) -> np.ndarray:
             continue
         lat_r = np.radians(lat[idx])
         lng_r = np.radians(lng[idx])
-        dlat  = np.diff(lat_r)
-        dlng  = np.diff(lng_r)
-        a = (np.sin(dlat / 2) ** 2
-             + np.cos(lat_r[:-1]) * np.cos(lat_r[1:]) * np.sin(dlng / 2) ** 2)
+        dlat = np.diff(lat_r)
+        dlng = np.diff(lng_r)
+        a = (
+            (np.sin(dlat / 2) ** 2)
+            + np.cos(lat_r[:-1]) * np.cos(lat_r[1:]) * np.sin(dlng / 2) ** 2
+        )
         inc = R * 2 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
         dist[idx] = np.concatenate([[0.0], np.cumsum(inc)])
     return dist
+
+
+def lap_dist_from_gps(df: pl.DataFrame) -> np.ndarray:
+    """Cumulative distance [m] per lap (uses cached columns when available)."""
+    if "dist_m" in df.columns:
+        return df["dist_m"].to_numpy().astype(float)
+
+    dist_from_km = _dist_m_from_dist_km(df)
+    if dist_from_km is not None and np.nanmax(dist_from_km) > 0.0:
+        return dist_from_km
+
+    return _dist_m_from_gps(df)
 
 
 def smooth_signal(signal: np.ndarray, window_samples: int) -> np.ndarray:
@@ -617,8 +693,40 @@ def phase_masks_for_map(df: pl.DataFrame) -> dict[str, np.ndarray]:
     Returns:
         Dict with keys "BRAKE", "CORNER", "STRAIGHT" (boolean arrays, same length as *df*).
     """
+    if all(col in df.columns for col in PHASE_MASK_COLUMNS.values()):
+        return {
+            phase: df[col].to_numpy().astype(bool)
+            for phase, col in PHASE_MASK_COLUMNS.items()
+        }
     provisional = _phase_masks_from_signals(df)
     return _stabilise_phase_masks_by_progress(df, provisional)
+
+
+def ensure_dist_m_df(df: pl.DataFrame) -> pl.DataFrame:
+    """Return *df* with a cached per-lap distance column `dist_m`."""
+    if "dist_m" in df.columns:
+        return df
+    dist_m = lap_dist_from_gps(df)
+    return df.with_columns(pl.Series("dist_m", dist_m))
+
+
+def ensure_phase_masks_df(df: pl.DataFrame) -> pl.DataFrame:
+    """Return *df* with cached phase mask columns for map visualisation."""
+    if all(col in df.columns for col in PHASE_MASK_COLUMNS.values()):
+        return df
+    masks = phase_masks_for_map(df)
+    return df.with_columns([
+        pl.Series(PHASE_MASK_COLUMNS["BRAKE"], masks["BRAKE"]),
+        pl.Series(PHASE_MASK_COLUMNS["CORNER"], masks["CORNER"]),
+        pl.Series(PHASE_MASK_COLUMNS["STRAIGHT"], masks["STRAIGHT"]),
+    ])
+
+
+def enrich_run_df(df: pl.DataFrame) -> pl.DataFrame:
+    """Precompute cached columns used across multiple modules."""
+    df = ensure_dist_m_df(df)
+    df = ensure_phase_masks_df(df)
+    return df
 
 
 def load_data(path: str, complete_laps_only: bool = True) -> pl.DataFrame:
@@ -627,9 +735,10 @@ def load_data(path: str, complete_laps_only: bool = True) -> pl.DataFrame:
     When *complete_laps_only* is True, lap 0 and the last lap are excluded.
     When False, the full CSV is returned and the dashboard can choose laps later.
     """
-    df = apply_logic_start_time(pl.read_csv(path), path)
+    df = apply_logic_start_time(read_telemetry_csv(path), path)
     df = apply_special_lap_logic(df, path)
     df = ensure_detected_laps_df(df)
+    df = ensure_filtering_accel_columns_df(df)
     if complete_laps_only:
         df = ensure_complete_laps_df(df)
 
@@ -645,3 +754,108 @@ def load_data(path: str, complete_laps_only: bool = True) -> pl.DataFrame:
         dt_s[bad_mask] = fill_dt
 
     return df.with_columns(pl.Series("dt_s", dt_s))
+
+
+# ── Per-lap table colour styling ──────────────────────────────────────────────
+
+_TBL_PURPLE = '#9B59B6'
+_TBL_GREEN  = '#27AE60'
+_TBL_YELLOW = '#F1C40F'
+_TBL_RED    = '#E74C3C'
+
+_LOWER_BETTER_PATTERNS: tuple[str, ...] = (
+    'LapTime', 'laptime', 'lap time', 'Lap time',
+    'Off throttle',
+    'Steering smoothness',
+)
+
+
+def _table_lower_is_better(col: str) -> bool:
+    return any(p in col for p in _LOWER_BETTER_PATTERNS)
+
+
+def _hex_to_rgb(h: str) -> tuple[float, float, float]:
+    h = h.lstrip('#')
+    return int(h[0:2], 16) / 255.0, int(h[2:4], 16) / 255.0, int(h[4:6], 16) / 255.0
+
+
+def _lerp_hex(c0: str, c1: str, t: float) -> str:
+    r0, g0, b0 = _hex_to_rgb(c0)
+    r1, g1, b1 = _hex_to_rgb(c1)
+    r = r0 + t * (r1 - r0)
+    g = g0 + t * (g1 - g0)
+    b = b0 + t * (b1 - b0)
+    return f'#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}'
+
+
+def _grad3(t: float) -> str:
+    """Interpolate green → yellow → red for t in [0, 1]."""
+    if t <= 0.5:
+        return _lerp_hex(_TBL_GREEN, _TBL_YELLOW, t * 2.0)
+    return _lerp_hex(_TBL_YELLOW, _TBL_RED, (t - 0.5) * 2.0)
+
+
+def _text_on(bg_hex: str) -> str:
+    r, g, b = _hex_to_rgb(bg_hex)
+    lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return 'white' if lum < 0.55 else 'black'
+
+
+def _rank_color_styles(vals: np.ndarray, lower_better: bool) -> list[str]:
+    n = len(vals)
+    finite = np.isfinite(vals)
+    valid_idx = np.where(finite)[0]
+    nv = len(valid_idx)
+    styles: list[str] = [''] * n
+    if nv == 0:
+        return styles
+
+    valid_vals = vals[valid_idx]
+    order = np.argsort(valid_vals) if lower_better else np.argsort(-valid_vals)
+    ranks = np.empty(nv, dtype=int)
+    ranks[order] = np.arange(nv)
+
+    for rank, i in zip(ranks, valid_idx):
+        if nv == 1 or rank == 0:
+            bg = _TBL_PURPLE
+        elif nv == 2 and rank == 1:
+            bg = _TBL_RED
+        elif rank == nv - 1:
+            bg = _TBL_RED
+        elif rank == 1:
+            bg = _TBL_GREEN
+        else:
+            t = (rank - 1) / (nv - 2)
+            bg = _grad3(t)
+        txt = _text_on(bg)
+        styles[i] = f'background-color: {bg}; color: {txt}'
+
+    return styles
+
+
+def style_per_lap_table(df: pl.DataFrame) -> 'pd.io.formats.style.Styler':
+    """Return a pandas Styler with rank-based colour gradient per numeric column.
+
+    Purple = best, green = 2nd best, red = worst,
+    green → yellow → red gradient for middle ranks.
+    Lower-is-better for LapTime / Off-throttle / Steering-smoothness columns.
+    """
+    import pandas as pd  # noqa: PLC0415
+
+    _SKIP = {'Lap', 'lap', 'Run', 'run'}
+    pdf = df.to_pandas()
+
+    def _apply_all(frame: pd.DataFrame) -> pd.DataFrame:
+        result = pd.DataFrame('', index=frame.index, columns=frame.columns)
+        for col in frame.columns:
+            if col in _SKIP:
+                continue
+            if not pd.api.types.is_numeric_dtype(frame[col]):
+                continue
+            lb = _table_lower_is_better(col)
+            result[col] = _rank_color_styles(
+                frame[col].to_numpy(dtype=float, na_value=np.nan), lb
+            )
+        return result
+
+    return pdf.style.apply(_apply_all, axis=None)

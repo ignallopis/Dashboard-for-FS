@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
+    />
+    <style>
+      html, body, #plot {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+      }
+    </style>
+    <script src="./plotly.min.js"></script>
+  </head>
+  <body>
+    <div id="plot"></div>
+    <script>
+      const plotEl = document.getElementById("plot")
+      let currentSelection = []
+      let currentLine = null
+      let eventId = 0
+      const fullscreenIcon = {
+        width: 1000,
+        height: 1000,
+        path: "M60 360V60H360V160H160V360Z M640 60H940V360H840V160H640Z M160 640V840H360V940H60V640Z M840 640V840H640V940H940V640Z",
+      }
+
+      function sendMessage(type, payload = {}) {
+        window.parent.postMessage({
+          isStreamlitMessage: true,
+          type,
+          ...payload,
+        }, "*")
+      }
+
+      function uniqueSorted(values) {
+        return [...new Set(values.filter(v => Number.isFinite(v)).map(v => Number(v)))].sort((a, b) => a - b)
+      }
+
+      function nextEventId() {
+        eventId = Math.max(eventId + 1, Date.now())
+        return eventId
+      }
+
+      function sendValue() {
+        sendMessage("streamlit:setComponentValue", {
+          value: {
+            event_id: nextEventId(),
+            selection_indices: currentSelection,
+            clicked_turn_id: null,
+            line: currentLine,
+            line_event: false,
+            fullscreen_event: false,
+          },
+          dataType: "json",
+        })
+      }
+
+      function sendLineValue() {
+        sendMessage("streamlit:setComponentValue", {
+          value: {
+            event_id: nextEventId(),
+            selection_indices: currentSelection,
+            clicked_turn_id: null,
+            line: currentLine,
+            line_event: true,
+            fullscreen_event: false,
+          },
+          dataType: "json",
+        })
+      }
+
+      function sendFullscreenValue() {
+        sendMessage("streamlit:setComponentValue", {
+          value: {
+            event_id: nextEventId(),
+            selection_indices: currentSelection,
+            clicked_turn_id: null,
+            line: currentLine,
+            line_event: false,
+            fullscreen_event: true,
+          },
+          dataType: "json",
+        })
+      }
+
+      function turnIdFromPoint(point) {
+        const cd = point?.customdata
+        if (Array.isArray(cd) && cd.length >= 2 && cd[0] === "turn") {
+          const turnId = Number(cd[1])
+          return Number.isFinite(turnId) ? turnId : null
+        }
+        if (cd && typeof cd === "object" && cd.kind === "turn") {
+          const turnId = Number(cd.turn_id)
+          return Number.isFinite(turnId) ? turnId : null
+        }
+        const traceName = String(point?.data?.name || "")
+        const match = traceName.match(/^T(\d+)\b/)
+        if (match) {
+          const turnId = Number(match[1])
+          return Number.isFinite(turnId) ? turnId : null
+        }
+        return null
+      }
+
+      function sendClickValue(turnId) {
+        sendMessage("streamlit:setComponentValue", {
+          value: {
+            event_id: nextEventId(),
+            selection_indices: currentSelection,
+            clicked_turn_id: turnId,
+            line: currentLine,
+            line_event: false,
+            fullscreen_event: false,
+          },
+          dataType: "json",
+        })
+      }
+
+      function setFrameHeight(heightPx) {
+        sendMessage("streamlit:setFrameHeight", { height: heightPx })
+      }
+
+      function lineFromShape(shape) {
+        if (!shape || shape.type !== "line") return null
+        const x0 = Number(shape.x0)
+        const y0 = Number(shape.y0)
+        const x1 = Number(shape.x1)
+        const y1 = Number(shape.y1)
+        if (![x0, y0, x1, y1].every(Number.isFinite)) return null
+        return { x0, y0, x1, y1 }
+      }
+
+      function latestLineFromLayout(layout) {
+        const shapes = Array.isArray(layout?.shapes) ? layout.shapes : []
+        for (let i = shapes.length - 1; i >= 0; i -= 1) {
+          const line = lineFromShape(shapes[i])
+          if (line) return line
+        }
+        return null
+      }
+
+      function onRender(event) {
+        if (!event?.data || event.data.type !== "streamlit:render") return
+        const args = event.data.args || {}
+        const fig = JSON.parse(args.figure_json)
+        const heightPx = Number(args.height_px) || 390
+        currentSelection = []
+        currentLine = null
+        fig.layout = fig.layout || {}
+        fig.layout.height = heightPx
+        fig.layout.dragmode = fig.layout.dragmode || "lasso"
+        fig.layout.newshape = {
+          line: { color: "#4DB3F2", width: 3 },
+        }
+
+        const config = {
+          displaylogo: false,
+          scrollZoom: false,
+          responsive: true,
+          modeBarButtonsToRemove: ["select2d"],
+          modeBarButtonsToAdd: [
+            "drawline",
+            "eraseshape",
+            {
+              name: "fullscreen",
+              title: "Open full screen track",
+              icon: fullscreenIcon,
+              click: () => sendFullscreenValue(),
+            },
+          ],
+        }
+
+        Plotly.purge(plotEl)
+        Plotly.newPlot(plotEl, fig.data, fig.layout, config).then(() => {
+          currentLine = latestLineFromLayout(fig.layout)
+          setFrameHeight(heightPx + 8)
+        })
+
+        plotEl.on("plotly_selected", (ev) => {
+          const pts = ev?.points || []
+          currentSelection = uniqueSorted(
+            pts.map((p) => {
+              const cd = p.customdata
+              if (Array.isArray(cd) && cd.length > 0) return Number(cd[0])
+              if (Number.isFinite(cd)) return Number(cd)
+              return NaN
+            }),
+          )
+          sendValue()
+        })
+
+        plotEl.on("plotly_deselect", () => {
+          currentSelection = []
+          sendValue()
+        })
+
+        plotEl.on("plotly_click", (ev) => {
+          const pts = ev?.points || []
+          for (const point of pts) {
+            const turnId = turnIdFromPoint(point)
+            if (turnId !== null) {
+              sendClickValue(turnId)
+              return
+            }
+          }
+        })
+
+        plotEl.on("plotly_relayout", (ev) => {
+          if (!ev) return
+          if (Array.isArray(ev.shapes)) {
+            currentLine = latestLineFromLayout({ shapes: ev.shapes })
+            sendLineValue()
+            return
+          }
+          const shapeKeys = Object.keys(ev).filter((k) => k.startsWith("shapes["))
+          if (shapeKeys.length > 0) {
+            currentLine = latestLineFromLayout(plotEl.layout)
+            sendLineValue()
+          }
+        })
+      }
+
+      window.addEventListener("message", onRender)
+      sendMessage("streamlit:componentReady", { apiVersion: 1 })
+      setFrameHeight(398)
+    </script>
+  </body>
+</html>

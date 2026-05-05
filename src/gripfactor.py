@@ -39,6 +39,7 @@ from utils import (
     make_dark_figure,
     per_lap_axis,
     unique_laps,
+    cols_to_numpy,
 )
 
 G = 9.80665  # [m/s²]
@@ -128,7 +129,7 @@ def _from_df(df: pl.DataFrame) -> dict[str, np.ndarray]:
     cols = list(_REQUIRED_COLS)
     if COMPLETE_LAPS_MARKER in df.columns:
         cols.append(COMPLETE_LAPS_MARKER)
-    return {c: df[c].to_numpy().astype(float) for c in cols}
+    return cols_to_numpy(df, cols)
 
 
 def _phase_masks(
@@ -263,13 +264,14 @@ def grip_factor_evolution_fig(
     if table.is_empty():
         return fig
 
-    laps    = table["Lap"].to_numpy().astype(int)
-    laptime = table["LapTime [s]"].to_numpy().astype(float)
+    cols = cols_to_numpy(table, ["Lap", "LapTime [s]", *[f"GF {cat}" for cat in GRIP_CATEGORIES]])
+    laps = cols["Lap"].astype(int)
+    laptime = cols["LapTime [s]"]
     x_arr, order, _xlabel = per_lap_axis(laps, laptime, x_mode)
     sorted_laps = laps[order]
 
     for cat in GRIP_CATEGORIES:
-        ys = table[f"GF {cat}"].to_numpy().astype(float)[order]
+        ys = cols[f"GF {cat}"][order]
         ok = np.isfinite(ys)
         if not ok.any():
             continue
@@ -327,7 +329,14 @@ def grip_factor_track_maps_fig(
         )
         return fig
 
-    laps_arr = df["laps"].to_numpy().astype(float)
+    cols = cols_to_numpy(df, [
+        "laps",
+        "VN_latitude",
+        "VN_longitude",
+        "Filtering_VN_ax",
+        "Filtering_VN_ay",
+    ])
+    laps_arr = cols["laps"]
     lap_mask = laps_arr == float(lap)
     if not lap_mask.any():
         fig.add_annotation(
@@ -337,10 +346,10 @@ def grip_factor_track_maps_fig(
         )
         return fig
 
-    lat  = df["VN_latitude"].to_numpy().astype(float)
-    lng  = df["VN_longitude"].to_numpy().astype(float)
-    ax_g = df["Filtering_VN_ax"].to_numpy().astype(float) / G
-    ay_g = df["Filtering_VN_ay"].to_numpy().astype(float) / G
+    lat = cols["VN_latitude"]
+    lng = cols["VN_longitude"]
+    ax_g = cols["Filtering_VN_ax"] / G
+    ay_g = cols["Filtering_VN_ay"] / G
 
     valid = lap_mask & np.isfinite(lat) & np.isfinite(lng)
     if not valid.any():
@@ -421,14 +430,15 @@ def grip_factor_evolution_multi_fig(
         if table.is_empty():
             continue
         dash = _RUN_DASHES[run_idx % len(_RUN_DASHES)]
-        laps    = table["Lap"].to_numpy().astype(int)
-        laptime = table["LapTime [s]"].to_numpy().astype(float)
+        cols = cols_to_numpy(table, ["Lap", "LapTime [s]", *[f"GF {cat}" for cat in GRIP_CATEGORIES]])
+        laps = cols["Lap"].astype(int)
+        laptime = cols["LapTime [s]"]
         x_arr, order, _ = per_lap_axis(laps, laptime, x_mode)
         sorted_laps = laps[order]
         all_laps.update(laps.tolist())
 
         for cat in GRIP_CATEGORIES:
-            ys = table[f"GF {cat}"].to_numpy().astype(float)[order]
+            ys = cols[f"GF {cat}"][order]
             ok = np.isfinite(ys)
             if not ok.any():
                 continue

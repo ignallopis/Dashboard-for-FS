@@ -1,12 +1,12 @@
 """dynamics.py
 ------------
 Vehicle dynamics KPIs:
-  1. Slip angle efficiency                               (ay / |SA| per wheel)
+  1. Slip angle balance                                  (front vs rear |SA|)
   2. Understeer angle evolution                          (delta_actual - delta_ideal)
 
 Usage:
     python src/dynamics.py                    — standalone CLI (loads from CSV_PATH)
-    slip_angle_efficiency_figs(df)            — dashboard (takes polars DataFrame)
+    sa_balance_figs(dfs)                      — dashboard (takes run DataFrames)
     understeer_angle_fig(df)                  — dashboard (takes polars DataFrame)
 """
 from __future__ import annotations
@@ -17,9 +17,11 @@ import plotly.graph_objects as go
 from utils import (
     COMPLETE_LAPS_MARKER,
     make_dark_figure, add_lap_scatter, add_trend_line, add_zero_line,
+    cols_to_numpy,
     ensure_complete_laps_df,
+    lap_dist_from_gps,
     keep_min_duration_segments, exclude_lap0_and_last_lap,
-    robust_dt, unique_laps, phase_masks_for_map, per_lap_axis,
+    robust_dt, smooth_signal, unique_laps, phase_masks_for_map, per_lap_axis,
     WHEEL_COLORS, WHEEL_SYMBOLS,
 )
 
@@ -37,9 +39,63 @@ MIN_SA_MEAN_DEG     = 1.0    # [deg] slip angles below this are ignored
 MAX_SA_MEAN_DEG     = 15.0   # [deg]
 MAX_SA_EFF          = 5.0    # [m/s²/deg] sanity cap on efficiency
 
-_SA_COLS = ['TimeStamp', 'laps', 'laptime',
-            'Filtering_VN_ay', 'Steering', 'VN_vx',
-            'Est_SAFL', 'Est_SAFR', 'Est_SARL', 'Est_SARR']
+# ── Vehicle geometry & damper calibration ─────────────────────────────────────
+# These constants drive roll/pitch from damper sensors and physical KPIs.
+# DampXX in the CSV are raw potentiometer counts with different zero/scale per
+# wheel — provide calibration to get real mm at the wheel.
+TRACK_FRONT_M       = 1.225  # [m]  front track width — Vhcl.tf from Parameters.m
+TRACK_REAR_M        = 1.175  # [m]  rear track width  — Vhcl.tr
+WHEELBASE_M         = 1.53   # [m]  axle-to-axle wheelbase — Vhcl.Wheel_Base
+
+# ── Vehicle inertial & aero (Parameters.m) ───────────────────────────────────
+MASS_KG          = 288.0      # Vhcl.m — 220 kg car + 68 kg driver
+IZ_KGM2          = 129.024    # Vhcl.Iz — yaw inertia
+COG_Z_M          = 0.278      # Vhcl.CoG_z
+LF_M             = 0.765      # Vhcl.lf
+LR_M             = 0.765      # Vhcl.lr
+KROLLF_NMRAD     = 36929.4    # Vhcl.Krollf
+KROLLR_NMRAD     = 40833.7    # Vhcl.Krollr
+HRCF_M           = 0.012      # Vhcl.hrcf
+HRCR_M           = 0.042      # Vhcl.hrcr
+CL_AERO          = -5.913     # Vhcl.Coef_Lift (negative = downforce)
+CD_AERO          = 1.803      # Vhcl.Coef_Drag
+A_AERO_M2        = 1.0        # Vhcl.A
+COP_X_FROM_FRONT = -0.7547    # Vhcl.CoP_x
+RHO_AIR_KGM3     = 1.225      # Standard air density
+MU_TIRE          = 1.70       # Estimated FS slick peak friction coefficient
+G_MPS2           = 9.81
+G_MS2            = G_MPS2
+WHEEL_RADIUS_M   = 0.2032     # Vhcl.Wheel_Radius
+GEAR_RATIO       = 9.05       # Vhcl.i
+T_MOTOR_MAX_NM   = 27.5       # Max tractive torque per motor
+MAX_POWER_W      = 80_000     # Battery power ceiling
+N_MOTORS         = 4
+
+# ── Brake system (Parameters.m) ──────────────────────────────────────────────
+BRAKE_PISTONS_F      = 8
+BRAKE_PISTONS_R      = 4
+BRAKE_PISTON_DIAM_M  = 0.023
+BRAKE_PAD_RE_M       = 0.0927
+BRAKE_PAD_RI_M       = 0.0608
+BRAKE_PAD_MU         = 0.617
+BRAKE_FRONT_BALANCE  = 0.67
+
+# Counts → mm at the damper rod (per wheel; placeholder = 1.0 means raw counts).
+# Set to your sensor calibration to get angles in physical degrees.
+DAMPER_COUNTS_PER_MM = {'FL': 1.0, 'FR': 1.0, 'RL': 1.0, 'RR': 1.0}
+# Damper rod travel → wheel travel motion ratio (wheel_mm = damper_mm * MR).
+# Typical FS pushrod: ~0.9–1.2.
+DAMPER_MOTION_RATIO  = {'FL': 1.0, 'FR': 1.0, 'RL': 1.0, 'RR': 1.0}
+# True when the calibration above is real. When False, dashboard adds a banner
+# warning that roll/pitch values are uncalibrated and only the SHAPE is meaningful.
+DAMPER_CALIBRATED    = False
+
+# Damper velocity split between low-speed and high-speed regimes [mm/s].
+DAMPER_LSHS_SPLIT_MMPS = 25.0
+
+_SA_BALANCE_COLS = ['TimeStamp', 'laps', 'laptime',
+                    'Filtering_VN_ay', 'VN_vx',
+                    'Est_SAFL', 'Est_SAFR', 'Est_SARL', 'Est_SARR']
 
 _US_COLS_COG = ['TimeStamp', 'laps', 'laptime',
                 'Steering', 'Filtering_VN_ay', 'Est_vxCOG']
@@ -51,7 +107,7 @@ _US_COLS_VX  = ['TimeStamp', 'laps', 'laptime',
 
 def _load(columns: list[str]) -> dict[str, np.ndarray]:
     df = pl.read_csv(CSV_PATH, columns=columns)
-    return {c: df[c].to_numpy().astype(float) for c in columns}
+    return cols_to_numpy(df, columns)
 
 
 def _from_df(df: pl.DataFrame, columns: list[str]) -> dict[str, np.ndarray]:
@@ -59,7 +115,7 @@ def _from_df(df: pl.DataFrame, columns: list[str]) -> dict[str, np.ndarray]:
     cols = list(columns)
     if COMPLETE_LAPS_MARKER in df.columns and COMPLETE_LAPS_MARKER not in cols:
         cols.append(COMPLETE_LAPS_MARKER)
-    return {c: df[c].to_numpy().astype(float) for c in cols}
+    return cols_to_numpy(df, cols)
 
 
 def _base_validity(*arrays: np.ndarray) -> np.ndarray:
@@ -71,200 +127,278 @@ def _display_laps(lap_ids: np.ndarray) -> np.ndarray:
     return np.asarray(lap_ids, dtype=int)
 
 
-# ── 1. Slip angle efficiency ──────────────────────────────────────────────────
+def _radius_corner_mask(
+    vx_mps: np.ndarray,
+    ay_mps2: np.ndarray,
+    dt_s: float,
+    *,
+    radius_threshold_m: float = 60.0,
+    min_speed_mps: float = MIN_SPEED,
+    min_duration_s: float = MIN_CORNER_DURATION,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Corner mask using the Driver/Lap Analysis curvature logic.
 
-def _compute_slip_angle(
-    d: dict[str, np.ndarray],
-    x_mode: str = 'laptime',
-) -> tuple[go.Figure, go.Figure, np.ndarray, dict, np.ndarray, np.ndarray, dict, np.ndarray]:
-    """Core computation for slip angle efficiency.
-
-    Returns (fig1, fig2, lap_list, sa_eff, lt_val, n_samps, sa_mean, ay_mean).
+    The driver cornering analysis detects curves from radius
+    ``R = V^2 / |ay|`` with a default 60 m threshold. This local copy avoids
+    importing `src.cornering`, which already imports this module.
     """
-    d['time'] = d['TimeStamp'] - d['TimeStamp'][0]
+    ay_abs = np.abs(np.asarray(ay_mps2, dtype=float))
+    vx = np.asarray(vx_mps, dtype=float)
+    radius_m = np.divide(
+        vx ** 2,
+        np.maximum(ay_abs, 0.05),
+        out=np.full_like(vx, np.nan, dtype=float),
+        where=np.isfinite(vx) & np.isfinite(ay_abs),
+    )
+    inv_radius = np.divide(
+        1.0,
+        radius_m,
+        out=np.zeros_like(radius_m, dtype=float),
+        where=np.isfinite(radius_m) & (radius_m > 0.0),
+    )
+    win = max(1, int(round(0.30 / dt_s)))
+    inv_radius_sm = smooth_signal(inv_radius, win)
+    radius_sm_m = np.divide(
+        1.0,
+        inv_radius_sm,
+        out=np.full_like(inv_radius_sm, np.nan, dtype=float),
+        where=np.isfinite(inv_radius_sm) & (inv_radius_sm > 0.0),
+    )
+    raw = (
+        np.isfinite(radius_sm_m)
+        & (np.abs(vx) >= min_speed_mps)
+        & (radius_sm_m < radius_threshold_m)
+    )
+    return keep_min_duration_segments(raw, min_duration_s, dt_s), radius_sm_m
 
-    valid = _base_validity(*d.values())
+
+# ── 1. Slip angle balance ────────────────────────────────────────────────────
+
+def _compute_sa_balance(d: dict[str, np.ndarray]) -> dict[str, np.ndarray | int]:
+    """Corner-filtered per-sample front/rear slip-angle balance arrays."""
+    d['time'] = d['TimeStamp'] - d['TimeStamp'][0]
+    valid = _base_validity(*(d[c] for c in _SA_BALANCE_COLS), d['time'])
     d = {k: v[valid] for k, v in d.items()}
     d = exclude_lap0_and_last_lap(d)
+    if d['time'].size == 0:
+        empty = np.array([], dtype=float)
+        return {
+            'sa_front_deg': empty,
+            'sa_rear_deg': empty,
+            'ay_abs_mps2': empty,
+            'balance_index': empty,
+            'laps': empty.astype(int),
+            'laptime': empty,
+            'n_corner_samples': 0,
+        }
 
-    dt       = robust_dt(d['time'])
-    ay       = d['Filtering_VN_ay']
-    steering = d['Steering']
-    vx       = d['VN_vx']
-    laps     = d['laps']
-    laptime  = d['laptime']
+    dt = robust_dt(d['time'])
+    ay = d['Filtering_VN_ay']
+    corner_mask, _radius_m = _radius_corner_mask(d['VN_vx'], ay, dt, radius_threshold_m=60.0)
 
-    if '__corner_mask' in d:
-        corner_mask = d['__corner_mask'].astype(bool) & (np.abs(vx) >= MIN_SPEED)
-    else:
-        raw_corner = (
-            (np.abs(ay) >= AY_THRESHOLD)
-            & (np.abs(steering) >= STEERING_THRESHOLD)
-            & (np.abs(vx) >= MIN_SPEED)
-        )
-        corner_mask = keep_min_duration_segments(raw_corner, MIN_CORNER_DURATION, dt)
-
-    lap_list = unique_laps(laps)
-    n        = len(lap_list)
-    lt_val   = np.full(n, np.nan)
-    n_samps  = np.zeros(n, dtype=int)
-    ay_mean  = np.full(n, np.nan)
-
-    sa_mean = {w: np.full(n, np.nan) for w in ('FL', 'FR', 'RL', 'RR')}
-    sa_eff  = {w: np.full(n, np.nan) for w in ('FL', 'FR', 'RL', 'RR')}
-
-    for i, lap in enumerate(lap_list):
-        lm  = laps == lap
-        lcm = lm & corner_mask
-        n_samps[i] = lcm.sum()
-        if lm.any():
-            lt_val[i] = laptime[lm].max()
-        if n_samps[i] < MIN_CORNER_SAMPLES:
-            continue
-
-        ay_mean[i] = np.nanmean(np.abs(ay[lcm]))
-        for w in ('FL', 'FR', 'RL', 'RR'):
-            sa_deg = np.rad2deg(np.abs(d[f'Est_SA{w}'][lcm]))
-            sa_mean[w][i] = np.nanmean(sa_deg)
-            if sa_mean[w][i] > MIN_SA_MEAN_DEG:
-                sa_eff[w][i] = ay_mean[i] / sa_mean[w][i]
-
-    # Plot 1: mean SA per wheel vs selected lap axis
-    fig1 = make_dark_figure(
-        title=f"Mean Slip Angle per Wheel vs {'Lap Time' if x_mode == 'laptime' else 'Lap'}",
-        xlabel='Lap time [s]' if x_mode == 'laptime' else 'Lap',
-        ylabel='Mean |SA| in corners [deg]',
+    sa_front_deg = 0.5 * (
+        np.rad2deg(np.abs(d['Est_SAFL']))
+        + np.rad2deg(np.abs(d['Est_SAFR']))
     )
-    for w in ('FL', 'FR', 'RL', 'RR'):
-        ok = (
-            (n_samps >= MIN_CORNER_SAMPLES)
-            & np.isfinite(sa_mean[w])
-            & (sa_mean[w] > MIN_SA_MEAN_DEG)
-            & (sa_mean[w] < MAX_SA_MEAN_DEG)
-        )
-        if ok.any():
-            lap_disp = _display_laps(lap_list[ok])
-            x_arr, order, _xlabel = per_lap_axis(lap_disp, lt_val[ok], x_mode)
-            add_lap_scatter(fig1, x_arr, sa_mean[w][ok][order], lap_disp[order],
-                            name=w, color=WHEEL_COLORS[w], symbol=WHEEL_SYMBOLS[w])
-    if x_mode == 'laps':
-        valid_laps = _display_laps(lap_list[n_samps >= MIN_CORNER_SAMPLES])
-        if valid_laps.size > 0:
-            fig1.update_xaxes(tickvals=np.sort(valid_laps.astype(int)))
-
-    # Plot 2: SA efficiency vs lateral acceleration
-    fig2 = make_dark_figure(
-        title='Lateral Load vs Slip Angle Used',
-        xlabel='Mean |SA| in corners [deg]',
-        ylabel='Mean |ay| in corners [m/s²]',
+    sa_rear_deg = 0.5 * (
+        np.rad2deg(np.abs(d['Est_SARL']))
+        + np.rad2deg(np.abs(d['Est_SARR']))
     )
-    for w in ('FL', 'FR', 'RL', 'RR'):
-        ok = (
-            (n_samps >= MIN_CORNER_SAMPLES)
-            & np.isfinite(sa_mean[w])
-            & np.isfinite(ay_mean)
-            & (sa_mean[w] > MIN_SA_MEAN_DEG)
-            & (sa_mean[w] < MAX_SA_MEAN_DEG)
-        )
-        if ok.any():
-            add_lap_scatter(fig2, sa_mean[w][ok], ay_mean[ok], _display_laps(lap_list[ok]),
-                            name=w, color=WHEEL_COLORS[w], symbol=WHEEL_SYMBOLS[w])
-
-    return fig1, fig2, lap_list, sa_eff, lt_val, n_samps, sa_mean, ay_mean
-
-
-def slip_angle_efficiency() -> list[go.Figure]:
-    """CLI version: loads from CSV, prints KPIs, returns figures."""
-    d = _load(_SA_COLS)
-    fig1, fig2, lap_list, sa_eff, lt_val, n_samps, sa_mean, ay_mean = _compute_slip_angle(d)
-
-    print('\n─── Slip Angle Efficiency [m/s²/deg] ───')
-    header = (
-        f"{'Lap':>4}  {'LapTime':>8}"
-        + ''.join(f"  {'Eff_' + w:>10}" for w in ('FL', 'FR', 'RL', 'RR'))
+    denom = sa_front_deg + sa_rear_deg
+    balance_index = np.divide(
+        sa_rear_deg - sa_front_deg,
+        denom,
+        out=np.full_like(denom, np.nan, dtype=float),
+        where=np.isfinite(denom) & (denom > 0.05),
     )
-    print(header)
-    for i, lap in enumerate(lap_list):
-        if n_samps[i] < MIN_CORNER_SAMPLES:
-            continue
-        vals = ''.join(
-            f"  {sa_eff[w][i]:>10.3f}" if np.isfinite(sa_eff[w][i]) else f"  {'—':>10}"
-            for w in ('FL', 'FR', 'RL', 'RR')
-        )
-        print(f'{int(lap):>4}  {lt_val[i]:>8.2f}{vals}')
-
-    return [fig1, fig2]
-
-
-def slip_angle_efficiency_figs(
-    df: pl.DataFrame,
-    corner_mask: np.ndarray | None = None,
-    x_mode: str = 'laptime',
-) -> list[go.Figure]:
-    """Dashboard version: takes a polars DataFrame, returns figures (no print)."""
-    d = _from_df(df, _SA_COLS)
-    if corner_mask is not None:
-        d['__corner_mask'] = corner_mask.astype(float)
-    fig1, fig2, *_ = _compute_slip_angle(d, x_mode=x_mode)
-    return [fig1, fig2]
-
-
-def slip_angle_efficiency_kpis(
-    df: pl.DataFrame,
-    corner_mask: np.ndarray | None = None,
-) -> dict:
-    """Dashboard KPIs for slip angle efficiency."""
-    d = _from_df(df, _SA_COLS)
-    if corner_mask is not None:
-        d['__corner_mask'] = corner_mask.astype(float)
-    _fig1, _fig2, lap_list, sa_eff, lt_val, n_samps, sa_mean, ay_mean = _compute_slip_angle(d)
-
-    valid_mask = (
-        (n_samps >= MIN_CORNER_SAMPLES)
-        & np.isfinite(lt_val)
-        & np.isfinite(ay_mean)
-        & np.all(
-            np.stack([np.isfinite(sa_eff[w]) for w in ("FL", "FR", "RL", "RR")], axis=1),
-            axis=1,
-        )
+    finite = (
+        corner_mask
+        & np.isfinite(sa_front_deg)
+        & np.isfinite(sa_rear_deg)
+        & np.isfinite(balance_index)
+        & np.isfinite(ay)
     )
-    if not valid_mask.any():
-        return {"warnings": ["No valid laps for slip-angle KPIs."]}
-
-    mean_eff = np.nanmean(
-        np.stack([sa_eff[w][valid_mask] for w in ("FL", "FR", "RL", "RR")], axis=1),
-        axis=1,
-    )
-    best_idx = int(np.nanargmax(mean_eff))
-    valid_laps = lap_list[valid_mask]
-    valid_laps_disp = _display_laps(valid_laps)
-    valid_lt = lt_val[valid_mask]
-    valid_ay = ay_mean[valid_mask]
-
-    table = {
-        "Lap": valid_laps_disp.astype(int),
-        "LapTime [s]": np.round(valid_lt, 3),
-        "Corner samples": n_samps[valid_mask].astype(int),
-        "Mean |ay| [m/s²]": np.round(valid_ay, 3),
-    }
-    for w in ("FL", "FR", "RL", "RR"):
-        table[f"Mean |SA| {w} [deg]"] = np.round(sa_mean[w][valid_mask], 3)
-        table[f"Eff {w} [m/s²/deg]"] = np.round(sa_eff[w][valid_mask], 4)
-    table["Mean Eff [m/s²/deg]"] = np.round(mean_eff, 4)
-
     return {
-        "valid_laps": int(valid_mask.sum()),
-        "mean_corner_ay": float(np.nanmean(valid_ay)),
-        "fastest_lap": int(valid_laps_disp[int(np.nanargmin(valid_lt))]),
-        "fastest_lt": float(np.nanmin(valid_lt)),
-        "best_eff_lap": int(valid_laps_disp[best_idx]),
-        "best_eff": float(mean_eff[best_idx]),
-        "eff_mean_by_wheel": {
-            w: float(np.nanmean(sa_eff[w][valid_mask])) for w in ("FL", "FR", "RL", "RR")
-        },
-        "table": pl.DataFrame(table),
-        "warnings": [],
+        'sa_front_deg': sa_front_deg[finite],
+        'sa_rear_deg': sa_rear_deg[finite],
+        'ay_abs_mps2': np.abs(ay[finite]),
+        'balance_index': np.clip(balance_index[finite], -1.0, 1.0),
+        'laps': d['laps'][finite].astype(int),
+        'laptime': d['laptime'][finite],
+        'n_corner_samples': int(finite.sum()),
     }
+
+
+def _empty_sa_balance_figs(message: str) -> list[go.Figure]:
+    fig_scatter = make_dark_figure(
+        title='SA front vs rear balance',
+        xlabel='SA front avg [deg]',
+        ylabel='SA rear avg [deg]',
+    )
+    fig_index = make_dark_figure(
+        title='SA balance index vs lateral acceleration',
+        xlabel='|ay| [m/s²]',
+        ylabel='Balance index [-]',
+    )
+    for fig in (fig_scatter, fig_index):
+        fig.add_annotation(
+            xref='paper', yref='paper', x=0.5, y=0.5,
+            showarrow=False, text=message,
+            font=dict(color='#EBEBEB', size=12),
+        )
+    return [fig_scatter, fig_index]
+
+
+def sa_balance_figs(dfs: dict[str, pl.DataFrame]) -> list[go.Figure]:
+    """Return [SA front vs rear scatter, balance index vs |ay|]."""
+    if not dfs:
+        return _empty_sa_balance_figs('No runs selected')
+
+    payloads: dict[str, dict[str, np.ndarray | int]] = {}
+    warnings: list[str] = []
+    for run_name, df in dfs.items():
+        missing = [c for c in _SA_BALANCE_COLS if c not in df.columns]
+        if missing:
+            warnings.append(f'{run_name}: missing SA balance columns: {missing}')
+            continue
+        payload = _compute_sa_balance(_from_df(df, _SA_BALANCE_COLS))
+        if int(payload['n_corner_samples']) == 0:
+            warnings.append(f'{run_name}: no radius-filtered corner samples for SA balance.')
+            continue
+        payloads[run_name] = payload
+
+    if not payloads:
+        return _empty_sa_balance_figs('; '.join(warnings) if warnings else 'No valid SA balance samples')
+
+    all_front = np.concatenate([np.asarray(p['sa_front_deg'], dtype=float) for p in payloads.values()])
+    all_rear = np.concatenate([np.asarray(p['sa_rear_deg'], dtype=float) for p in payloads.values()])
+    all_ay = np.concatenate([np.asarray(p['ay_abs_mps2'], dtype=float) for p in payloads.values()])
+    axis_max = float(np.nanpercentile(np.concatenate([all_front, all_rear]), 99.5)) * 1.08
+    if not np.isfinite(axis_max) or axis_max <= 0.0:
+        axis_max = 12.0
+    axis_max = max(axis_max, 2.0)
+    ay_cmax = float(np.nanpercentile(all_ay, 95)) if all_ay.size else 1.0
+
+    fig_scatter = make_dark_figure(
+        title='SA front vs rear balance',
+        xlabel='SA front avg [deg]',
+        ylabel='SA rear avg [deg]',
+    )
+    ref_x = np.linspace(0.0, axis_max, 120)
+    for scale, name, color, dash in (
+        (1.0, 'Neutral', 'rgba(235,235,235,0.70)', 'solid'),
+        (1.2, '+20% rear SA', 'rgba(242,140,64,0.60)', 'dot'),
+        (0.8, '-20% rear SA', 'rgba(77,179,242,0.60)', 'dot'),
+    ):
+        fig_scatter.add_trace(go.Scatter(
+            x=ref_x,
+            y=scale * ref_x,
+            mode='lines',
+            line=dict(color=color, dash=dash, width=1.4),
+            name=name,
+            hoverinfo='skip',
+        ))
+    for idx, (run_name, payload) in enumerate(payloads.items()):
+        showscale = idx == 0
+        fig_scatter.add_trace(go.Scattergl(
+            x=payload['sa_front_deg'],
+            y=payload['sa_rear_deg'],
+            mode='markers',
+            marker=dict(
+                color=payload['ay_abs_mps2'],
+                colorscale='Plasma',
+                cmin=0.0,
+                cmax=ay_cmax,
+                size=4,
+                opacity=0.45,
+                showscale=showscale,
+                colorbar=dict(title='|ay| [m/s²]') if showscale else None,
+            ),
+            name=run_name,
+            hovertemplate=(
+                f'{run_name}<br>SA front=%{{x:.2f}} deg<br>SA rear=%{{y:.2f}} deg'
+                '<br>|ay|=%{marker.color:.2f} m/s²<extra></extra>'
+            ),
+        ))
+    fig_scatter.update_xaxes(range=[0.0, axis_max])
+    fig_scatter.update_yaxes(range=[0.0, axis_max], scaleanchor='x', scaleratio=1)
+    fig_scatter.update_layout(showlegend=True)
+
+    entries: list[tuple[str, int, float]] = []
+    for run_name, payload in payloads.items():
+        laps = np.asarray(payload['laps'], dtype=int)
+        laptime = np.asarray(payload['laptime'], dtype=float)
+        for lap in np.unique(laps):
+            lm = laps == lap
+            entries.append((run_name, int(lap), float(np.nanmax(laptime[lm]))))
+    color_map = build_color_map(entries)
+
+    fig_index = make_dark_figure(
+        title='SA balance index vs lateral acceleration',
+        xlabel='|ay| [m/s²]',
+        ylabel='(SA rear - SA front) / (SA rear + SA front) [-]',
+    )
+    fig_index.add_hrect(
+        y0=-0.1, y1=0.1,
+        line_width=0,
+        fillcolor='rgba(115,217,115,0.10)',
+        layer='below',
+    )
+    fig_index.add_hline(y=0.0, line=dict(color='rgba(235,235,235,0.65)', dash='dash', width=1.2))
+    for run_name, payload in payloads.items():
+        laps = np.asarray(payload['laps'], dtype=int)
+        for lap in np.unique(laps):
+            lm = laps == lap
+            trace_name = f'{run_name}·L{int(lap)}' if len(payloads) > 1 else f'L{int(lap)}'
+            fig_index.add_trace(go.Scattergl(
+                x=np.asarray(payload['ay_abs_mps2'], dtype=float)[lm],
+                y=np.asarray(payload['balance_index'], dtype=float)[lm],
+                mode='markers',
+                marker=dict(
+                    color=color_map.get((run_name, int(lap)), '#EBEBEB'),
+                    size=4,
+                    opacity=0.48,
+                ),
+                name=trace_name,
+                hovertemplate=(
+                    f'{trace_name}<br>|ay|=%{{x:.2f}} m/s²'
+                    '<br>Balance=%{y:+.3f}<extra></extra>'
+                ),
+            ))
+    fig_index.update_yaxes(range=[-1.0, 1.0])
+    fig_index.update_layout(showlegend=True)
+    return [fig_scatter, fig_index]
+
+
+def sa_balance_kpis(dfs: dict[str, pl.DataFrame]) -> dict[str, dict]:
+    """Per-run KPIs for front/rear slip-angle balance."""
+    results: dict[str, dict] = {}
+    for run_name, df in dfs.items():
+        missing = [c for c in _SA_BALANCE_COLS if c not in df.columns]
+        if missing:
+            results[run_name] = {'warnings': [f'Missing SA balance columns: {missing}']}
+            continue
+        payload = _compute_sa_balance(_from_df(df, _SA_BALANCE_COLS))
+        n_corner = int(payload['n_corner_samples'])
+        if n_corner == 0:
+            results[run_name] = {'n_corner_samples': 0, 'warnings': ['No radius-filtered corner samples for SA balance.']}
+            continue
+
+        balance = np.asarray(payload['balance_index'], dtype=float)
+        ay_abs = np.asarray(payload['ay_abs_mps2'], dtype=float)
+        sa_front = np.asarray(payload['sa_front_deg'], dtype=float)
+        sa_rear = np.asarray(payload['sa_rear_deg'], dtype=float)
+        peak_mask = ay_abs >= np.nanpercentile(ay_abs, 80.0)
+        results[run_name] = {
+            'balance_index_mean': float(np.nanmean(balance)),
+            'balance_index_at_peak': float(np.nanmean(balance[peak_mask])) if peak_mask.any() else np.nan,
+            'os_fraction': float(np.nanmean(balance > 0.10)),
+            'peak_sa_front_deg': float(np.nanpercentile(sa_front, 95.0)),
+            'peak_sa_rear_deg': float(np.nanpercentile(sa_rear, 95.0)),
+            'n_corner_samples': n_corner,
+            'warnings': [],
+        }
+    return results
 
 
 # ── 2. Understeer angle evolution ─────────────────────────────────────────────
@@ -502,16 +636,28 @@ def pool_arrays_from_dfs(
         if any(c not in df.columns for c in _PILOT_COLS):
             continue
 
-        laps    = df["laps"].to_numpy().astype(float)
-        laptime = df["laptime"].to_numpy().astype(float)
-        ax      = df["Filtering_VN_ax"].to_numpy().astype(float)
-        ay      = df["Filtering_VN_ay"].to_numpy().astype(float)
-        lat     = df["VN_latitude"].to_numpy().astype(float)
-        lng     = df["VN_longitude"].to_numpy().astype(float)
-        vx      = df["VN_vx"].to_numpy().astype(float)
-        brk     = df["Brake"].to_numpy().astype(float)
-        thr     = df["Throttle"].to_numpy().astype(float)
-        ste     = np.rad2deg(df["Steering"].to_numpy().astype(float))
+        cols = cols_to_numpy(df, [
+            "laps",
+            "laptime",
+            "Filtering_VN_ax",
+            "Filtering_VN_ay",
+            "VN_latitude",
+            "VN_longitude",
+            "VN_vx",
+            "Brake",
+            "Throttle",
+            "Steering",
+        ])
+        laps = cols["laps"]
+        laptime = cols["laptime"]
+        ax = cols["Filtering_VN_ax"]
+        ay = cols["Filtering_VN_ay"]
+        lat = cols["VN_latitude"]
+        lng = cols["VN_longitude"]
+        vx = cols["VN_vx"]
+        brk = cols["Brake"]
+        thr = cols["Throttle"]
+        ste = np.rad2deg(cols["Steering"])
         phase_masks = phase_masks_for_map(df)
         phase = np.full(len(df), "STRAIGHT", dtype=object)
         phase[phase_masks["BRAKE"]] = "BRAKE"
@@ -847,6 +993,7 @@ def track_map_fig(
     gg_idx: np.ndarray | None,
     ui_rev: str,
     lap_gates: dict[str, dict[str, object]] | None = None,
+    manual_gate_line: tuple[tuple[float, float], tuple[float, float]] | None = None,
 ) -> go.Figure:
     """Track map coloured by phase, with optional highlights for linked selections."""
     fig = make_dark_figure(xlabel="Longitude [deg]", ylabel="Latitude [deg]")
@@ -900,6 +1047,16 @@ def track_map_fig(
                     f"<br>lat={finish_lat:.6f}<extra></extra>"
                 ),
             ))
+    if manual_gate_line is not None:
+        gate_lon = [float(manual_gate_line[0][0]), float(manual_gate_line[1][0])]
+        gate_lat = [float(manual_gate_line[0][1]), float(manual_gate_line[1][1])]
+        fig.add_trace(go.Scattergl(
+            x=gate_lon, y=gate_lat, mode="lines+markers",
+            name="Manual gate preview",
+            line=dict(color="#4DB3F2", width=3),
+            marker=dict(size=7, color="#4DB3F2"),
+            hovertemplate="Manual gate preview<extra></extra>",
+        ))
     if cross_range is not None:
         d_min, d_max = cross_range
         if (d_max - d_min) < _CLICK_THR_M:
@@ -922,7 +1079,9 @@ def track_map_fig(
             showlegend=False, hoverinfo="skip",
         ))
     fig.update_layout(
-        height=_H_RIGHT, dragmode="select", uirevision=ui_rev,
+        height=_H_RIGHT,
+        dragmode="lasso",
+        uirevision=ui_rev,
         legend=dict(
             orientation="h", yanchor="bottom", y=1.01,
             xanchor="right", x=1.0,
@@ -941,12 +1100,20 @@ def gg_diagram_fig(
     single_csv: bool,
     ui_rev: str,
     gg_range: list[float],
+    friction_envelope: bool = True,
 ) -> go.Figure:
     """GG diagram coloured by lap, optionally filtered by track zone."""
+    if len(gg_range) != 2 or not np.all(np.isfinite(gg_range)):
+        visible_mask = np.zeros(len(pool["ax"]), dtype=bool)
+        for run, lap in visible_keys:
+            visible_mask |= (pool["run"] == run) & (pool["lap"] == lap)
+        gg_range = gg_axis_range(pool, visible_mask, zone_mask)
+
     fig = make_dark_figure(
         xlabel="Filtering_VN_ay [m/s²]",
         ylabel="Filtering_VN_ax [m/s²]",
     )
+    n_traces = 0
     for run, lap, lt in sorted(entries, key=lambda e: e[2]):
         if (run, lap) not in visible_keys:
             continue
@@ -965,14 +1132,47 @@ def gg_diagram_fig(
                 f"<br>ax=%{{y:.2f}} m/s²<extra></extra>"
             ),
         ))
+        n_traces += 1
+    if n_traces == 0:
+        fig.add_annotation(
+            xref="paper", yref="paper", x=0.5, y=0.5,
+            showarrow=False,
+            text="No GG samples for the selected laps/zone",
+            font=dict(size=12, color=_TEXT_COL),
+        )
     fig.add_vline(x=0.0, line=dict(color="rgba(200,200,200,0.35)", dash="dot", width=1))
     fig.add_hline(y=0.0, line=dict(color="rgba(200,200,200,0.35)", dash="dot", width=1))
+    if friction_envelope:
+        theta = np.linspace(0.0, 2.0 * np.pi, 360)
+        envelope_styles = {
+            0.0: "rgba(150,165,180,0.50)",
+            15.0: "rgba(190,210,225,0.62)",
+            25.0: "rgba(245,250,255,0.78)",
+        }
+        for speed_mps, color in envelope_styles.items():
+            downforce_n = 0.5 * RHO_AIR_KGM3 * (speed_mps ** 2) * abs(CL_AERO) * A_AERO_M2
+            a_max_mps2 = MU_TIRE * (G_MS2 + downforce_n / MASS_KG)
+            fig.add_trace(go.Scatter(
+                x=a_max_mps2 * np.cos(theta),
+                y=a_max_mps2 * np.sin(theta),
+                mode="lines",
+                line=dict(color=color, dash="dot", width=1.2),
+                name=f"{speed_mps * 3.6:.0f} km/h",
+                showlegend=True,
+                hoverinfo="skip",
+            ))
+        envelope_max = MU_TIRE * (
+            G_MS2
+            + 0.5 * RHO_AIR_KGM3 * (25.0 ** 2) * abs(CL_AERO) * A_AERO_M2 / MASS_KG
+        )
+        range_max = max(abs(float(gg_range[0])), abs(float(gg_range[1])), float(envelope_max) * 1.03)
+        gg_range = [-range_max, range_max]
     _add_gg_quadrant_annotations(fig, pool, entries, visible_keys, zone_mask, single_csv)
     fig.update_layout(
-        height=_H_RIGHT, uirevision=ui_rev, showlegend=False,
+        height=_H_RIGHT, uirevision=ui_rev, showlegend=friction_envelope,
         margin=dict(l=60, r=10, t=30, b=60),
-        xaxis=dict(autorange=True),
-        yaxis=dict(autorange=True, scaleanchor="x", scaleratio=1),
+        xaxis=dict(range=gg_range),
+        yaxis=dict(range=gg_range, scaleanchor="x", scaleratio=1),
     )
     return fig
 
@@ -1096,8 +1296,9 @@ def phase_map_fig(df: pl.DataFrame) -> go.Figure:
         )
         return fig
 
-    lat   = df["VN_latitude"].to_numpy().astype(float)
-    lng   = df["VN_longitude"].to_numpy().astype(float)
+    cols = cols_to_numpy(df, ["VN_latitude", "VN_longitude"])
+    lat = cols["VN_latitude"]
+    lng = cols["VN_longitude"]
     valid = np.isfinite(lat) & np.isfinite(lng)
     if not valid.any():
         return fig
@@ -1135,11 +1336,1164 @@ def phase_map_fig(df: pl.DataFrame) -> go.Figure:
     return fig
 
 
+# ── 4. Damper velocity histograms (LSB/HSB/LSR/HSR) ──────────────────────────
+
+_DAMPER_COLS = ['TimeStamp', 'laps', 'DampFL', 'DampFR', 'DampRL', 'DampRR']
+
+# Quadrant colours: bump = warm, rebound = cool; high-speed = darker
+_DAMP_QUAD_COLORS = {
+    'HSR': '#1F77B4',  # high-speed rebound  (very negative)
+    'LSR': '#7CB6E0',  # low-speed rebound
+    'LSB': '#F2A65A',  # low-speed bump
+    'HSB': '#D94F4F',  # high-speed bump     (very positive)
+}
+
+
+def _damper_mm(counts: np.ndarray, wheel: str) -> np.ndarray:
+    """Convert raw damper counts to mm at the damper rod (uses calibration)."""
+    cpm = DAMPER_COUNTS_PER_MM.get(wheel, 1.0)
+    return counts / cpm if cpm not in (0.0, None) else counts.astype(float)
+
+
+def _wheel_mm_from_damper_mm(damp_mm: np.ndarray, wheel: str) -> np.ndarray:
+    """Damper rod travel [mm] → wheel travel [mm] using motion ratio."""
+    mr = DAMPER_MOTION_RATIO.get(wheel, 1.0)
+    return damp_mm * mr
+
+
+def damper_histogram_figs(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
+    """Damper velocity histograms per wheel split into LSB/HSB/LSR/HSR.
+
+    Returns a single 2×2 figure (FL / FR / RL / RR) plus a KPIs dict with the
+    fraction of time in each quadrant per wheel and balance metrics.
+    """
+    df = ensure_complete_laps_df(df)
+    missing = [c for c in _DAMPER_COLS if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing damper columns: {missing}")
+
+    arr = cols_to_numpy(df, _DAMPER_COLS)
+    time_s = arr['TimeStamp'] - arr['TimeStamp'][0]
+    dt = robust_dt(time_s)
+
+    split = float(DAMPER_LSHS_SPLIT_MMPS)
+    quad_share: dict[str, dict[str, float]] = {}
+    quad_p95: dict[str, dict[str, float]] = {}
+
+    from plotly.subplots import make_subplots
+    fig = make_subplots(
+        rows=2, cols=2, shared_xaxes=False, shared_yaxes=False,
+        subplot_titles=('FL', 'FR', 'RL', 'RR'),
+        horizontal_spacing=0.08, vertical_spacing=0.14,
+    )
+    grid_pos = {'FL': (1, 1), 'FR': (1, 2), 'RL': (2, 1), 'RR': (2, 2)}
+    show_legend_once = {'HSR', 'LSR', 'LSB', 'HSB'}
+
+    # Damper signals can be integer-quantised → derivative gets stuck at 0.
+    # Smooth over ~50 ms before differentiating to recover physical velocity.
+    from utils import smooth_signal
+    smooth_n = max(1, int(round(0.05 / dt)))
+
+    for w in ('FL', 'FR', 'RL', 'RR'):
+        damp_mm = _damper_mm(arr[f'Damp{w}'], w)
+        wheel_mm = _wheel_mm_from_damper_mm(damp_mm, w)
+        wheel_mm = smooth_signal(wheel_mm, smooth_n)
+        vel = np.gradient(wheel_mm, dt)  # [mm/s]
+        finite = np.isfinite(vel)
+        vel = vel[finite]
+        if vel.size == 0:
+            continue
+
+        lo = float(np.nanpercentile(vel, 1))
+        hi = float(np.nanpercentile(vel, 99))
+        bound = max(abs(lo), abs(hi), split * 2.0)
+        bins = np.linspace(-bound, bound, 81)
+
+        masks = {
+            'HSR': vel <= -split,
+            'LSR': (vel > -split) & (vel < 0.0),
+            'LSB': (vel >= 0.0) & (vel < split),
+            'HSB': vel >= split,
+        }
+        total = float(vel.size)
+        quad_share[w] = {q: float(m.sum()) / total for q, m in masks.items()}
+        quad_p95[w] = {
+            'bump_p95':    float(np.nanpercentile(vel[vel > 0], 95)) if (vel > 0).any() else np.nan,
+            'rebound_p95': float(np.nanpercentile(vel[vel < 0], 5))  if (vel < 0).any() else np.nan,
+        }
+
+        r, c = grid_pos[w]
+        for q in ('HSR', 'LSR', 'LSB', 'HSB'):
+            sub = vel[masks[q]]
+            if sub.size == 0:
+                continue
+            fig.add_trace(
+                go.Histogram(
+                    x=sub, xbins=dict(start=bins[0], end=bins[-1], size=bins[1] - bins[0]),
+                    marker_color=_DAMP_QUAD_COLORS[q],
+                    opacity=0.85, name=q,
+                    legendgroup=q,
+                    showlegend=q in show_legend_once,
+                ),
+                row=r, col=c,
+            )
+            show_legend_once.discard(q)
+
+        fig.add_vline(x=-split, line=dict(color='rgba(255,255,255,0.35)', dash='dot', width=1), row=r, col=c)
+        fig.add_vline(x=+split, line=dict(color='rgba(255,255,255,0.35)', dash='dot', width=1), row=r, col=c)
+        fig.add_vline(x=0.0,    line=dict(color='rgba(255,255,255,0.55)', dash='dash', width=1), row=r, col=c)
+
+        share = quad_share[w]
+        ann = (
+            f"HSR {share['HSR']*100:4.1f}%   LSR {share['LSR']*100:4.1f}%<br>"
+            f"LSB {share['LSB']*100:4.1f}%   HSB {share['HSB']*100:4.1f}%"
+        )
+        fig.add_annotation(
+            xref='x domain', yref='y domain',
+            x=0.02, y=0.98, xanchor='left', yanchor='top',
+            text=ann, showarrow=False, align='left',
+            font=dict(size=10, color='#EBEBEB'),
+            bgcolor='rgba(20,20,23,0.78)',
+            bordercolor='rgba(128,128,128,0.35)', borderwidth=1, borderpad=3,
+            row=r, col=c,
+        )
+
+    fig.update_layout(
+        title=dict(
+            text=(
+                'Damper velocity histograms — LSB/HSB/LSR/HSR (split at '
+                f'±{split:.0f} mm/s)' + ('' if DAMPER_CALIBRATED else '  ·  uncalibrated counts/s')
+            ),
+            font=dict(size=14, color='#EBEBEB'),
+        ),
+        paper_bgcolor='#141417', plot_bgcolor='#141417',
+        font=dict(color='#EBEBEB', size=11),
+        barmode='overlay', bargap=0.02,
+        height=620,
+        legend=dict(
+            bgcolor='rgba(20,20,23,0.85)',
+            bordercolor='rgba(128,128,128,0.3)',
+            font=dict(color='#EBEBEB'),
+            orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1.0,
+        ),
+        margin=dict(l=60, r=20, t=70, b=50),
+    )
+    unit = 'mm/s' if DAMPER_CALIBRATED else 'counts/s'
+    for r in (1, 2):
+        for c in (1, 2):
+            fig.update_xaxes(title_text=f'Damper velocity [{unit}]', gridcolor='rgba(128,128,128,0.2)', row=r, col=c)
+            fig.update_yaxes(title_text='Samples', gridcolor='rgba(128,128,128,0.2)', row=r, col=c)
+
+    # KPIs: per-wheel quadrant share + bump/rebound balance
+    kpis = {
+        'split_mmps': split,
+        'calibrated': bool(DAMPER_CALIBRATED),
+        'quad_share': quad_share,
+        'quad_p95':   quad_p95,
+        'bump_share_by_axle': {
+            'front': float(np.mean([quad_share[w]['LSB'] + quad_share[w]['HSB'] for w in ('FL', 'FR') if w in quad_share])) if quad_share else np.nan,
+            'rear':  float(np.mean([quad_share[w]['LSB'] + quad_share[w]['HSB'] for w in ('RL', 'RR') if w in quad_share])) if quad_share else np.nan,
+        },
+        'warnings': [] if DAMPER_CALIBRATED else [
+            'Damper signals are uncalibrated raw counts — set DAMPER_COUNTS_PER_MM and '
+            'DAMPER_MOTION_RATIO in src/dynamics.py for absolute mm/s values.'
+        ],
+    }
+    return [fig], kpis
+
+
+# ── 5. Roll gradient (deg/g) ─────────────────────────────────────────────────
+
+_ROLL_COLS = ['TimeStamp', 'laps', 'laptime',
+              'Filtering_VN_ay', 'Steering',
+              'DampFL', 'DampFR', 'DampRL', 'DampRR']
+
+
+def _roll_angle_deg(damp_left_mm: np.ndarray, damp_right_mm: np.ndarray,
+                    wheel_left: str, wheel_right: str, track_m: float) -> np.ndarray:
+    """Estimate axle roll angle [deg] from damper positions.
+
+    Positive roll = body rolls towards the right (left wheel compresses,
+    right wheel extends) → matches positive ay in left-handed corner exits.
+    """
+    wheel_left_mm  = _wheel_mm_from_damper_mm(damp_left_mm, wheel_left)
+    wheel_right_mm = _wheel_mm_from_damper_mm(damp_right_mm, wheel_right)
+    delta_mm = wheel_left_mm - wheel_right_mm
+    return np.rad2deg(np.arctan2(delta_mm / 1000.0, track_m))
+
+
+def roll_gradient_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
+    """Body roll angle vs lateral acceleration, regressed per axle."""
+    df = ensure_complete_laps_df(df)
+    missing = [c for c in _ROLL_COLS if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing roll columns: {missing}")
+
+    arr = cols_to_numpy(df, _ROLL_COLS)
+    valid = _base_validity(*arr.values())
+    arr = {k: v[valid] for k, v in arr.items()}
+
+    ay = arr['Filtering_VN_ay']
+    steer = arr['Steering']
+    in_corner = (np.abs(ay) >= 0.8 * AY_THRESHOLD) & (np.abs(steer) >= 0.5 * STEERING_THRESHOLD)
+
+    # Reference each damper to its own median (≈ static ride height) so
+    # the roll angle is a delta relative to straight running.
+    damp = {}
+    for w in ('FL', 'FR', 'RL', 'RR'):
+        mm = _damper_mm(arr[f'Damp{w}'], w)
+        damp[w] = mm - float(np.nanmedian(mm))
+
+    roll_front = _roll_angle_deg(damp['FL'], damp['FR'], 'FL', 'FR', TRACK_FRONT_M)
+    roll_rear  = _roll_angle_deg(damp['RL'], damp['RR'], 'RL', 'RR', TRACK_REAR_M)
+    ay_g = ay / 9.81
+
+    fig = make_dark_figure(
+        title='Roll angle vs lateral acceleration  ·  slope = roll gradient [deg/g]',
+        xlabel='Lateral acceleration ay [g]',
+        ylabel='Roll angle [deg]' + ('' if DAMPER_CALIBRATED else '  (uncalibrated)'),
+    )
+
+    kpis: dict = {'calibrated': bool(DAMPER_CALIBRATED)}
+    for axle, (label, color, roll) in {
+        'front': ('Front', '#4DB3F2', roll_front),
+        'rear':  ('Rear',  '#F28C40', roll_rear),
+    }.items():
+        m = in_corner & np.isfinite(roll) & np.isfinite(ay_g)
+        if not m.any():
+            kpis[f'{axle}_gradient_deg_per_g'] = np.nan
+            kpis[f'{axle}_r2'] = np.nan
+            continue
+        x = ay_g[m]
+        y = roll[m]
+        fig.add_trace(go.Scattergl(
+            x=x, y=y, mode='markers',
+            marker=dict(color=color, size=3, opacity=0.4),
+            name=f'{label} samples',
+        ))
+        if x.size >= 10:
+            slope, intercept = np.polyfit(x, y, 1)
+            xfit = np.linspace(np.nanmin(x), np.nanmax(x), 50)
+            fig.add_trace(go.Scatter(
+                x=xfit, y=slope * xfit + intercept,
+                mode='lines',
+                line=dict(color=color, width=2.4),
+                name=f'{label} fit · {slope:+.2f} deg/g',
+            ))
+            ss_res = float(np.sum((y - (slope * x + intercept)) ** 2))
+            ss_tot = float(np.sum((y - np.nanmean(y)) ** 2))
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+            kpis[f'{axle}_gradient_deg_per_g'] = float(slope)
+            kpis[f'{axle}_r2'] = float(r2)
+        else:
+            kpis[f'{axle}_gradient_deg_per_g'] = np.nan
+            kpis[f'{axle}_r2'] = np.nan
+
+    fig.add_hline(y=0.0, line=dict(color='rgba(200,200,200,0.4)', dash='dot', width=1))
+    fig.add_vline(x=0.0, line=dict(color='rgba(200,200,200,0.4)', dash='dot', width=1))
+    kpis['warnings'] = (
+        [] if DAMPER_CALIBRATED else
+        ['Roll values are uncalibrated — set DAMPER_COUNTS_PER_MM/MOTION_RATIO in src/dynamics.py.']
+    )
+    return fig, kpis
+
+
+# ── 6. Brake distribution: ideal model vs measured regen ─────────────────────
+
+_BRAKE_DIST_COLS = [
+    'TimeStamp', 'laps', 'laptime',
+    'Filtering_VN_ax', 'VN_vx',
+    'FL_actualTorque', 'FR_actualTorque',
+    'RL_actualTorque', 'RR_actualTorque',
+]
+_BRAKE_DIST_OPTIONAL_COLS = ['BSEFront', 'BSERear']
+
+
+def _ideal_brake_forces(
+    ax_abs_mps2: np.ndarray,
+    vx_mps: np.ndarray | float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Ideal front/rear brake force split from vertical load distribution."""
+    ax_abs = np.asarray(ax_abs_mps2, dtype=float)
+    vx = np.asarray(vx_mps, dtype=float)
+    aero_n = 0.5 * RHO_AIR_KGM3 * (vx ** 2) * abs(CL_AERO) * A_AERO_M2
+    front_aero_frac = _aero_front_fraction()
+    d_fz_n = MASS_KG * ax_abs * COG_Z_M / WHEELBASE_M
+    fz_front_n = MASS_KG * G_MPS2 * LR_M / WHEELBASE_M + d_fz_n + aero_n * front_aero_frac
+    fz_rear_n = MASS_KG * G_MPS2 * LF_M / WHEELBASE_M - d_fz_n + aero_n * (1.0 - front_aero_frac)
+    fz_total_n = fz_front_n + fz_rear_n
+    front_frac = np.divide(
+        fz_front_n,
+        fz_total_n,
+        out=np.full_like(fz_front_n, np.nan, dtype=float),
+        where=np.isfinite(fz_total_n) & (fz_total_n > 0.0),
+    )
+    total_fx_n = MASS_KG * ax_abs
+    return total_fx_n * front_frac, total_fx_n * (1.0 - front_frac), front_frac
+
+
+def _regen_force_from_motor_torque(torque_nm: np.ndarray) -> np.ndarray:
+    """Positive braking force [N] from negative motor torque [N·m]."""
+    regen_torque_nm = -np.minimum(0.0, torque_nm) * GEAR_RATIO
+    return regen_torque_nm / WHEEL_RADIUS_M
+
+
+def _brake_pressure_demand_force(pressure_bar: np.ndarray, piston_count: int) -> np.ndarray:
+    """Hydraulic brake demand force [N] from pressure [bar], if sensors exist."""
+    piston_area_m2 = np.pi * (BRAKE_PISTON_DIAM_M * 0.5) ** 2
+    pad_radius_m = 0.5 * (BRAKE_PAD_RE_M + BRAKE_PAD_RI_M)
+    pressure_pa = np.maximum(0.0, pressure_bar) * 1e5
+    return pressure_pa * piston_count * piston_area_m2 * BRAKE_PAD_MU * pad_radius_m / WHEEL_RADIUS_M
+
+
+def _rms_distance_to_ideal_curve(
+    ff_n: np.ndarray,
+    fr_n: np.ndarray,
+    vx_mps: np.ndarray,
+    ax_grid_mps2: np.ndarray,
+) -> np.ndarray:
+    """Per-sample Euclidean distance [N] to the ideal curve at sample speed."""
+    out = np.full_like(ff_n, np.nan, dtype=float)
+    chunk_size = 4000
+    for start in range(0, len(ff_n), chunk_size):
+        end = min(start + chunk_size, len(ff_n))
+        for i in range(start, end):
+            f_curve, r_curve, _front_frac = _ideal_brake_forces(ax_grid_mps2, vx_mps[i])
+            dist = np.hypot(f_curve - ff_n[i], r_curve - fr_n[i])
+            out[i] = float(np.nanmin(dist)) if np.any(np.isfinite(dist)) else np.nan
+    return out
+
+
+def _ideal_rear_at_front_force(
+    ff_n: np.ndarray,
+    vx_mps: np.ndarray,
+    ax_grid_mps2: np.ndarray,
+) -> np.ndarray:
+    """Ideal rear force [N] interpolated at measured front force and speed."""
+    out = np.full_like(ff_n, np.nan, dtype=float)
+    for i, (front_force_n, vx) in enumerate(zip(ff_n, vx_mps)):
+        f_curve, r_curve, _front_frac = _ideal_brake_forces(ax_grid_mps2, vx)
+        order = np.argsort(f_curve)
+        out[i] = np.interp(front_force_n, f_curve[order], r_curve[order])
+    return out
+
+
+def _empty_brake_distribution_fig(message: str) -> go.Figure:
+    fig = make_dark_figure(
+        title='Ideal braking curve vs measured regen',
+        xlabel='Front braking force [kN]',
+        ylabel='Rear braking force [kN]',
+    )
+    fig.add_annotation(
+        xref='paper', yref='paper', x=0.5, y=0.5,
+        showarrow=False, text=message,
+        font=dict(color='#EBEBEB', size=12),
+    )
+    return fig
+
+
+def ideal_braking_curve_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Compare ideal front/rear braking distribution with measured regen force.
+
+    Returns a force-plane figure plus KPIs per run.
+    """
+    if not dfs:
+        return _empty_brake_distribution_fig('No runs selected'), {'runs': {}, 'warnings': ['No runs selected.']}
+
+    ax_grid = np.linspace(0.0, MU_TIRE * G_MPS2, 200)
+    run_payloads: list[dict[str, object]] = []
+    kpi_runs: dict[str, dict[str, float]] = {}
+    warnings: list[str] = []
+    color_max = 1.0
+    required = list(_BRAKE_DIST_COLS)
+    ideal_curve_limits: list[tuple[float, float]] = []
+
+    for run_name, df_in in dfs.items():
+        df = ensure_complete_laps_df(df_in)
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            warnings.append(f'{run_name}: missing brake distribution columns: {missing}')
+            continue
+
+        cols = required + [c for c in _BRAKE_DIST_OPTIONAL_COLS if c in df.columns]
+        arr = cols_to_numpy(df, cols)
+        dist_m = lap_dist_from_gps(df)
+        valid = _base_validity(*(arr[c] for c in required)) & np.isfinite(dist_m)
+        if not valid.any():
+            warnings.append(f'{run_name}: no finite brake distribution samples.')
+            continue
+
+        arr = {k: v[valid] for k, v in arr.items()}
+        dist_m = dist_m[valid]
+        vx_mps = np.abs(arr['VN_vx'])
+        ax_abs_mps2 = np.abs(arr['Filtering_VN_ax'])
+        f_reg_fl = _regen_force_from_motor_torque(arr['FL_actualTorque'])
+        f_reg_fr = _regen_force_from_motor_torque(arr['FR_actualTorque'])
+        f_reg_rl = _regen_force_from_motor_torque(arr['RL_actualTorque'])
+        f_reg_rr = _regen_force_from_motor_torque(arr['RR_actualTorque'])
+        f_reg_front_n = f_reg_fl + f_reg_fr
+        f_reg_rear_n = f_reg_rl + f_reg_rr
+        total_regen_n = f_reg_front_n + f_reg_rear_n
+
+        brake_mask = (
+            (arr['Filtering_VN_ax'] < -1.0)
+            & (total_regen_n > 50.0)
+            & np.isfinite(vx_mps)
+            & np.isfinite(dist_m)
+        )
+        if not brake_mask.any():
+            warnings.append(f'{run_name}: no regen braking samples meet the filter.')
+            continue
+
+        ff_n = f_reg_front_n[brake_mask]
+        fr_n = f_reg_rear_n[brake_mask]
+        vx_b = vx_mps[brake_mask]
+        ax_b = ax_abs_mps2[brake_mask]
+        dist_b = dist_m[brake_mask]
+        total_b = ff_n + fr_n
+        front_bias = np.divide(
+            ff_n,
+            total_b,
+            out=np.full_like(ff_n, np.nan, dtype=float),
+            where=total_b > 0.0,
+        )
+
+        equivalent_ax = np.clip(total_b / MASS_KG, 0.0, MU_TIRE * G_MPS2)
+        _ideal_ff, _ideal_fr, ideal_front_bias = _ideal_brake_forces(equivalent_ax, vx_b)
+        bias_error = front_bias - ideal_front_bias
+        dist_to_ideal_n = _rms_distance_to_ideal_curve(ff_n, fr_n, vx_b, ax_grid)
+        ideal_rear_n = _ideal_rear_at_front_force(ff_n, vx_b, ax_grid)
+        rear_overbiased = fr_n > ideal_rear_n
+        peak_combined_brake_g = np.nanmax(total_b) / (MASS_KG * G_MPS2)
+
+        hyd_payload = None
+        if 'BSEFront' in arr and 'BSERear' in arr:
+            bse_f = arr['BSEFront'][brake_mask]
+            bse_r = arr['BSERear'][brake_mask]
+            bse_active = (
+                np.nanstd(bse_f) > 0.05
+                or np.nanstd(bse_r) > 0.05
+            )
+            if bse_active:
+                hyd_payload = {
+                    'front_kN': _brake_pressure_demand_force(bse_f, BRAKE_PISTONS_F) / 1000.0,
+                    'rear_kN': _brake_pressure_demand_force(bse_r, BRAKE_PISTONS_R) / 1000.0,
+                }
+
+        color_max = max(color_max, float(np.nanpercentile(ax_b, 95)) if ax_b.size else 1.0)
+        run_payloads.append({
+            'run_name': run_name,
+            'front_kN': ff_n / 1000.0,
+            'rear_kN': fr_n / 1000.0,
+            'ax_abs': ax_b,
+            'hyd': hyd_payload,
+        })
+        kpi_runs[run_name] = {
+            'front_bias_mean': float(np.nanmean(front_bias)),
+            'front_bias_std': float(np.nanstd(front_bias)),
+            'rms_dist_to_ideal_N': float(np.sqrt(np.nanmean(dist_to_ideal_n ** 2))),
+            'pct_time_rear_overbiased': float(np.nanmean(rear_overbiased) * 100.0),
+            'peak_combined_brake_g': float(peak_combined_brake_g),
+            'samples': int(brake_mask.sum()),
+        }
+
+    if not run_payloads:
+        return _empty_brake_distribution_fig('No valid regen braking samples'), {
+            'runs': kpi_runs,
+            'warnings': warnings or ['No valid regen braking samples.'],
+        }
+
+    fig = make_dark_figure(
+        xlabel='Front braking force [kN]',
+        ylabel='Rear braking force [kN]',
+    )
+
+    curve_colors = {0.0: '#3155D4', 15.0: '#32A6F0', 25.0: '#54F0FF'}
+    for speed_mps, color in curve_colors.items():
+        f_curve, r_curve, _front_frac = _ideal_brake_forces(ax_grid, speed_mps)
+        ideal_curve_limits.append((float(np.nanmax(f_curve / 1000.0)), float(np.nanmax(r_curve / 1000.0))))
+        fig.add_trace(go.Scatter(
+            x=f_curve / 1000.0,
+            y=r_curve / 1000.0,
+            mode='lines',
+            line=dict(color=color, width=2.4),
+            name=f'Ideal {speed_mps:.0f} m/s',
+            hovertemplate='Ff=%{x:.2f} kN<br>Fr=%{y:.2f} kN<extra></extra>',
+        ))
+
+    force_limit_kN = MU_TIRE * MASS_KG * G_MPS2 / 1000.0
+    fig.add_trace(go.Scatter(
+        x=[0.0, force_limit_kN],
+        y=[force_limit_kN, 0.0],
+        mode='lines',
+        line=dict(color='rgba(235,235,235,0.55)', width=1.5, dash='dot'),
+        name=f'μ envelope v=0 ({MU_TIRE:.2f})',
+        hoverinfo='skip',
+    ))
+    balance_slope = (1.0 - BRAKE_FRONT_BALANCE) / BRAKE_FRONT_BALANCE
+    fig.add_trace(go.Scatter(
+        x=[0.0, force_limit_kN],
+        y=[0.0, balance_slope * force_limit_kN],
+        mode='lines',
+        line=dict(color='#F2D44D', width=1.8, dash='dash'),
+        name=f'LLC balance {BRAKE_FRONT_BALANCE * 100:.0f}/{(1.0 - BRAKE_FRONT_BALANCE) * 100:.0f}',
+        hoverinfo='skip',
+    ))
+
+    run_colors = ['#F28C40', '#73D973', '#D973D9', '#F27070', '#B6E880', '#FF97FF']
+    for idx, payload in enumerate(run_payloads):
+        run_name = str(payload['run_name'])
+        showscale = idx == 0
+        fig.add_trace(go.Scattergl(
+            x=payload['front_kN'],
+            y=payload['rear_kN'],
+            mode='markers',
+            marker=dict(
+                color=payload['ax_abs'],
+                colorscale='Plasma',
+                cmin=0.0,
+                cmax=color_max,
+                size=4,
+                opacity=0.48,
+                colorbar=dict(title='|ax| [m/s²]') if showscale else None,
+                showscale=showscale,
+            ),
+            name=f'{run_name} regen',
+            hovertemplate=(
+                f'{run_name}<br>Ff=%{{x:.2f}} kN<br>Fr=%{{y:.2f}} kN'
+                '<br>|ax|=%{marker.color:.2f} m/s²<extra></extra>'
+            ),
+        ))
+        hyd = payload.get('hyd')
+        if isinstance(hyd, dict):
+            fig.add_trace(go.Scattergl(
+                x=hyd['front_kN'],
+                y=hyd['rear_kN'],
+                mode='markers',
+                marker=dict(
+                    color='rgba(235,235,235,0.0)',
+                    line=dict(color=run_colors[idx % len(run_colors)], width=1.2),
+                    size=6,
+                    symbol='circle-open',
+                    opacity=0.55,
+                ),
+                name=f'{run_name} BSE demand',
+                hovertemplate=(
+                    f'{run_name} BSE demand<br>Ff=%{{x:.2f}} kN'
+                    '<br>Fr=%{y:.2f} kN<extra></extra>'
+                ),
+            ))
+
+    visible_front_kN = [float(np.nanpercentile(p['front_kN'], 99.7)) for p in run_payloads]
+    visible_rear_kN = [float(np.nanpercentile(p['rear_kN'], 99.7)) for p in run_payloads]
+    for p in run_payloads:
+        hyd = p.get('hyd')
+        if isinstance(hyd, dict):
+            visible_front_kN.append(float(np.nanpercentile(hyd['front_kN'], 99.7)))
+            visible_rear_kN.append(float(np.nanpercentile(hyd['rear_kN'], 99.7)))
+    for front_lim_kN, rear_lim_kN in ideal_curve_limits:
+        visible_front_kN.append(front_lim_kN)
+        visible_rear_kN.append(rear_lim_kN)
+    axis_max = max(visible_front_kN + visible_rear_kN) * 1.12
+    fig.update_layout(
+        paper_bgcolor='#141417',
+        plot_bgcolor='#141417',
+        font=dict(color='#EBEBEB', size=11),
+        height=860,
+        margin=dict(l=80, r=120, t=35, b=75),
+        legend=dict(
+            bgcolor='rgba(20,20,23,0.85)',
+            bordercolor='rgba(128,128,128,0.3)',
+            orientation='h',
+            yanchor='bottom',
+            y=1.01,
+            xanchor='right',
+            x=1.0,
+        ),
+        hovermode='closest',
+    )
+    fig.update_xaxes(title_text='Front braking force [kN]', range=[0.0, 5.0])
+    fig.update_yaxes(title_text='Rear braking force [kN]', range=[0.0, 2.0], scaleanchor='x', scaleratio=1)
+
+    return fig, {
+        'runs': kpi_runs,
+        'warnings': warnings,
+        'front_balance_reference': BRAKE_FRONT_BALANCE,
+        'mu_tire': MU_TIRE,
+    }
+
+
+# ── 9. Acceleration envelope: tire vs torque vs power ────────────────────────
+
+_ACCEL_ENV_COLS = [
+    'TimeStamp', 'laps', 'laptime',
+    'Filtering_VN_ax', 'VN_vx',
+    'FL_actualTorque', 'FR_actualTorque',
+    'RL_actualTorque', 'RR_actualTorque',
+]
+
+
+def _accel_envelope_curves(vx_mps: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Model tractive-force envelopes [N] vs speed [m/s]."""
+    vx = np.asarray(vx_mps, dtype=float)
+    aero_n = 0.5 * RHO_AIR_KGM3 * (vx ** 2) * abs(CL_AERO) * A_AERO_M2
+    fx_tire_n = MU_TIRE * (MASS_KG * G_MS2 + aero_n)
+    fx_torque_n = np.full_like(vx, N_MOTORS * T_MOTOR_MAX_NM * GEAR_RATIO / WHEEL_RADIUS_M, dtype=float)
+    fx_power_n = MAX_POWER_W / np.maximum(vx, 0.5)
+    fx_max_n = np.minimum(np.minimum(fx_tire_n, fx_torque_n), fx_power_n)
+    return fx_tire_n, fx_torque_n, fx_power_n, fx_max_n
+
+
+def _empty_accel_envelope_fig(message: str) -> go.Figure:
+    fig = make_dark_figure(
+        xlabel='Vehicle speed [m/s]',
+        ylabel='Total tractive force [kN]',
+    )
+    fig.add_annotation(
+        xref='paper', yref='paper', x=0.5, y=0.5,
+        showarrow=False, text=message,
+        font=dict(color='#EBEBEB', size=12),
+    )
+    return fig
+
+
+def _tire_torque_crossover_mps() -> float:
+    """Speed where tire and torque limits intersect."""
+    fx_torque_n = N_MOTORS * T_MOTOR_MAX_NM * GEAR_RATIO / WHEEL_RADIUS_M
+    aero_needed_n = fx_torque_n / MU_TIRE - MASS_KG * G_MS2
+    if aero_needed_n <= 0.0:
+        return 0.0
+    denom = 0.5 * RHO_AIR_KGM3 * abs(CL_AERO) * A_AERO_M2
+    if denom <= 0.0:
+        return np.inf
+    return float(np.sqrt(aero_needed_n / denom))
+
+
+def accel_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Compare measured tractive force against tire/torque/power envelopes."""
+    if not dfs:
+        return _empty_accel_envelope_fig('No runs selected'), {'runs': {}, 'warnings': ['No runs selected.']}
+
+    v_grid_mps = np.linspace(0.0, 35.0, 200)
+    fx_tire_grid_n, fx_torque_grid_n, fx_power_grid_n, fx_max_grid_n = _accel_envelope_curves(v_grid_mps)
+    torque_power_crossover_mps = float(MAX_POWER_W / fx_torque_grid_n[0]) if fx_torque_grid_n.size else np.nan
+    tire_torque_crossover_mps = _tire_torque_crossover_mps()
+
+    run_payloads: list[dict[str, object]] = []
+    kpi_runs: dict[str, dict[str, float]] = {}
+    warnings: list[str] = []
+    required = list(_ACCEL_ENV_COLS)
+    run_colors = ['#F28C40', '#73D973', '#D973D9', '#4DB3F2', '#F27070', '#B6E880']
+
+    for run_name, df_in in dfs.items():
+        df = ensure_complete_laps_df(df_in)
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            warnings.append(f'{run_name}: missing acceleration-envelope columns: {missing}')
+            continue
+
+        arr = cols_to_numpy(df, required)
+        valid = _base_validity(*(arr[c] for c in required))
+        if not valid.any():
+            warnings.append(f'{run_name}: no finite acceleration-envelope samples.')
+            continue
+
+        arr = {k: v[valid] for k, v in arr.items()}
+        arr = exclude_lap0_and_last_lap(arr)
+        if arr['TimeStamp'].size == 0:
+            warnings.append(f'{run_name}: no complete laps after lap-0/last-lap exclusion.')
+            continue
+
+        vx_mps = np.abs(arr['VN_vx'])
+        total_torque_nm = (
+            arr['FL_actualTorque'] + arr['FR_actualTorque']
+            + arr['RL_actualTorque'] + arr['RR_actualTorque']
+        )
+        fx_measured_n = total_torque_nm * GEAR_RATIO / WHEEL_RADIUS_M
+        accel_mask = (
+            (arr['Filtering_VN_ax'] > 1.0)
+            & (total_torque_nm > 0.0)
+            & (vx_mps > 5.0)
+        )
+        if not accel_mask.any():
+            warnings.append(f'{run_name}: no traction samples meet the acceleration filter.')
+            continue
+
+        vx_a = vx_mps[accel_mask]
+        fx_a_n = fx_measured_n[accel_mask]
+        laps_a = arr['laps'][accel_mask]
+        ax_a = arr['Filtering_VN_ax'][accel_mask]
+        fx_tire_a_n, fx_torque_a_n, fx_power_a_n, fx_max_a_n = _accel_envelope_curves(vx_a)
+        efficiency = np.divide(
+            fx_a_n,
+            fx_max_a_n,
+            out=np.full_like(fx_a_n, np.nan, dtype=float),
+            where=np.isfinite(fx_max_a_n) & (fx_max_a_n > 0.0),
+        )
+        over_envelope = efficiency > 1.02
+        if over_envelope.any():
+            warnings.append(
+                f'{run_name}: {np.mean(over_envelope) * 100.0:.1f}% of accel samples exceed the model envelope by >2%.'
+            )
+
+        run_payloads.append({
+            'run_name': run_name,
+            'vx_mps': vx_a,
+            'fx_kN': fx_a_n / 1000.0,
+            'laps': laps_a.astype(int),
+            'ax_mps2': ax_a,
+        })
+        kpi_runs[run_name] = {
+            'peak_accel_g': float(np.nanmax(fx_a_n) / (MASS_KG * G_MS2)),
+            'pct_within_90_envelope': float(np.nanmean(fx_a_n >= 0.9 * fx_max_a_n) * 100.0),
+            'mean_envelope_efficiency': float(np.nanmean(efficiency)),
+            'pct_time_power_limited': float(np.nanmean(vx_a > torque_power_crossover_mps) * 100.0),
+            'peak_total_power_kw': float(np.nanmax(fx_a_n * vx_a) / 1000.0),
+            'samples': int(accel_mask.sum()),
+            'power_limit_crossover_mps': float(torque_power_crossover_mps),
+        }
+
+    if not run_payloads:
+        return _empty_accel_envelope_fig('No valid acceleration samples'), {
+            'runs': kpi_runs,
+            'warnings': warnings or ['No valid acceleration samples.'],
+        }
+
+    fig = make_dark_figure(
+        xlabel='Vehicle speed [m/s]',
+        ylabel='Total tractive force [kN]',
+    )
+    fig.add_trace(go.Scatter(
+        x=v_grid_mps,
+        y=fx_tire_grid_n / 1000.0,
+        mode='lines',
+        line=dict(color='#F28C40', width=2.0, dash='dash'),
+        name='Fx tire limit',
+        hovertemplate='V=%{x:.1f} m/s<br>Fx=%{y:.2f} kN<extra></extra>',
+    ))
+    fig.add_trace(go.Scatter(
+        x=v_grid_mps,
+        y=fx_torque_grid_n / 1000.0,
+        mode='lines',
+        line=dict(color='#73D973', width=2.0, dash='dash'),
+        name='Fx torque limit',
+        hovertemplate='V=%{x:.1f} m/s<br>Fx=%{y:.2f} kN<extra></extra>',
+    ))
+    fig.add_trace(go.Scatter(
+        x=v_grid_mps,
+        y=fx_power_grid_n / 1000.0,
+        mode='lines',
+        line=dict(color='#4DB3F2', width=2.0, dash='dash'),
+        name='Fx power limit',
+        hovertemplate='V=%{x:.1f} m/s<br>Fx=%{y:.2f} kN<extra></extra>',
+    ))
+    fig.add_trace(go.Scatter(
+        x=v_grid_mps,
+        y=fx_max_grid_n / 1000.0,
+        mode='lines',
+        line=dict(color='#F5F5F5', width=4.0),
+        name='Fx max envelope',
+        hovertemplate='V=%{x:.1f} m/s<br>Fx max=%{y:.2f} kN<extra></extra>',
+    ))
+
+    for idx, payload in enumerate(run_payloads):
+        run_name = str(payload['run_name'])
+        lap_ids = np.asarray(payload['laps'], dtype=int)
+        ax_vals = np.asarray(payload['ax_mps2'], dtype=float)
+        customdata = np.column_stack([lap_ids, ax_vals])
+        fig.add_trace(go.Scattergl(
+            x=payload['vx_mps'],
+            y=payload['fx_kN'],
+            mode='markers',
+            marker=dict(
+                color=run_colors[idx % len(run_colors)],
+                size=4,
+                opacity=0.42,
+            ),
+            customdata=customdata,
+            name=run_name,
+            hovertemplate=(
+                f'{run_name}<br>V=%{{x:.2f}} m/s<br>Fx=%{{y:.2f}} kN'
+                '<br>Lap=%{customdata[0]:.0f}<br>ax=%{customdata[1]:.2f} m/s²<extra></extra>'
+            ),
+        ))
+
+    annotation_specs = [
+        ('tire-limited', 0.5 * min(tire_torque_crossover_mps, 35.0)),
+        ('torque-limited', 0.5 * (min(tire_torque_crossover_mps, 35.0) + min(torque_power_crossover_mps, 35.0))),
+        ('power-limited', 0.5 * (min(torque_power_crossover_mps, 35.0) + 35.0)),
+    ]
+    for text, x_pos in annotation_specs:
+        if not np.isfinite(x_pos) or x_pos <= 0.2 or x_pos >= 34.8:
+            continue
+        y_pos = float(np.interp(x_pos, v_grid_mps, fx_max_grid_n / 1000.0)) * 1.03
+        fig.add_annotation(
+            x=x_pos,
+            y=y_pos,
+            text=text,
+            showarrow=False,
+            font=dict(color='#CFCFCF', size=11),
+            bgcolor='rgba(20,20,23,0.72)',
+        )
+
+    fig.update_layout(
+        paper_bgcolor='#141417',
+        plot_bgcolor='#141417',
+        font=dict(color='#EBEBEB', size=11),
+        height=760,
+        margin=dict(l=80, r=40, t=45, b=75),
+        legend=dict(
+            bgcolor='rgba(20,20,23,0.85)',
+            bordercolor='rgba(128,128,128,0.3)',
+            orientation='h',
+            yanchor='bottom',
+            y=1.01,
+            xanchor='right',
+            x=1.0,
+        ),
+        hovermode='closest',
+    )
+    fig.update_xaxes(title_text='Vehicle speed [m/s]', range=[0.0, 35.0])
+    fig.update_yaxes(title_text='Total tractive force [kN]', rangemode='tozero')
+
+    return fig, {
+        'runs': kpi_runs,
+        'warnings': warnings,
+        'tire_torque_crossover_mps': float(tire_torque_crossover_mps),
+        'torque_power_crossover_mps': float(torque_power_crossover_mps),
+        'mu_tire': MU_TIRE,
+        'fx_torque_limit_n': float(fx_torque_grid_n[0]),
+    }
+
+
+# ── 10. Friction-circle utilization per wheel ────────────────────────────────
+
+_TIRE_FORCE_COLS = [
+    'TimeStamp', 'laps', 'laptime',
+    'Filtering_VN_ay', 'VN_vx',
+    'Est_FXFL', 'Est_FXFR', 'Est_FXRL', 'Est_FXRR',
+    'Est_FYFL', 'Est_FYFR', 'Est_FYRL', 'Est_FYRR',
+    'Est_FZFL', 'Est_FZFR', 'Est_FZRL', 'Est_FZRR',
+]
+
+
+def friction_circle_figs(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
+    """Per-wheel tire force utilization from Est_FX/FY/FZ."""
+    df = ensure_complete_laps_df(df)
+    missing = [c for c in _TIRE_FORCE_COLS if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing tire force columns: {missing}")
+
+    from plotly.subplots import make_subplots
+
+    arr = cols_to_numpy(df, _TIRE_FORCE_COLS)
+    dist_m = lap_dist_from_gps(df)
+    valid = _base_validity(*arr.values()) & np.isfinite(dist_m)
+    arr = {k: v[valid] for k, v in arr.items()}
+    dist_m = dist_m[valid]
+
+    time_s = arr['TimeStamp'] - arr['TimeStamp'][0]
+    dt = robust_dt(time_s)
+    corner_mask, _radius_m = _radius_corner_mask(arr['VN_vx'], arr['Filtering_VN_ay'], dt)
+    ay_abs = np.abs(arr['Filtering_VN_ay'])
+    color_max = float(np.nanpercentile(ay_abs[corner_mask], 95)) if corner_mask.any() else 1.0
+    theta = np.linspace(0.0, 2.0 * np.pi, 160)
+
+    fig_circle = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=('FL', 'FR', 'RL', 'RR'),
+        horizontal_spacing=0.08,
+        vertical_spacing=0.14,
+    )
+    pos = {'FL': (1, 1), 'FR': (1, 2), 'RL': (2, 1), 'RR': (2, 2)}
+    util_by_wheel: dict[str, np.ndarray] = {}
+    kpi_wheels: dict[str, dict[str, float]] = {}
+
+    for idx, w in enumerate(('FL', 'FR', 'RL', 'RR')):
+        fx = arr[f'Est_FX{w}']
+        fy = arr[f'Est_FY{w}']
+        fz = arr[f'Est_FZ{w}']
+        finite = corner_mask & np.isfinite(fx) & np.isfinite(fy) & np.isfinite(fz) & (fz > 100.0)
+        util = np.divide(
+            np.hypot(fx, fy),
+            MU_TIRE * fz,
+            out=np.full_like(fx, np.nan, dtype=float),
+            where=np.isfinite(fx) & np.isfinite(fy) & np.isfinite(fz) & (fz > 100.0),
+        )
+        util_by_wheel[w] = util
+        r, c = pos[w]
+        fig_circle.add_trace(go.Scatter(
+            x=MU_TIRE * np.cos(theta),
+            y=MU_TIRE * np.sin(theta),
+            mode='lines',
+            line=dict(color='rgba(235,235,235,0.55)', width=1.2, dash='dash'),
+            name='μ limit' if idx == 0 else '',
+            showlegend=idx == 0,
+            hoverinfo='skip',
+        ), row=r, col=c)
+        if finite.any():
+            fig_circle.add_trace(go.Scattergl(
+                x=fx[finite] / fz[finite],
+                y=fy[finite] / fz[finite],
+                mode='markers',
+                marker=dict(
+                    color=ay_abs[finite],
+                    colorscale='Turbo',
+                    cmin=0.0,
+                    cmax=color_max,
+                    size=3,
+                    opacity=0.50,
+                    showscale=idx == 3,
+                    colorbar=dict(title='|ay| [m/s²]') if idx == 3 else None,
+                ),
+                name=w,
+            ), row=r, col=c)
+        brake_turn = finite & (fx < 0.0)
+        kpi_wheels[w] = {
+            'peak_util': float(np.nanpercentile(util[finite], 99)) if finite.any() else np.nan,
+            'sat_time_pct': float(np.nanmean(util[finite] > 0.95) * 100.0) if finite.any() else np.nan,
+            'brake_turn_pct': float(np.nanmean(brake_turn[finite]) * 100.0) if finite.any() else np.nan,
+        }
+
+    fig_circle.update_layout(
+        title=dict(text=f'Friction circle per wheel · μ={MU_TIRE:.2f} · radius-filtered corners'),
+        paper_bgcolor='#141417',
+        plot_bgcolor='#141417',
+        font=dict(color='#EBEBEB', size=11),
+        height=700,
+        margin=dict(l=60, r=40, t=70, b=55),
+    )
+    for r in (1, 2):
+        for c in (1, 2):
+            fig_circle.update_xaxes(title_text='Fx/Fz [-]', range=[-MU_TIRE * 1.1, MU_TIRE * 1.1], row=r, col=c)
+            fig_circle.update_yaxes(title_text='Fy/Fz [-]', range=[-MU_TIRE * 1.1, MU_TIRE * 1.1], row=r, col=c)
+
+    fig_util = make_dark_figure(
+        title='Tire utilization vs distance',
+        xlabel='Distance [m]',
+        ylabel='Utilization √(Fx²+Fy²)/(μFz) [-]',
+    )
+    for w in ('FL', 'FR', 'RL', 'RR'):
+        finite = np.isfinite(util_by_wheel[w]) & np.isfinite(dist_m)
+        if finite.any():
+            fig_util.add_trace(go.Scattergl(
+                x=dist_m[finite],
+                y=util_by_wheel[w][finite],
+                mode='lines',
+                name=w,
+                line=dict(color=WHEEL_COLORS[w], width=1.2),
+            ))
+    fig_util.add_hline(y=1.0, line=dict(color='rgba(235,235,235,0.7)', dash='dash', width=1.2))
+
+    return [fig_circle, fig_util], {
+        'wheels': kpi_wheels,
+        'mu_tire': MU_TIRE,
+        'corner_samples': int(corner_mask.sum()),
+        'warnings': [] if corner_mask.any() else ['No radius-filtered corner samples for friction circle.'],
+    }
+
+
+# ── 9. Body slip angle beta ──────────────────────────────────────────────────
+
+def body_slip_angle_fig(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
+    """Body sideslip beta from Est_vyCOG/Est_vxCOG."""
+    df = ensure_complete_laps_df(df)
+    cols = [
+        'TimeStamp', 'laps', 'laptime',
+        'Filtering_VN_ay', 'VN_vx',
+        'Est_vxCOG', 'Est_vyCOG',
+    ]
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing body-slip columns: {missing}")
+
+    arr = cols_to_numpy(df, cols)
+    dist_m = lap_dist_from_gps(df)
+    valid = _base_validity(*arr.values()) & np.isfinite(dist_m)
+    arr = {k: v[valid] for k, v in arr.items()}
+    dist_m = dist_m[valid]
+    time_s = arr['TimeStamp'] - arr['TimeStamp'][0]
+    dt = robust_dt(time_s)
+    beta_deg = np.rad2deg(np.arctan2(arr['Est_vyCOG'], arr['Est_vxCOG']))
+    beta_rate_degps = np.gradient(smooth_signal(beta_deg, max(1, int(round(0.05 / dt)))), dt)
+    corner_mask, radius_m = _radius_corner_mask(arr['VN_vx'], arr['Filtering_VN_ay'], dt)
+
+    fig_beta = make_dark_figure(
+        title='Body slip angle β vs distance',
+        xlabel='Distance [m]',
+        ylabel='β [deg]',
+    )
+    for lap in unique_laps(arr['laps']):
+        lm = arr['laps'] == lap
+        if not lm.any():
+            continue
+        order = np.argsort(dist_m[lm])
+        fig_beta.add_trace(go.Scattergl(
+            x=dist_m[lm][order],
+            y=beta_deg[lm][order],
+            mode='lines',
+            name=f'L{int(lap)}',
+            line=dict(width=1.2),
+        ))
+    fig_beta.add_hline(y=0.0, line=dict(color='rgba(235,235,235,0.45)', dash='dot', width=1.0))
+
+    fig_thrust = make_dark_figure(
+        title='β-thrust diagram',
+        xlabel='Lateral acceleration ay [m/s²]',
+        ylabel='β [deg]',
+    )
+    finite_corner = corner_mask & np.isfinite(beta_deg) & np.isfinite(arr['Filtering_VN_ay'])
+    if finite_corner.any():
+        fig_thrust.add_trace(go.Scattergl(
+            x=arr['Filtering_VN_ay'][finite_corner],
+            y=beta_deg[finite_corner],
+            mode='markers',
+            marker=dict(
+                color=arr['VN_vx'][finite_corner],
+                colorscale='Viridis',
+                size=4,
+                opacity=0.50,
+                colorbar=dict(title='vx [m/s]'),
+            ),
+            name='Corners',
+        ))
+    fig_thrust.add_hline(y=0.0, line=dict(color='rgba(235,235,235,0.45)', dash='dot', width=1.0))
+    fig_thrust.add_vline(x=0.0, line=dict(color='rgba(235,235,235,0.45)', dash='dot', width=1.0))
+
+    apex_beta_vals: list[float] = []
+    for lap in unique_laps(arr['laps']):
+        lm = arr['laps'] == lap
+        lap_corner = lm & corner_mask & np.isfinite(radius_m)
+        if not lap_corner.any():
+            continue
+        idxs = np.where(lap_corner)[0]
+        apex_idx = idxs[int(np.nanargmin(radius_m[lap_corner]))]
+        if np.isfinite(beta_deg[apex_idx]):
+            apex_beta_vals.append(float(beta_deg[apex_idx]))
+
+    peak_mask = finite_corner if finite_corner.any() else np.isfinite(beta_deg)
+    kpis = {
+        'peak_abs_beta_deg': float(np.nanmax(np.abs(beta_deg[peak_mask]))) if peak_mask.any() else np.nan,
+        'apex_abs_beta_deg': float(np.nanmean(np.abs(apex_beta_vals))) if apex_beta_vals else np.nan,
+        'max_beta_rate_degps': float(np.nanmax(np.abs(beta_rate_degps[peak_mask]))) if peak_mask.any() else np.nan,
+        'corner_samples': int(corner_mask.sum()),
+        'warnings': [] if corner_mask.any() else ['No radius-filtered corner samples for beta analysis.'],
+    }
+    return [fig_beta, fig_thrust], kpis
+
+
+# ── Aero load helper ─────────────────────────────────────────────────────────
+
+def _aero_front_fraction() -> float:
+    """Front aero load fraction from CoP distance behind the front axle."""
+    cop_from_front_m = abs(COP_X_FROM_FRONT)
+    return float(np.clip((WHEELBASE_M - cop_from_front_m) / WHEELBASE_M, 0.0, 1.0))
+
+
+# ── 11. Steering vs ay (steady-state US/OS curve) ────────────────────────────
+
+_STEER_COLS = ['TimeStamp', 'laps', 'laptime',
+               'Filtering_VN_ay', 'Steering', 'VN_vx']
+
+
+def steering_vs_ay_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
+    """Steering angle vs lateral acceleration in steady-state cornering.
+
+    The slope at low |ay| is the linear-region understeer gradient
+    (rad of road-wheel angle per m/s²).  Departure of the curve from the
+    bicycle-model ideal δ = L·ay/vx² indicates US (above ideal) or OS (below).
+    """
+    df = ensure_complete_laps_df(df)
+    missing = [c for c in _STEER_COLS if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing steering-vs-ay columns: {missing}")
+
+    arr = cols_to_numpy(df, _STEER_COLS)
+    valid = _base_validity(*arr.values())
+    arr = {k: v[valid] for k, v in arr.items()}
+
+    time_s = arr['TimeStamp'] - arr['TimeStamp'][0]
+    dt = robust_dt(time_s)
+
+    ay   = arr['Filtering_VN_ay']
+    steer = arr['Steering']
+    vx   = arr['VN_vx']
+
+    # Steady state: cornering, low jerk (≈ d|ay|/dt small)
+    day_dt = np.gradient(ay, dt)
+    raw_corner = (
+        (np.abs(ay) >= AY_THRESHOLD)
+        & (np.abs(steer) >= STEERING_THRESHOLD)
+        & (np.abs(vx) >= MIN_SPEED)
+        & (np.abs(day_dt) < 6.0)   # m/s³ jerk cap
+    )
+    cm = keep_min_duration_segments(raw_corner, MIN_CORNER_DURATION, dt)
+    if not cm.any():
+        fig = make_dark_figure(
+            title='Steering vs ay  ·  steady-state cornering',
+            xlabel='ay [m/s²]', ylabel='Steering [deg]',
+        )
+        fig.add_annotation(
+            xref='paper', yref='paper', x=0.5, y=0.5, showarrow=False,
+            text='No steady-state cornering samples found',
+            font=dict(color='#EBEBEB', size=12),
+        )
+        return fig, {'warnings': ['No steady-state cornering samples for steering vs ay.']}
+
+    ay_c    = ay[cm]
+    steer_c = np.rad2deg(steer[cm])
+    vx_c    = vx[cm]
+
+    fig = make_dark_figure(
+        title='Steering vs Lateral Acceleration  ·  US/OS handling curve',
+        xlabel='Lateral acceleration ay [m/s²]',
+        ylabel='Steering (road-wheel) [deg]',
+    )
+    fig.add_trace(go.Scattergl(
+        x=ay_c, y=steer_c, mode='markers',
+        marker=dict(color='#4DB3F2', size=3, opacity=0.45),
+        name='Samples',
+    ))
+
+    # Bicycle-model ideal: δ_ideal = L·ay/vx²  (rad)
+    vx_ref = float(np.nanmedian(np.abs(vx_c)))
+    ay_grid = np.linspace(np.nanmin(ay_c), np.nanmax(ay_c), 80)
+    if vx_ref > 1.0:
+        ideal_deg = np.rad2deg(WHEELBASE_M * ay_grid / (vx_ref ** 2))
+        fig.add_trace(go.Scatter(
+            x=ay_grid, y=ideal_deg, mode='lines',
+            line=dict(color='#73D973', dash='dash', width=2.0),
+            name=f'Ideal δ = L·ay/vx² (vx={vx_ref:.1f} m/s)',
+        ))
+
+    # Linear-region fit (|ay| < 4 m/s²) for the understeer gradient
+    lin = np.abs(ay_c) < 4.0
+    grad_deg_per_g = np.nan
+    if lin.sum() >= 30:
+        slope, intercept = np.polyfit(ay_c[lin], steer_c[lin], 1)
+        xfit = np.linspace(np.nanmin(ay_c[lin]), np.nanmax(ay_c[lin]), 50)
+        fig.add_trace(go.Scatter(
+            x=xfit, y=slope * xfit + intercept, mode='lines',
+            line=dict(color='#F28C40', width=2.2),
+            name=f'Linear fit  ·  {slope:+.3f} deg/(m/s²)',
+        ))
+        grad_deg_per_g = float(slope) * 9.81
+
+    fig.add_hline(y=0.0, line=dict(color='rgba(200,200,200,0.4)', dash='dot', width=1))
+    fig.add_vline(x=0.0, line=dict(color='rgba(200,200,200,0.4)', dash='dot', width=1))
+
+    kpis = {
+        'samples': int(ay_c.size),
+        'understeer_gradient_deg_per_g': grad_deg_per_g,
+        'vx_median_mps': vx_ref,
+        'warnings': [],
+    }
+    return fig, kpis
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
-    for fig in slip_angle_efficiency():
-        fig.show()
     understeer_angle().show()
 
 
