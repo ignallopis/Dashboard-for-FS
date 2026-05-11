@@ -85,6 +85,14 @@ def _vx_signal(columns: list[str]) -> str:
     return "Est_vxCOG" if "Est_vxCOG" in columns else "VN_vx"
 
 
+def _segment_bounds(mask: np.ndarray) -> list[tuple[int, int]]:
+    idx = np.flatnonzero(mask)
+    if idx.size == 0:
+        return []
+    cuts = np.where(np.diff(idx) > 1)[0] + 1
+    return [(int(seg[0]), int(seg[-1])) for seg in np.split(idx, cuts) if seg.size]
+
+
 def _prepare_arrays_from_df(
     df: pl.DataFrame,
     accel_mask: np.ndarray | None = None,
@@ -761,28 +769,61 @@ def _tc_objective_figures(
     figs: list[go.Figure] = []
 
     fig_box = make_dark_figure(
-        title="SR distribution by wheel during TC evaluation",
+        title="Maximum slip ratio by wheel across TC events",
         xlabel="Wheel",
-        ylabel="Slip ratio [-]",
+        ylabel="Maximum SR [-]",
     )
+    event_rows: list[dict[str, float | int]] = []
+    for event_id, (start, end) in enumerate(_segment_bounds(eval_mask), start=1):
+        seg = slice(start, end + 1)
+        lap = int(round(np.nanmedian(d["laps"][seg])))
+        for w in WHEELS:
+            vals = sr[w][seg]
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                continue
+            event_rows.append({
+                "wheel": w,
+                "event": event_id,
+                "lap": lap,
+                "max_sr": float(np.nanmax(vals)),
+            })
+
     for w in WHEELS:
-        s = sr[w][eval_mask]
-        s = s[np.isfinite(s)]
-        if s.size == 0:
+        wheel_rows = [row for row in event_rows if row["wheel"] == w]
+        if not wheel_rows:
             continue
+        wheel_vals = np.array([float(row["max_sr"]) for row in wheel_rows], dtype=float)
+        wheel_events = np.array([int(row["event"]) for row in wheel_rows], dtype=int)
+        wheel_laps = np.array([int(row["lap"]) for row in wheel_rows], dtype=int)
         fig_box.add_trace(go.Box(
-            x=np.full(s.size, w),
-            y=s,
+            x=np.full(wheel_vals.size, w),
+            y=wheel_vals,
             name=w,
-            marker=dict(color=WHEEL_COLORS[w], size=3, opacity=0.25),
+            marker=dict(color=WHEEL_COLORS[w], size=5, opacity=0.45),
             line=dict(color=WHEEL_COLORS[w]),
             boxmean=True,
-            boxpoints="outliers",
-            hovertemplate="%{x}<br>SR %{y:.3f}<extra></extra>",
+            boxpoints="all",
+            jitter=0.28,
+            pointpos=0.0,
+            customdata=np.column_stack([wheel_events, wheel_laps]),
+            hovertemplate=(
+                "Wheel %{x}"
+                "<br>Max SR %{y:.3f}"
+                "<br>Event %{customdata[0]:.0f}"
+                "<br>Lap %{customdata[1]:.0f}"
+                "<extra></extra>"
+            ),
         ))
-    fig_box.add_hrect(y0=under_thr, y1=over_thr, fillcolor="rgba(115, 217, 115, 0.12)", line_width=0)
-    fig_box.add_hline(y=SR_TARGET, line=dict(color="rgba(255,255,255,0.65)", dash="dash", width=1.3))
-    fig_box.update_yaxes(range=[-0.08, 0.45])
+    fig_box.add_trace(go.Scatter(
+        x=list(WHEELS),
+        y=[over_thr] * len(WHEELS),
+        mode="lines",
+        name="Overslip threshold",
+        line=dict(color="rgba(255,255,255,0.65)", dash="dash", width=1.3),
+        hoverinfo="skip",
+    ))
+    fig_box.update_yaxes(range=[-0.02, 0.45])
     figs.append(fig_box)
 
     low_pct: list[float] = []

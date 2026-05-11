@@ -1029,6 +1029,11 @@ def build_video_component_html(
     return prefix + (idx === 0 ? "" : String(idx + 1));
   }}
 
+  function axisLayoutName(axisRefValue, prefix) {{
+    const ref = axisRefValue || prefix;
+    return ref === prefix ? prefix + "axis" : prefix + "axis" + ref.slice(1);
+  }}
+
   function xAxisLayout(idx, totalSignals) {{
     const ax = {{ gridcolor: "#2a2a2e", automargin: true, fixedrange: false }};
     if (idx < totalSignals - 1) {{
@@ -1178,7 +1183,74 @@ def build_video_component_html(
 
   function cursorAnnotations(lap, signals, xVal, tg) {{
     if (!isFinite(xVal) || !isFinite(tg)) return [];
-    return signals.map((signal, idx) => {{
+    const xValues = xArrayForLap(lap);
+    const finiteX = xValues.filter(value => value !== null && isFinite(value));
+    const xMin = finiteX.length ? Math.min(...finiteX) : NaN;
+    const xMax = finiteX.length ? Math.max(...finiteX) : NaN;
+    const xFrac = isFinite(xMin) && isFinite(xMax) && xMax !== xMin
+      ? (xVal - xMin) / (xMax - xMin)
+      : 0.5;
+    const nearRightEdge = xFrac > 0.88;
+
+    function screenYFromData(yref, yVal) {{
+      if (!chartGd || !chartGd._fullLayout) return null;
+      const axis = chartGd._fullLayout[axisLayoutName(yref, "y")];
+      if (!axis || typeof axis.l2p !== "function") return null;
+      const pixel = Number(axis.l2p(yVal));
+      return isFinite(pixel) ? pixel : null;
+    }}
+
+    function annotationOffsets(entries) {{
+      const yShifts = Array(entries.length).fill(0);
+      const xShifts = Array(entries.length).fill(nearRightEdge ? -6 : 6);
+      const minGapPx = 24;
+      const xStepPx = 42;
+      let cluster = [];
+
+      function applyCluster(items) {{
+        if (!items.length) return;
+        if (items.length === 1) {{
+          yShifts[items[0].idx] = 0;
+          return;
+        }}
+        const center = items.reduce((sum, item) => sum + item.screenY, 0) / items.length;
+        const start = center - (minGapPx * (items.length - 1)) / 2;
+        items.forEach((item, order) => {{
+          yShifts[item.idx] = start + order * minGapPx - item.screenY;
+          xShifts[item.idx] = (nearRightEdge ? -6 : 6) + (nearRightEdge ? -1 : 1) * order * xStepPx;
+        }});
+      }}
+
+      const ordered = entries
+        .map((entry, idx) => ({{
+          idx,
+          yref: entry.yref,
+          screenY: screenYFromData(entry.yref, entry.y),
+        }}))
+        .filter(item => item.screenY !== null && isFinite(item.screenY))
+        .sort((a, b) => {{
+          if (a.yref !== b.yref) return String(a.yref).localeCompare(String(b.yref));
+          return a.screenY - b.screenY;
+        }});
+
+      ordered.forEach(item => {{
+        if (!cluster.length) {{
+          cluster = [item];
+          return;
+        }}
+        const prev = cluster[cluster.length - 1];
+        if (item.yref === prev.yref && item.screenY - prev.screenY < minGapPx) {{
+          cluster.push(item);
+          return;
+        }}
+        applyCluster(cluster);
+        cluster = [item];
+      }});
+      applyCluster(cluster);
+      return {{ yShifts, xShifts }};
+    }}
+
+    const entries = signals.map((signal, idx) => {{
       const yVal = signalYAtTelemetryTime(lap, signal, tg);
       const ySafe = isFinite(yVal) ? yVal : 0;
       return {{
@@ -1187,18 +1259,21 @@ def build_video_component_html(
         xref: axisRef("x", idx),
         yref: axisRef("y", idx),
         text: formatSignalValue(signal, yVal),
-        showarrow: true,
-        arrowhead: 0,
-        ax: 20,
-        ay: 0,
+        showarrow: false,
         bgcolor: "rgba(20,20,23,0.92)",
         bordercolor: signal.color,
         borderwidth: 1,
         font: {{ color: "#EBEBEB", size: 10 }},
-        xanchor: "left",
+        xanchor: nearRightEdge ? "right" : "left",
         yanchor: "middle",
+        xshift: nearRightEdge ? -6 : 6,
       }};
     }});
+    const offsets = annotationOffsets(entries);
+    return entries.map((entry, idx) => Object.assign({{}}, entry, {{
+      xshift: offsets.xShifts[idx],
+      yshift: offsets.yShifts[idx],
+    }}));
   }}
 
   function cursorShapes(signals, xVal) {{
@@ -1237,8 +1312,9 @@ def build_video_component_html(
       plot_bgcolor: "#141417",
       font: {{ color: "#EBEBEB", size: 11 }},
       height: currentChartHeightPx(),
-      margin: {{ l: 82, r: 18, t: 8, b: 42 }},
+      margin: {{ l: 82, r: 18, t: 8, b: 42, autoexpand: false }},
       showlegend: false,
+      hovermode: false,
       grid: {{
         rows: signals.length,
         columns: 1,
@@ -1259,6 +1335,7 @@ def build_video_component_html(
   function plotConfig() {{
     return {{
       displaylogo: false,
+      displayModeBar: true,
       responsive: true,
       scrollZoom: true,
       doubleClick: "reset+autosize",
@@ -1355,7 +1432,8 @@ def build_video_component_html(
       name: signal.label,
       xaxis: axisRef("x", idx),
       yaxis: axisRef("y", idx),
-      hoverinfo: "x+y",
+      hoverinfo: "skip",
+      hovertemplate: null,
     }}));
     if (compareLap) {{
       const compareX = xArrayForCompareLap(lap, compareLap);
@@ -1370,7 +1448,8 @@ def build_video_component_html(
           name: "Compare L" + compareLap.lap_id + " · " + signal.label,
           xaxis: axisRef("x", idx),
           yaxis: axisRef("y", idx),
-          hoverinfo: "x+y",
+          hoverinfo: "skip",
+          hovertemplate: null,
         }});
       }});
     }}

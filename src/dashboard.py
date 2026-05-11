@@ -34,6 +34,7 @@ import src.tv as tv
 import src.rb as rb
 import src.driver as drv
 import src.gripfactor as gf
+import src.lap_sectors as lsec
 import src.lapcount as lapcount
 import src.track_map_component as tmc
 import src.videoanalysis as va
@@ -46,6 +47,7 @@ from utils import (
     enrich_run_df,
     load_data,
     select_laps_df,
+    style_metrics_table,
     style_per_lap_table,
 )
 
@@ -57,6 +59,8 @@ TRACE_DASHES = ("solid", "dash", "dot", "dashdot", "longdash", "longdashdot")
 TRACE_SYMBOLS = ("circle", "square", "diamond", "triangle-up", "x", "cross")
 FileSignature = tuple[int, int]
 _PL_HASH_FUNCS = {pl.DataFrame: lambda _df: 0}
+_TELEMETRY_REQUIRED_HEADER_COLS = {"TimeStamp"}
+_TELEMETRY_SIGNAL_HEADER_COLS = {"laps", "VN_vx", "VN_latitude", "VN_longitude"}
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -65,6 +69,25 @@ def _file_signature(path: Path) -> FileSignature:
     """Return a cache-busting signature for *path* based on its current stat()."""
     stat = path.stat()
     return (int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _is_telemetry_csv(path: Path) -> bool:
+    """Fast header-only check to ignore support CSVs stored under data/."""
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as fh:
+            header = fh.readline().strip().split(",")
+    except OSError:
+        return False
+    header_cols = set(header)
+    return (
+        _TELEMETRY_REQUIRED_HEADER_COLS.issubset(header_cols)
+        and bool(_TELEMETRY_SIGNAL_HEADER_COLS & header_cols)
+    )
+
+
+def _telemetry_csv_paths(data_dir: Path) -> list[Path]:
+    """Return dashboard-loadable telemetry CSVs, excluding lookup/support files."""
+    return sorted(path for path in data_dir.glob("*.csv") if _is_telemetry_csv(path))
 
 
 @st.cache_resource(show_spinner="Loading run...")
@@ -97,6 +120,14 @@ def _clear_data_caches() -> None:
         load_run,
         load_lap_gate,
         csv_needs_lap_detection_cached,
+        _pt_energy_per_lap_fig_cached,
+        _pt_power_per_wheel_fig_cached,
+        _pt_battery_status_fig_cached,
+        _pt_thermal_evolution_fig_cached,
+        _dyn_ideal_braking_curve_fig_cached,
+        _dyn_decel_envelope_fig_cached,
+        _dyn_ideal_traction_curve_fig_cached,
+        _dyn_accel_envelope_fig_cached,
         _driver_summary_cached,
         _driver_throttle_histogram_fig_cached,
         _driver_full_throttle_time_fig_cached,
@@ -113,6 +144,10 @@ def _clear_data_caches() -> None:
         _driver_lap_time_distribution_fig_cached,
         _driver_cornering_turns_cached,
         _driver_cornering_metrics_cached,
+        _driver_fastest_lap_cached,
+        _driver_lap_sectors_cached,
+        _driver_csv_sector_summary_cached,
+        _driver_whole_lap_metrics_cached,
     )
     for func in cached_funcs:
         clear = getattr(func, "clear", None)
@@ -215,20 +250,138 @@ def _consume_lap_turn_click_event(
     return True
 
 
+def _add_manual_gate_line_to_fig(
+    fig: go.Figure,
+    manual_gate_line: tuple[tuple[float, float], tuple[float, float]] | None,
+) -> go.Figure:
+    """Overlay the manual finish-line preview on a longitude/latitude figure."""
+    if manual_gate_line is None:
+        return fig
+    (x0, y0), (x1, y1) = manual_gate_line
+    fig.add_shape(
+        type="line",
+        x0=x0,
+        y0=y0,
+        x1=x1,
+        y1=y1,
+        xref="x",
+        yref="y",
+        line=dict(color="#4DB3F2", width=3),
+    )
+    fig.add_trace(go.Scattergl(
+        x=[x0, x1],
+        y=[y0, y1],
+        mode="markers",
+        marker=dict(color="#4DB3F2", size=8, symbol="circle"),
+        name="Manual finish line",
+        hovertemplate="Manual finish line<extra></extra>",
+        showlegend=False,
+    ))
+    return fig
+
+
+def _lap_gates_from_run_tokens(
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+) -> dict[str, dict]:
+    """Load lapcount finish-gate metadata for the selected CSV runs."""
+    lap_gates: dict[str, dict] = {}
+    for run_name, file_signature, _lap_token in run_tokens:
+        try:
+            gate = load_lap_gate(str(DATA_DIR / run_name), file_signature)
+        except Exception:
+            continue
+        if not gate:
+            continue
+        try:
+            gate_lon = np.asarray(gate["gate_lon"], dtype=float)
+            gate_lat = np.asarray(gate["gate_lat"], dtype=float)
+            finish_lon = float(gate["finish_lon"])
+            finish_lat = float(gate["finish_lat"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            gate_lon.size == 2
+            and gate_lat.size == 2
+            and np.all(np.isfinite(gate_lon))
+            and np.all(np.isfinite(gate_lat))
+            and np.isfinite(finish_lon)
+            and np.isfinite(finish_lat)
+        ):
+            lap_gates[run_name] = gate
+    return lap_gates
+
+
+def _add_lap_detection_gates_to_fig(
+    fig: go.Figure,
+    lap_gates: dict[str, dict],
+) -> go.Figure:
+    """Overlay lapcount-detected finish lines on a longitude/latitude figure."""
+    if not lap_gates:
+        return fig
+
+    multi_run = len(lap_gates) > 1
+    for idx, (run_name, gate) in enumerate(lap_gates.items()):
+        gate_lon = np.asarray(gate["gate_lon"], dtype=float)
+        gate_lat = np.asarray(gate["gate_lat"], dtype=float)
+        finish_lon = float(gate["finish_lon"])
+        finish_lat = float(gate["finish_lat"])
+        gate_half_width_m = float(gate.get("gate_half_width_m", np.nan))
+        mode = str(gate.get("lapcount_mode", "circuit"))
+        color = RUN_COLORS[idx % len(RUN_COLORS)] if multi_run else "#F2F2F2"
+        label = f"Lapcount finish · {Path(run_name).stem}" if multi_run else "Lapcount finish"
+
+        fig.add_trace(go.Scattergl(
+            x=gate_lon,
+            y=gate_lat,
+            mode="lines",
+            name=label,
+            line=dict(color=color, width=2.5, dash="dash"),
+            hovertemplate=(
+                f"{label}<br>"
+                f"mode={mode}<br>"
+                f"half width={gate_half_width_m:.1f} m"
+                "<extra></extra>"
+            ),
+        ))
+        fig.add_trace(go.Scattergl(
+            x=[finish_lon],
+            y=[finish_lat],
+            mode="markers",
+            marker=dict(
+                size=10,
+                color=color,
+                symbol="x",
+                line=dict(color="#FFFFFF", width=1.5),
+            ),
+            showlegend=False,
+            hovertemplate=(
+                f"{label} centre"
+                f"<br>lon={finish_lon:.6f}"
+                f"<br>lat={finish_lat:.6f}<extra></extra>"
+            ),
+        ))
+    return fig
+
+
 @st.dialog("Lap Analysis Phase Map", width="large")
 def _render_lap_phase_fullscreen_dialog(
-    figure_json: str,
+    phase_fig: go.Figure,
     *,
     turn_ids: list[int],
     included_turns_key: str,
     event_state_key: str,
 ) -> None:
     """Render the Lap Analysis phase map in a large dialog."""
-    st.caption("Click a curve to include/exclude it from Lap Analysis.")
+    st.caption("Click a curve to include/exclude it from Lap Analysis, or draw a line for the finish line.")
     phase_event = tmc.render_track_map_component(
-        figure_json,
+        tmc.serialize_figure(phase_fig),
         height_px=760,
         key=f"drv_lap_phase_map_fullscreen_{event_state_key}",
+    )
+    _consume_track_component_event(
+        phase_event,
+        pool_len=0,
+        event_state_key=f"{event_state_key}_manual_fullscreen",
     )
     if _consume_lap_turn_click_event(
         phase_event,
@@ -242,7 +395,7 @@ def _render_lap_phase_fullscreen_dialog(
 def _autodetect_laps(data_dir: Path) -> None:
     """Run lap detection on any CSV in *data_dir* that doesn't have it yet."""
     modified = False
-    for path in sorted(data_dir.glob("*.csv")):
+    for path in _telemetry_csv_paths(data_dir):
         try:
             file_signature = _file_signature(path)
             if not csv_needs_lap_detection_cached(str(path), file_signature):
@@ -363,6 +516,7 @@ def _style_trace_for_run(
     trace: go.BaseTraceType,
     run_name: str,
     run_color: str,
+    run_idx: int,
     variant_idx: int,
 ) -> go.BaseTraceType:
     """Clone *trace* and restyle it for a specific run overlay."""
@@ -373,22 +527,70 @@ def _style_trace_for_run(
 
     dash = TRACE_DASHES[variant_idx % len(TRACE_DASHES)]
     symbol = TRACE_SYMBOLS[variant_idx % len(TRACE_SYMBOLS)]
+    run_dash = TRACE_DASHES[run_idx % len(TRACE_DASHES)]
+    run_symbol = TRACE_SYMBOLS[run_idx % len(TRACE_SYMBOLS)]
     wheel = _wheel_token(base_name)
     trace_color = WHEEL_COLORS[wheel] if wheel is not None else run_color
+    trace_type = getattr(out, "type", "") or ""
+    run_label = Path(run_name).stem
+    is_ideal_share_line = base_name == "ideal (Fz = braking)"
+    is_fz_reference_line = base_name == "Fz-proportional reference"
+    mode = getattr(out, "mode", "") or ""
+    is_wheel_line = (
+        wheel is not None
+        and trace_type in {"scatter", "scattergl"}
+        and "lines" in mode
+        and "markers" not in mode
+    )
 
-    if hasattr(out, "line") and out.line is not None:
+    if hasattr(out, "line") and out.line is not None and not is_ideal_share_line and not is_fz_reference_line:
         out.line.color = trace_color
-        if getattr(out, "mode", "") != "markers":
-            out.line.dash = dash
+        if trace_type != "box" and mode != "markers":
+            out.line.dash = run_dash if is_wheel_line else dash
+    elif hasattr(out, "line") and out.line is not None and is_fz_reference_line:
+        out.line.dash = run_dash
     if hasattr(out, "marker") and out.marker is not None:
         out.marker.color = trace_color
         if wheel is not None:
             out.marker.line.color = run_color
             out.marker.line.width = 2
+            if trace_type in {"scatter", "scattergl"}:
+                out.marker.symbol = run_symbol
         elif getattr(out, "type", "") != "bar":
             out.marker.symbol = symbol
     if hasattr(out, "textfont") and out.textfont is not None and wheel is not None:
         out.textfont.color = run_color
+
+    x_vals = getattr(out, "x", None)
+    if (
+        wheel is not None
+        and x_vals is not None
+        and len(x_vals) > 0
+        and all(isinstance(x_val, str) for x_val in x_vals)
+    ):
+        out.x = [f"{run_label} · {str(x_val)}" for x_val in x_vals]
+    elif (
+        trace_type == "box"
+        and x_vals is not None
+        and len(x_vals) > 0
+        and all(isinstance(x_val, str) for x_val in x_vals)
+    ):
+        out.x = np.full(len(x_vals), run_label)
+    elif (
+        base_name == "Lockup threshold"
+        and getattr(out, "x", None) is not None
+    ):
+        out.x = [f"{run_label} · {str(x)}" for x in out.x]
+    elif (
+        base_name == "Yaw instability threshold"
+        and getattr(out, "x", None) is not None
+    ):
+        out.x = [run_label for _ in out.x]
+    elif (
+        base_name == "F/R summary"
+        and getattr(out, "x", None) is not None
+    ):
+        out.x = [f"{run_label} · FR" for _ in out.x]
     return out
 
 
@@ -403,6 +605,8 @@ def _render_lap_detail_chart(
     key: str,
     fullscreen_figures: dict[str, go.Figure] | None = None,
     fullscreen_selected: str | None = None,
+    fullscreen_track_figure: go.Figure | None = None,
+    fullscreen_gg_figures: dict[str, go.Figure] | None = None,
 ) -> None:
     """Render Lap Analysis detail with Video-Analysis-style crosshair labels."""
     fig_json = fig.to_json()
@@ -412,6 +616,15 @@ def _render_lap_detail_chart(
     }
     if not fullscreen_payload:
         fullscreen_payload = {str(fullscreen_selected or "Current corner"): json.loads(fig_json)}
+    fullscreen_track_payload = (
+        json.loads(fullscreen_track_figure.to_json())
+        if fullscreen_track_figure is not None
+        else None
+    )
+    fullscreen_gg_payload = {
+        str(label): json.loads(gg_fig.to_json())
+        for label, gg_fig in (fullscreen_gg_figures or {}).items()
+    }
     height_px = int(fig.layout.height or 900)
     component_id = f"lap_detail_{abs(hash(key))}"
     wrapper_id = f"{component_id}_wrap"
@@ -424,6 +637,14 @@ def _render_lap_detail_chart(
         json.dumps(fullscreen_payload, ensure_ascii=False, allow_nan=False),
         quote=False,
     )
+    escaped_fullscreen_track_json = html.escape(
+        json.dumps(fullscreen_track_payload, ensure_ascii=False, allow_nan=False),
+        quote=False,
+    )
+    escaped_fullscreen_gg_json = html.escape(
+        json.dumps(fullscreen_gg_payload, ensure_ascii=False, allow_nan=False),
+        quote=False,
+    )
     component_html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -431,31 +652,67 @@ def _render_lap_detail_chart(
 <script src={plotly_cdn_js}></script>
 <style>
   html, body {{ margin:0; padding:0; background:#141417; overflow:hidden; }}
-  #{wrapper_id} {{ position:relative; width:100%; height:{height_px}px; background:#141417; }}
-  #{component_id} {{ width:100%; height:{height_px}px; }}
-  #{wrapper_id}:fullscreen {{ width:100vw; height:100vh; background:#141417; }}
-  #{wrapper_id}:fullscreen #{component_id} {{ width:100vw; height:100vh; }}
-  .lap_detail_fullscreen_controls {{
-    display:none; position:absolute; z-index:20; top:8px; left:10px;
-    align-items:center; gap:6px; padding:6px 8px;
+  #{wrapper_id} {{
+    position:relative; width:100%; height:{height_px}px; background:#141417;
+    overflow:hidden; border:1px solid rgba(255,255,255,0.08); border-radius:8px;
+  }}
+  .lap_detail_shell {{
+    width:100%; height:100%; display:grid; grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+  }}
+  .lap_detail_main {{ min-width:0; min-height:0; }}
+  #{component_id} {{ width:100%; height:100%; }}
+  .lap_detail_side {{
+    display:none; min-width:0; min-height:0; grid-template-rows:minmax(0, 1fr) minmax(0, 1fr);
+    gap:14px; padding:52px 12px 12px 0;
+  }}
+  .lap_detail_side_plot {{
+    width:100%; height:100%; min-height:260px; background:#141417;
+  }}
+  #{wrapper_id}:fullscreen {{
+    width:100vw; height:100vh; background:#141417; border-radius:0; border:none;
+  }}
+  #{wrapper_id}:fullscreen .lap_detail_shell {{
+    grid-template-columns: minmax(0, 1.08fr) minmax(520px, 0.92fr);
+    gap:16px; padding:12px;
+  }}
+  #{wrapper_id}:fullscreen .lap_detail_side {{ display:grid; }}
+  .lap_detail_toolbar {{
+    position:absolute; z-index:20; top:8px; left:10px;
+    display:flex; align-items:center; gap:6px; padding:6px 8px;
     background:rgba(20,20,23,0.88); border:1px solid rgba(255,255,255,0.14);
     border-radius:6px; color:#EBEBEB; font:12px -apple-system, "Segoe UI", sans-serif;
   }}
-  #{wrapper_id}:fullscreen .lap_detail_fullscreen_controls {{ display:flex; }}
-  .lap_detail_fullscreen_controls select {{
+  .lap_detail_toolbar button,
+  .lap_detail_toolbar select {{
     background:#111318; color:#EBEBEB; border:1px solid rgba(255,255,255,0.18);
     border-radius:5px; padding:3px 6px; font-size:12px;
   }}
+  .lap_detail_toolbar label {{ display:none; align-items:center; gap:6px; }}
+  #{wrapper_id}:fullscreen .lap_detail_toolbar label {{ display:flex; }}
 </style>
 </head>
 <body>
 <script id="{component_id}_json" type="application/json">{escaped_fig_json}</script>
 <script id="{component_id}_fullscreen_json" type="application/json">{escaped_fullscreen_json}</script>
+<script id="{component_id}_fullscreen_track_json" type="application/json">{escaped_fullscreen_track_json}</script>
+<script id="{component_id}_fullscreen_gg_json" type="application/json">{escaped_fullscreen_gg_json}</script>
 <div id="{wrapper_id}">
-  <label class="lap_detail_fullscreen_controls">Inspect corner
-    <select id="{component_id}_corner_select"></select>
-  </label>
-  <div id="{component_id}"></div>
+  <div class="lap_detail_toolbar">
+    <button id="{component_id}_fullscreen_btn" type="button">Full screen</button>
+    <label>Inspect corner
+      <select id="{component_id}_corner_select"></select>
+    </label>
+  </div>
+  <div class="lap_detail_shell">
+    <div class="lap_detail_main">
+      <div id="{component_id}"></div>
+    </div>
+    <div class="lap_detail_side">
+      <div id="{component_id}_track" class="lap_detail_side_plot"></div>
+      <div id="{component_id}_gg" class="lap_detail_side_plot"></div>
+    </div>
+  </div>
 </div>
 <script>
 (function() {{
@@ -464,11 +721,22 @@ def _render_lap_detail_chart(
   const SELECTED_CORNER = {fullscreen_selected_js};
   const wrap = document.getElementById(WID);
   const gd = document.getElementById(CID);
+  const trackGd = document.getElementById(CID + "_track");
+  const ggGd = document.getElementById(CID + "_gg");
   const cornerSelect = document.getElementById(CID + "_corner_select");
+  const fullscreenButton = document.getElementById(CID + "_fullscreen_btn");
   const fullscreenFigures = JSON.parse(document.getElementById(CID + "_fullscreen_json").textContent);
+  const fullscreenTrackFigure = JSON.parse(document.getElementById(CID + "_fullscreen_track_json").textContent);
+  const fullscreenGgFigures = JSON.parse(document.getElementById(CID + "_fullscreen_gg_json").textContent);
   let fig = JSON.parse(document.getElementById(CID + "_json").textContent);
   let baseShapes = [];
   let baseAnnotations = [];
+  let selectedDistanceM = null;
+  let currentTrackFig = null;
+  let currentGgFig = null;
+  let cursorRaf = 0;
+  let pendingCursorPoint = null;
+  let lastCursorXVal = null;
 
   const fullscreenIcon = {{
     width: 1000,
@@ -476,10 +744,12 @@ def _render_lap_detail_chart(
     path: "M60 360V60H360V160H160V360Z M640 60H940V360H840V160H640Z M160 640V840H360V940H60V640Z M840 640V840H640V940H940V640Z",
   }};
   function targetHeight() {{
-    return document.fullscreenElement === wrap ? window.innerHeight : {height_px};
+    return document.fullscreenElement === wrap ? window.innerHeight - 24 : {height_px};
   }}
   function resizePlotForMode() {{
     Plotly.relayout(gd, {{ height: targetHeight(), autosize: true }});
+    if (trackGd && trackGd.data) Plotly.Plots.resize(trackGd);
+    if (ggGd && ggGd.data) Plotly.Plots.resize(ggGd);
   }}
   function toggleFullscreen() {{
     if (document.fullscreenElement === wrap) {{
@@ -499,7 +769,7 @@ def _render_lap_detail_chart(
     ],
     modeBarButtonsToAdd: [{{
       name: "fullscreen",
-      title: "Full screen plots",
+      title: "Full screen charts",
       icon: fullscreenIcon,
       click: toggleFullscreen,
     }}],
@@ -510,6 +780,7 @@ def _render_lap_detail_chart(
     fig.layout = fig.layout || {{}};
     fig.layout.height = targetHeight();
     fig.layout.autosize = true;
+    fig.layout.margin = Object.assign({{}}, fig.layout.margin || {{}}, {{ autoexpand: false }});
     fig.layout.showlegend = false;
     fig.layout.hovermode = false;
     fig.layout.dragmode = "pan";
@@ -520,6 +791,12 @@ def _render_lap_detail_chart(
     }});
     baseShapes = Array.isArray(fig.layout.shapes) ? fig.layout.shapes.slice() : [];
     baseAnnotations = Array.isArray(fig.layout.annotations) ? fig.layout.annotations.slice() : [];
+    pendingCursorPoint = null;
+    lastCursorXVal = null;
+    if (cursorRaf) {{
+      cancelAnimationFrame(cursorRaf);
+      cursorRaf = 0;
+    }}
   }}
 
   function populateCornerSelect() {{
@@ -535,11 +812,188 @@ def _render_lap_detail_chart(
     cornerSelect.disabled = labels.length <= 1;
   }}
 
+  function sidePlotConfig() {{
+    return {{
+      displaylogo: false,
+      responsive: true,
+      scrollZoom: true,
+      displayModeBar: false,
+    }};
+  }}
+
+  function customColumn(raw, col) {{
+    if (Array.isArray(raw)) {{
+      return raw.map(value => Array.isArray(value) ? Number(value[col || 0]) : Number(value));
+    }}
+    if (!raw || typeof raw !== "object") return [];
+    const flat = arrayFrom(raw);
+    if (!flat.length) return [];
+    const shape = Array.isArray(raw.shape)
+      ? raw.shape
+      : (typeof raw.shape === "string" ? raw.shape.split(",").map(value => Number(value.trim())) : []);
+    const width = shape.length >= 2 ? Number(shape[1]) : 1;
+    if (width <= 1) return flat.map(value => Number(value));
+    const out = [];
+    for (let i = col || 0; i < flat.length; i += width) out.push(Number(flat[i]));
+    return out;
+  }}
+
+  function nearestPointInTrace(trace, distanceM) {{
+    if (!trace || !isFinite(distanceM)) return null;
+    if (trace.visible === false || trace.visible === "legendonly") return null;
+    const xArr = arrayFrom(trace.x);
+    const yArr = arrayFrom(trace.y);
+    const sArr = customColumn(trace.customdata, 0);
+    const n = Math.min(xArr.length, yArr.length, sArr.length);
+    let best = null;
+    let bestDiff = Infinity;
+    for (let i = 0; i < n; i++) {{
+      const x = Number(xArr[i]);
+      const y = Number(yArr[i]);
+      const s = Number(sArr[i]);
+      if (!isFinite(x) || !isFinite(y) || !isFinite(s)) continue;
+      const diff = Math.abs(s - distanceM);
+      if (diff < bestDiff) {{
+        bestDiff = diff;
+        best = {{ x, y, s }};
+      }}
+    }}
+    return best;
+  }}
+
+  function nearestByDistanceTrace(data, distanceM) {{
+    if (!Array.isArray(data) || !isFinite(distanceM)) return null;
+    let best = null;
+    let bestDiff = Infinity;
+    data.forEach(trace => {{
+      const point = nearestPointInTrace(trace, distanceM);
+      if (!point) return;
+      const diff = Math.abs(point.s - distanceM);
+      if (diff < bestDiff) {{
+        bestDiff = diff;
+        best = point;
+      }}
+    }});
+    return best;
+  }}
+
+  function nearestByVisibleTrace(data, distanceM) {{
+    if (!Array.isArray(data) || !isFinite(distanceM)) return [];
+    const points = [];
+    data.forEach((trace, idx) => {{
+      const point = nearestPointInTrace(trace, distanceM);
+      if (!point) return;
+      points.push({{
+        x: point.x,
+        y: point.y,
+        s: point.s,
+        traceIndex: idx,
+        traceName: String(trace.name || ""),
+      }});
+    }});
+    return points;
+  }}
+
+  function markerTrace(point, name, color) {{
+    if (!point) return null;
+    return {{
+      x: [point.x],
+      y: [point.y],
+      mode: "markers",
+      name: name,
+      showlegend: false,
+      hovertemplate: "Selected point<br>Distance %{{customdata[0]:.1f}} m<extra></extra>",
+      customdata: [[point.s]],
+      marker: {{
+        color: color || "#FFFFFF",
+        size: 13,
+        symbol: "circle",
+        line: {{ color: "#111318", width: 2 }},
+      }},
+    }};
+  }}
+
+  function figureWithSelection(baseFig, markerName) {{
+    if (!baseFig) return {{ data: [], layout: {{}} }};
+    const nextData = Array.isArray(baseFig.data) ? baseFig.data.slice() : [];
+    const marker = markerTrace(
+      nearestByDistanceTrace(nextData, selectedDistanceM),
+      markerName,
+      "#FFFFFF",
+    );
+    if (marker) nextData.push(marker);
+    return {{ data: nextData, layout: baseFig.layout || {{}} }};
+  }}
+
+  function ggFigureWithSelection(baseFig) {{
+    if (!baseFig) return {{ data: [], layout: {{}} }};
+    const nextData = Array.isArray(baseFig.data) ? baseFig.data.slice() : [];
+    const markerColors = ["#FFFFFF", "#73D973"];
+    nearestByVisibleTrace(nextData, selectedDistanceM).forEach((point, idx) => {{
+      const markerName = point.traceName
+        ? ("Selected GG point · " + point.traceName)
+        : ("Selected GG point " + String(idx + 1));
+      const marker = markerTrace(
+        point,
+        markerName,
+        markerColors[idx] || "#FFFFFF",
+      );
+      if (marker) nextData.push(marker);
+    }});
+    return {{ data: nextData, layout: baseFig.layout || {{}} }};
+  }}
+
+  function renderSelectionMarkers() {{
+    if (trackGd && currentTrackFig) {{
+      const nextTrack = figureWithSelection(currentTrackFig, "Selected car position");
+      Plotly.react(trackGd, nextTrack.data, nextTrack.layout, sidePlotConfig()).then(() => {{
+        Plotly.Plots.resize(trackGd);
+      }});
+    }}
+    if (ggGd && currentGgFig) {{
+      const nextGg = ggFigureWithSelection(currentGgFig);
+      Plotly.react(ggGd, nextGg.data, nextGg.layout, sidePlotConfig()).then(() => {{
+        Plotly.Plots.resize(ggGd);
+      }});
+    }}
+  }}
+
+  function renderTrackFigure() {{
+    if (!trackGd || !fullscreenTrackFigure) return;
+    const trackFig = JSON.parse(JSON.stringify(fullscreenTrackFigure));
+    trackFig.layout = trackFig.layout || {{}};
+    trackFig.layout.autosize = true;
+    currentTrackFig = trackFig;
+    const nextTrack = figureWithSelection(currentTrackFig, "Selected car position");
+    Plotly.react(trackGd, nextTrack.data, nextTrack.layout, sidePlotConfig()).then(() => {{
+      Plotly.Plots.resize(trackGd);
+    }});
+  }}
+
+  function renderGgFigure(label) {{
+    if (!ggGd) return;
+    const ggFig = fullscreenGgFigures[label];
+    if (!ggFig) {{
+      Plotly.purge(ggGd);
+      ggGd.innerHTML = "";
+      return;
+    }}
+    const nextFig = JSON.parse(JSON.stringify(ggFig));
+    nextFig.layout = nextFig.layout || {{}};
+    nextFig.layout.autosize = true;
+    currentGgFig = nextFig;
+    const nextGg = ggFigureWithSelection(currentGgFig);
+    Plotly.react(ggGd, nextGg.data, nextGg.layout, sidePlotConfig()).then(() => {{
+      Plotly.Plots.resize(ggGd);
+    }});
+  }}
+
   function changeCorner(label) {{
     const nextFig = fullscreenFigures[label];
     if (!nextFig) return;
     prepareFigure(nextFig);
     Plotly.react(gd, fig.data, fig.layout, config).then(resizePlotForMode);
+    renderGgFigure(label);
   }}
 
   function arrayFrom(raw) {{
@@ -577,6 +1031,64 @@ def _render_lap_detail_chart(
   function axisLayoutName(axisRef, prefix) {{
     const ref = axisRef || prefix;
     return ref === prefix ? prefix + "axis" : prefix + "axis" + ref.slice(1);
+  }}
+
+  function screenYFromData(yref, yVal) {{
+    const fullLayout = gd._fullLayout;
+    if (!fullLayout) return null;
+    const axis = fullLayout[axisLayoutName(yref, "y")];
+    if (!axis || typeof axis.l2p !== "function") return null;
+    const pixel = Number(axis.l2p(yVal));
+    return isFinite(pixel) ? pixel : null;
+  }}
+
+  function annotationOffsets(entries, nearRightEdge) {{
+    const yShifts = Array(entries.length).fill(0);
+    const xShifts = Array(entries.length).fill(nearRightEdge ? -6 : 6);
+    const groups = new Map();
+    entries.forEach((entry, idx) => {{
+      const screenY = screenYFromData(entry.yref, entry.y);
+      const key = entry.yref || "y";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push({{ idx, screenY }});
+    }});
+    const minGapPx = 24;
+    const xStepPx = 42;
+
+    function applyCluster(cluster) {{
+      if (!cluster.length) return;
+      if (cluster.length === 1) {{
+        yShifts[cluster[0].idx] = 0;
+        return;
+      }}
+      const center = cluster.reduce((sum, item) => sum + item.screenY, 0) / cluster.length;
+      const start = center - (minGapPx * (cluster.length - 1)) / 2;
+      cluster.forEach((item, order) => {{
+        yShifts[item.idx] = start + order * minGapPx - item.screenY;
+        xShifts[item.idx] = (nearRightEdge ? -6 : 6) + (nearRightEdge ? -1 : 1) * order * xStepPx;
+      }});
+    }}
+
+    groups.forEach(group => {{
+      const valid = group
+        .filter(item => item.screenY !== null && isFinite(item.screenY))
+        .sort((a, b) => a.screenY - b.screenY);
+      let cluster = [];
+      valid.forEach(item => {{
+        if (!cluster.length) {{
+          cluster = [item];
+          return;
+        }}
+        if (item.screenY - cluster[cluster.length - 1].screenY < minGapPx) {{
+          cluster.push(item);
+          return;
+        }}
+        applyCluster(cluster);
+        cluster = [item];
+      }});
+      applyCluster(cluster);
+    }});
+    return {{ yShifts, xShifts }};
   }}
 
   function plotAreaXFromEvent(event) {{
@@ -642,6 +1154,43 @@ def _render_lap_detail_chart(
     return NaN;
   }}
 
+  function distanceAtGraphX(xVal) {{
+    if (!isFinite(xVal)) return NaN;
+    for (const trace of fig.data) {{
+      if (trace.visible === false || trace.visible === "legendonly") continue;
+      const xArr = arrayFrom(trace.x);
+      const sArr = customColumn(trace.customdata, 0);
+      const n = Math.min(xArr.length, sArr.length);
+      if (n < 2) continue;
+      let first = -1;
+      let last = -1;
+      for (let i = 0; i < n; i++) {{
+        if (isFinite(Number(xArr[i])) && isFinite(Number(sArr[i]))) {{
+          if (first < 0) first = i;
+          last = i;
+        }}
+      }}
+      if (first < 0) continue;
+      const xFirst = Number(xArr[first]);
+      const xLast = Number(xArr[last]);
+      if (xVal <= xFirst) return Number(sArr[first]);
+      if (xVal >= xLast) return Number(sArr[last]);
+      for (let i = first; i < last; i++) {{
+        const x0 = Number(xArr[i]);
+        const x1 = Number(xArr[i + 1]);
+        const s0 = Number(sArr[i]);
+        const s1 = Number(sArr[i + 1]);
+        if (!isFinite(x0) || !isFinite(x1) || !isFinite(s0) || !isFinite(s1)) continue;
+        const inside = (x0 <= xVal && xVal <= x1) || (x1 <= xVal && xVal <= x0);
+        if (!inside) continue;
+        if (x1 === x0) return s0;
+        const f = (xVal - x0) / (x1 - x0);
+        return s0 + f * (s1 - s0);
+      }}
+    }}
+    return xVal;
+  }}
+
   function colorForTrace(trace) {{
     if (trace && trace.line && trace.line.color) return trace.line.color;
     if (trace && trace.marker && trace.marker.color) return trace.marker.color;
@@ -673,9 +1222,11 @@ def _render_lap_detail_chart(
     return refs;
   }}
 
-  function updateCursor(event) {{
-    const xVal = plotAreaXFromEvent(event);
+  function renderCursor(clientX, clientY) {{
+    const xVal = plotAreaXFromEvent({{ clientX, clientY }});
     if (xVal === null || !isFinite(xVal)) return;
+    if (lastCursorXVal !== null && Math.abs(lastCursorXVal - xVal) < 1e-6) return;
+    lastCursorXVal = xVal;
     const shapes = baseShapes.slice();
     subplotRefs().forEach(ref => {{
       shapes.push({{
@@ -691,6 +1242,13 @@ def _render_lap_detail_chart(
     }});
 
     const annotations = baseAnnotations.slice();
+    const fullX = gd._fullLayout && gd._fullLayout.xaxis;
+    const xrange = fullX && Array.isArray(fullX.range) ? fullX.range : null;
+    const xFrac = xrange && isFinite(Number(xrange[0])) && isFinite(Number(xrange[1])) && Number(xrange[1]) !== Number(xrange[0])
+      ? (xVal - Number(xrange[0])) / (Number(xrange[1]) - Number(xrange[0]))
+      : 0.5;
+    const nearRightEdge = xFrac > 0.88;
+    const entries = [];
     fig.data.forEach(trace => {{
       if (trace.visible === false || trace.visible === "legendonly") return;
       const y = valueAtX(trace.x, trace.y, xVal);
@@ -698,27 +1256,72 @@ def _render_lap_detail_chart(
       const color = colorForTrace(trace);
       const xref = trace.xaxis || "x";
       const yref = trace.yaxis || "y";
-      annotations.push({{
+      entries.push({{
         x: xVal,
         y: y,
         xref: xref,
         yref: yref,
         text: formatValue(y),
+        color: color,
+      }});
+    }});
+    const offsets = annotationOffsets(entries, nearRightEdge);
+    entries.forEach((entry, idx) => {{
+      annotations.push({{
+        x: entry.x,
+        y: entry.y,
+        xref: entry.xref,
+        yref: entry.yref,
+        text: entry.text,
         showarrow: false,
-        xanchor: "left",
+        xanchor: nearRightEdge ? "right" : "left",
         yanchor: "middle",
-        xshift: 6,
+        xshift: offsets.xShifts[idx],
+        yshift: offsets.yShifts[idx],
         bgcolor: "rgba(20,20,23,0.96)",
-        bordercolor: color,
+        bordercolor: entry.color,
         borderwidth: 1,
         borderpad: 2,
-        font: {{ color: color, size: 11 }},
+        font: {{ color: entry.color, size: 11 }},
       }});
     }});
     Plotly.relayout(gd, {{ shapes: shapes, annotations: annotations }});
   }}
 
+  function updateCursor(event) {{
+    pendingCursorPoint = {{
+      clientX: event.clientX,
+      clientY: event.clientY,
+    }};
+    if (cursorRaf) return;
+    cursorRaf = requestAnimationFrame(() => {{
+      cursorRaf = 0;
+      const point = pendingCursorPoint;
+      pendingCursorPoint = null;
+      if (!point) return;
+      renderCursor(point.clientX, point.clientY);
+    }});
+  }}
+
+  function selectCursor(event) {{
+    if (event.button !== 0) return;
+    const xVal = plotAreaXFromEvent(event);
+    if (xVal === null || !isFinite(xVal)) return;
+    const distanceM = distanceAtGraphX(xVal);
+    if (!isFinite(distanceM)) return;
+    selectedDistanceM = distanceM;
+    renderCursor(event.clientX, event.clientY);
+    renderSelectionMarkers();
+  }}
+
   function clearCursor() {{
+    if (selectedDistanceM !== null) return;
+    pendingCursorPoint = null;
+    lastCursorXVal = null;
+    if (cursorRaf) {{
+      cancelAnimationFrame(cursorRaf);
+      cursorRaf = 0;
+    }}
     Plotly.relayout(gd, {{ shapes: baseShapes, annotations: baseAnnotations }});
   }}
 
@@ -726,9 +1329,14 @@ def _render_lap_detail_chart(
   prepareFigure(fig);
   Plotly.newPlot(gd, fig.data, fig.layout, config).then(() => {{
     gd.addEventListener("mousemove", updateCursor);
+    gd.addEventListener("mousedown", selectCursor);
     gd.addEventListener("mouseleave", clearCursor);
     document.addEventListener("fullscreenchange", resizePlotForMode);
+    window.addEventListener("resize", resizePlotForMode);
     cornerSelect.addEventListener("change", event => changeCorner(event.target.value));
+    fullscreenButton.addEventListener("click", toggleFullscreen);
+    renderTrackFigure();
+    renderGgFigure(cornerSelect.value);
   }});
 }})();
 </script>
@@ -753,7 +1361,7 @@ def _overlay_figures(figs_by_run: dict[str, list[go.Figure]]) -> list[go.Figure]
         variant_map: dict[str, int] = {}
         tickvals_by_axis: dict[str, set[float]] = {}
 
-        for run_name in run_names:
+        for run_idx, run_name in enumerate(run_names):
             fig = figs_by_run[run_name][fig_idx]
             for trace_idx, trace in enumerate(fig.data):
                 variant_key = getattr(trace, "name", None) or f"trace_{trace_idx}"
@@ -764,6 +1372,7 @@ def _overlay_figures(figs_by_run: dict[str, list[go.Figure]]) -> list[go.Figure]
                         trace,
                         run_name,
                         run_colors[run_name],
+                        run_idx,
                         variant_map[variant_key],
                     )
                 )
@@ -800,6 +1409,19 @@ def _show_summary_table(rows: list[dict[str, object]]) -> None:
         st.dataframe(pl.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
+def _run_cache_tokens(dfs: dict[str, pl.DataFrame]) -> tuple[tuple[str, FileSignature, str], ...]:
+    """Stable cache tokens for current runs and selected laps."""
+    file_signatures = st.session_state.get("_run_file_signatures", {})
+    return tuple(
+        (
+            run_name,
+            file_signatures.get(run_name, (0, 0)),
+            _lap_signature(df),
+        )
+        for run_name, df in dfs.items()
+    )
+
+
 def _driver_run_tokens(
     dfs: dict[str, pl.DataFrame],
     file_signatures: dict[str, FileSignature],
@@ -813,6 +1435,82 @@ def _driver_run_tokens(
         )
         for run_name, df in dfs.items()
     )
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _pt_energy_per_lap_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+    x_mode: str,
+) -> tuple[go.Figure, dict]:
+    _ = run_tokens
+    return pt.energy_per_lap_fig(dfs, x_mode=x_mode)
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _pt_power_per_wheel_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+    x_mode: str,
+) -> tuple[go.Figure, dict]:
+    _ = run_tokens
+    return pt.power_per_wheel_fig(dfs, x_mode=x_mode)
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _pt_battery_status_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+    x_mode: str,
+) -> tuple[go.Figure, dict]:
+    _ = run_tokens
+    return pt.battery_status_fig(dfs, x_mode=x_mode)
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _pt_thermal_evolution_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+    x_mode: str,
+) -> tuple[go.Figure, dict]:
+    _ = run_tokens
+    return pt.thermal_evolution_fig(dfs, x_mode=x_mode)
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _dyn_ideal_braking_curve_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+) -> tuple[go.Figure, dict]:
+    _ = run_tokens
+    return dyn.ideal_braking_curve_fig(dfs)
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _dyn_decel_envelope_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+) -> tuple[go.Figure, dict]:
+    _ = run_tokens
+    return dyn.decel_envelope_fig(dfs)
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _dyn_ideal_traction_curve_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+) -> tuple[go.Figure, dict]:
+    _ = run_tokens
+    return dyn.ideal_traction_curve_fig(dfs)
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _dyn_accel_envelope_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+) -> tuple[go.Figure, dict]:
+    _ = run_tokens
+    return dyn.accel_envelope_fig(dfs)
 
 
 @st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
@@ -1008,6 +1706,77 @@ def _driver_cornering_metrics_cached(
         for t in turns_signature
     ]
     return corn.compute_turn_metrics(dfs, turns)
+
+
+@st.cache_data(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _driver_fastest_lap_cached(
+    dfs,
+    driver_run_tokens,
+    run_name: str,
+) -> int | None:
+    """Cached fastest valid lap for per-CSV sector summaries."""
+    _ = driver_run_tokens
+    return lsec.fastest_valid_lap(dfs[run_name])
+
+
+@st.cache_data(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _driver_lap_sectors_cached(
+    dfs,
+    driver_run_tokens,
+    run_name: str,
+    turns_signature: tuple,
+    lap_end_m_token: float,
+) -> list[lsec.Sector]:
+    """Cached sectorization for one run's fastest valid lap."""
+    _ = (dfs, driver_run_tokens, run_name, lap_end_m_token)
+    turns = [
+        corn.TurnDef(
+            turn_id=int(t[0]),
+            s_entry_m=float(t[1]),
+            s_apex_m=float(t[2]),
+            s_exit_m=float(t[3]),
+            apex_lat=float(t[4]),
+            apex_lng=float(t[5]),
+            lat=np.array([], dtype=float),
+            lng=np.array([], dtype=float),
+        )
+        for t in turns_signature
+    ]
+    return lsec.build_sectors(turns, float(lap_end_m_token))
+
+
+@st.cache_data(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _driver_csv_sector_summary_cached(
+    dfs,
+    driver_run_tokens,
+    run_name: str,
+    sectors_token: tuple,
+) -> dict[str, dict[str, float] | None]:
+    """Cached best/avg/potential metrics for one CSV."""
+    _ = driver_run_tokens
+    sectors = [
+        lsec.Sector(
+            index=int(token[0]),
+            kind=str(token[1]),
+            s_start_m=float(token[2]),
+            s_end_m=float(token[3]),
+            turn_id=None if int(token[4]) < 0 else int(token[4]),
+        )
+        for token in sectors_token
+    ]
+    return lsec.csv_metrics_summary(dfs[run_name], sectors)
+
+
+@st.cache_data(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _driver_whole_lap_metrics_cached(
+    dfs,
+    driver_run_tokens,
+    run_name: str,
+    lap_id: int,
+) -> dict[str, float] | None:
+    """Cached whole-lap phase metrics for the selected reference/comparison lap."""
+    _ = driver_run_tokens
+    return lsec.whole_lap_metrics(dfs[run_name], int(lap_id))
 
 
 # ── Function-level checks (per-controller "is it doing its job?") ─────────────
@@ -1391,12 +2160,14 @@ def _render_pc_function_check(dfs: dict[str, pl.DataFrame]) -> None:
 # ── Tab renderers ─────────────────────────────────────────────────────────────
 
 def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
+    run_tokens = _run_cache_tokens(dfs)
+
     # ── Energy ───────────────────────────────────────────────────────────────
     st.subheader("Energy per Lap")
     energy_x_mode = _select_per_lap_axis("pt_energy_axis", default="laps")
     try:
         if len(dfs) == 1:
-            fig, kpis = pt.energy_per_lap_fig(dfs, x_mode=energy_x_mode)
+            fig, kpis = _pt_energy_per_lap_fig_cached(dfs, run_tokens, energy_x_mode)
             for w in kpis.get("warnings", []):
                 st.warning(w)
             c1, c2, c3, c4 = st.columns(4)
@@ -1422,7 +2193,11 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
                 st.dataframe(kpis["table"], use_container_width=True, hide_index=True)
         else:
             run_results = {
-                run_name: pt.energy_per_lap_fig({run_name: df}, x_mode=energy_x_mode)
+                run_name: _pt_energy_per_lap_fig_cached(
+                    {run_name: df},
+                    _run_cache_tokens({run_name: df}),
+                    energy_x_mode,
+                )
                 for run_name, df in dfs.items()
             }
             for _run_name, (_fig, kpis) in run_results.items():
@@ -1462,7 +2237,7 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
     power_x_mode = _select_per_lap_axis("pt_power_axis", default="laps")
     try:
         if len(dfs) == 1:
-            fig, kpis = pt.power_per_wheel_fig(dfs, x_mode=power_x_mode)
+            fig, kpis = _pt_power_per_wheel_fig_cached(dfs, run_tokens, power_x_mode)
             for w in kpis.get("warnings", []):
                 st.warning(w)
             c1, c2, c3 = st.columns(3)
@@ -1481,7 +2256,11 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
                 st.dataframe(kpis["table"], use_container_width=True, hide_index=True)
         else:
             run_results = {
-                run_name: pt.power_per_wheel_fig({run_name: df}, x_mode=power_x_mode)
+                run_name: _pt_power_per_wheel_fig_cached(
+                    {run_name: df},
+                    _run_cache_tokens({run_name: df}),
+                    power_x_mode,
+                )
                 for run_name, df in dfs.items()
             }
             for _run_name, (_fig, kpis) in run_results.items():
@@ -1521,7 +2300,7 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
     battery_x_mode = _select_per_lap_axis("pt_battery_axis", default="laps")
     try:
         if len(dfs) == 1:
-            fig, kpis = pt.battery_status_fig(dfs, x_mode=battery_x_mode)
+            fig, kpis = _pt_battery_status_fig_cached(dfs, run_tokens, battery_x_mode)
             for w in kpis.get("warnings", []):
                 st.warning(w)
             c1, c2, c3 = st.columns(3)
@@ -1540,7 +2319,11 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
                 st.dataframe(kpis["table"], use_container_width=True, hide_index=True)
         else:
             run_results = {
-                run_name: pt.battery_status_fig({run_name: df}, x_mode=battery_x_mode)
+                run_name: _pt_battery_status_fig_cached(
+                    {run_name: df},
+                    _run_cache_tokens({run_name: df}),
+                    battery_x_mode,
+                )
                 for run_name, df in dfs.items()
             }
             for _run_name, (_fig, kpis) in run_results.items():
@@ -1578,7 +2361,7 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
     thermal_x_mode = _select_per_lap_axis("pt_thermal_axis", default="laps")
     try:
         if len(dfs) == 1:
-            fig, kpis = pt.thermal_evolution_fig(dfs, x_mode=thermal_x_mode)
+            fig, kpis = _pt_thermal_evolution_fig_cached(dfs, run_tokens, thermal_x_mode)
             for w in kpis.get("warnings", []):
                 st.warning(w)
             c1, c2, c3, c4 = st.columns(4)
@@ -1595,7 +2378,11 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
                 st.dataframe(kpis["table"], use_container_width=True, hide_index=True)
         else:
             run_results = {
-                run_name: pt.thermal_evolution_fig({run_name: df}, x_mode=thermal_x_mode)
+                run_name: _pt_thermal_evolution_fig_cached(
+                    {run_name: df},
+                    _run_cache_tokens({run_name: df}),
+                    thermal_x_mode,
+                )
                 for run_name, df in dfs.items()
             }
             for _run_name, (_fig, kpis) in run_results.items():
@@ -1630,19 +2417,25 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
 def _tab_dynamics(dfs: dict[str, pl.DataFrame]) -> None:
     dyn_section = st.segmented_control(
         "Dynamics section",
-        options=["Cornering", "Grip Factors", "Setup & Balance"],
-        default="Cornering",
+        options=["Braking", "Cornering", "Acceleration", "Setup", "Grip Factors"],
+        default="Braking",
         required=True,
         key="dyn_subsection",
         label_visibility="collapsed",
         width="stretch",
     )
 
+    if dyn_section == "Braking":
+        _render_dynamics_braking(dfs)
+        return
+    if dyn_section == "Acceleration":
+        _render_dynamics_acceleration(dfs)
+        return
+    if dyn_section == "Setup":
+        _render_dynamics_setup_signatures(dfs)
+        return
     if dyn_section == "Grip Factors":
         _render_dynamics_grip_factors(dfs)
-        return
-    if dyn_section == "Setup & Balance":
-        _render_dynamics_setup(dfs)
         return
 
     _render_dynamics_cornering(dfs)
@@ -1659,7 +2452,7 @@ def _render_ideal_braking_curve(dfs: dict[str, pl.DataFrame]) -> None:
         "brake torque at the disc."
     )
     try:
-        fig, kpis = dyn.ideal_braking_curve_fig(dfs)
+        fig, kpis = _dyn_ideal_braking_curve_fig_cached(dfs, _run_cache_tokens(dfs))
         for w in kpis.get("warnings", []):
             st.warning(w)
 
@@ -1691,78 +2484,223 @@ def _render_ideal_braking_curve(dfs: dict[str, pl.DataFrame]) -> None:
         st.error(f"Ideal braking curve unavailable: {exc}")
 
 
-def _render_dynamics_setup(dfs: dict[str, pl.DataFrame]) -> None:
-    """Tier 1 setup/balance KPIs: damper histograms, roll gradient,
-    steering vs ay (US/OS curve)."""
-    _run_name, df = _select_detail_run(dfs, key="dyn_setup_detail_run")
+def _render_dynamics_braking(dfs: dict[str, pl.DataFrame]) -> None:
+    """Longitudinal chassis response in braking."""
+    _render_ideal_braking_curve(dfs)
+    st.divider()
 
-    # ── Steering vs ay (US/OS curve) ──────────────────────────────────────
-    st.subheader("Steering vs Lateral Acceleration  ·  US/OS Curve")
+    st.subheader("Longitudinal Decel Envelope")
     st.caption(
-        "Steady-state cornering only (low jerk). Slope at low |ay| is the "
-        "linear understeer gradient; departure from the green ideal line "
-        "indicates US (above) or OS (below)."
+        "Faint points are real braking samples. The thick line is the p95 "
+        "deceleration envelope by 5 m/s speed bin. The dashed line is the "
+        "CAT17x design target, brake.MaxDeceleration = 1.79 g."
     )
     try:
-        fig, kpis = dyn.steering_vs_ay_fig(df)
+        fig, kpis = _dyn_decel_envelope_fig_cached(dfs, _run_cache_tokens(dfs))
         for w in kpis.get("warnings", []):
             st.warning(w)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("US gradient", f"{_fmt(kpis.get('understeer_gradient_deg_per_g'), '+.2f')} deg/g")
-        c2.metric("Median vx", f"{_fmt(kpis.get('vx_median_mps'), '.1f')} m/s")
-        c3.metric("Samples", str(kpis.get("samples", 0)))
+        rows = [
+            {
+                "Run": run_name,
+                "Peak p95 decel [g]": round(vals.get("peak_decel_p95_g", np.nan), 3),
+                "Peak speed [m/s]": round(vals.get("speed_at_peak_mps", np.nan), 1),
+                "Gap [g]": round(vals.get("gap_to_design_g", np.nan), 3),
+                "Design use [%]": round(vals.get("pct_design_decel", np.nan), 1),
+                "Samples": int(vals.get("samples", 0)),
+            }
+            for run_name, vals in kpis.get("runs", {}).items()
+        ]
+        if rows:
+            _show_summary_table(rows)
         _plotly_chart(fig, use_container_width=True, theme=None)
     except Exception as exc:
-        st.error(f"Steering vs ay unavailable: {exc}")
+        st.error(f"Decel envelope unavailable: {exc}")
+
+
+def _render_dynamics_acceleration(dfs: dict[str, pl.DataFrame]) -> None:
+    """Longitudinal chassis response in acceleration."""
+    st.subheader("Ideal Traction Curve  ·  Model vs Measured Drive")
+    st.caption(
+        "Drive-force plane (front axle vs rear axle). Curves are the ideal AWD "
+        "load-proportional distribution under longitudinal load transfer."
+    )
+    try:
+        fig, kpis = _dyn_ideal_traction_curve_fig_cached(dfs, _run_cache_tokens(dfs))
+        for w in kpis.get("warnings", []):
+            st.warning(w)
+        rows = [
+            {
+                "Run": run_name,
+                "Rear bias [%]": round(vals.get("rear_bias_mean", np.nan) * 100.0, 1),
+                "Ideal rear [%]": round(vals.get("rear_bias_ideal_mean", np.nan) * 100.0, 1),
+                "RMS to ideal [N]": round(vals.get("rms_dist_to_ideal_N", np.nan), 1),
+                "Peak accel [g]": round(vals.get("peak_combined_accel_g", np.nan), 3),
+                "Power-limited [%]": round(vals.get("pct_time_power_limited", np.nan), 1),
+                "Samples": int(vals.get("samples", 0)),
+            }
+            for run_name, vals in kpis.get("runs", {}).items()
+        ]
+        if rows:
+            _show_summary_table(rows)
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.error(f"Ideal traction curve unavailable: {exc}")
 
     st.divider()
 
-    # ── Roll gradient ────────────────────────────────────────────────────
-    st.subheader("Roll Gradient")
+    st.subheader("Longitudinal Accel Envelope")
     st.caption(
-        "Body roll from damper sensors vs lateral acceleration. "
-        "Slope = roll gradient [deg/g] per axle."
+        "P95 ax in acceleration events by 5 m/s speed bin, with grip-limited "
+        f"μ={dyn.MU_TIRE:.2f} g and 80 kW power-limited references."
+    )
+    try:
+        fig, kpis = _dyn_accel_envelope_fig_cached(dfs, _run_cache_tokens(dfs))
+        for w in kpis.get("warnings", []):
+            st.warning(w)
+        rows = [
+            {
+                "Run": run_name,
+                "Peak ax [g]": round(vals.get("peak_ax_g", np.nan), 3),
+                "Samples": int(vals.get("samples", 0)),
+            }
+            for run_name, vals in kpis.get("runs", {}).items()
+        ]
+        if rows:
+            _show_summary_table(rows)
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.error(f"Accel envelope unavailable: {exc}")
+
+
+def _render_setup_calibration_banner(df: pl.DataFrame) -> None:
+    damp_cols = [c for c in ("DampFL", "DampFR", "DampRL", "DampRR") if c in df.columns]
+    status = str(df["Pot_Calibration_Status"][0]) if "Pot_Calibration_Status" in df.columns else "failed"
+    convention = str(df["Pot_Calibration_Convention"][0]) if "Pot_Calibration_Convention" in df.columns else "raw"
+    r_roll = float(df["Pot_Calibration_r_roll"][0]) if "Pot_Calibration_r_roll" in df.columns else np.nan
+    r_pitch = float(df["Pot_Calibration_r_pitch"][0]) if "Pot_Calibration_r_pitch" in df.columns else np.nan
+    message = str(df["Pot_Calibration_Message"][0]) if "Pot_Calibration_Message" in df.columns else "Calibration failed - T1 metrics disabled."
+    details = (
+        f"{message} Convention: {convention}. "
+        f"r_roll={_fmt(r_roll, '.2f')}, r_pitch={_fmt(r_pitch, '.2f')}. "
+        f"Damp columns: {', '.join(damp_cols) if damp_cols else 'missing'}."
+    )
+    if status == "validated":
+        st.success(details)
+    elif status == "partial":
+        st.warning(details)
+    else:
+        st.error(details + " Falling back to raw damper-count diagnostics where possible.")
+
+
+def _render_dynamics_setup_signatures(dfs: dict[str, pl.DataFrame]) -> None:
+    """Setup diagnostics for roll, pitch, dampers and static load sanity."""
+    _run_name, df = _select_detail_run(dfs, key="dyn_setup_detail_run")
+    _render_setup_calibration_banner(df)
+
+    st.subheader("Roll Gradient  ·  Measured vs Theoretical")
+    st.caption(
+        "Radius-filtered corner samples. The theoretical CAT17x reference uses "
+        "m·h_roll/(Krollf+Krollr), approximately 0.52 deg/g."
     )
     try:
         fig, kpis = dyn.roll_gradient_fig(df)
         for w in kpis.get("warnings", []):
             st.warning(w)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Front gradient", f"{_fmt(kpis.get('front_gradient_deg_per_g'), '+.2f')} deg/g")
-        c2.metric("Front R²", _fmt(kpis.get("front_r2"), ".2f"))
-        c3.metric("Rear gradient", f"{_fmt(kpis.get('rear_gradient_deg_per_g'), '+.2f')} deg/g")
-        c4.metric("Rear R²", _fmt(kpis.get("rear_r2"), ".2f"))
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Theory", f"{_fmt(kpis.get('theoretical_deg_per_g'), '.2f')} deg/g")
+        c2.metric("Front grad", f"{_fmt(kpis.get('front_gradient_deg_per_g'), '+.2f')} deg/g")
+        c3.metric("Front dev", f"{_fmt(kpis.get('front_deviation_pct'), '+.1f')} %")
+        c4.metric("Rear grad", f"{_fmt(kpis.get('rear_gradient_deg_per_g'), '+.2f')} deg/g")
+        c5.metric("Rear dev", f"{_fmt(kpis.get('rear_deviation_pct'), '+.1f')} %")
         _plotly_chart(fig, use_container_width=True, theme=None)
     except Exception as exc:
         st.error(f"Roll gradient unavailable: {exc}")
 
     st.divider()
 
-    # ── Damper velocity histograms ───────────────────────────────────────
-    st.subheader("Damper Velocity Histograms  ·  LSB / HSB / LSR / HSR")
-    st.caption(
-        "Per-wheel damper velocity distribution. Splits at ±25 mm/s "
-        "(low-speed vs high-speed). Symmetric bump/rebound shapes = balanced "
-        "shim stack. Heavily skewed shapes = bump or rebound dominated."
-    )
+    st.subheader("Pitch Gradient  ·  Braking vs Acceleration")
+    st.caption("Pitch comparison only; CAT17x pitch stiffness is not documented for a theoretical line.")
     try:
-        figs, kpis = dyn.damper_histogram_figs(df)
+        fig, kpis = dyn.pitch_gradient_fig(df)
+        for w in kpis.get("warnings", []):
+            st.warning(w)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Brake gradient", f"{_fmt(kpis.get('brake_gradient_deg_per_g'), '+.2f')} deg/g")
+        c2.metric("Accel gradient", f"{_fmt(kpis.get('accel_gradient_deg_per_g'), '+.2f')} deg/g")
+        c3.metric("Calibrated", "yes" if kpis.get("calibrated") else "no")
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.error(f"Pitch gradient unavailable: {exc}")
+
+    st.divider()
+
+    st.subheader("Damper Velocity Histograms  ·  by Phase")
+    phase_label = st.segmented_control(
+        "Damper phase",
+        options=["ALL", "BRAKE", "CORNER", "ACCEL", "STRAIGHT"],
+        default="ALL",
+        required=True,
+        key="dyn_damper_phase",
+        label_visibility="collapsed",
+    )
+    phase = str(phase_label).lower()
+    try:
+        figs, kpis = dyn.damper_histogram_figs(df, phase=phase)
         for w in kpis.get("warnings", []):
             st.warning(w)
         front_bump = kpis.get("bump_share_by_axle", {}).get("front", float("nan"))
-        rear_bump  = kpis.get("bump_share_by_axle", {}).get("rear",  float("nan"))
+        rear_bump = kpis.get("bump_share_by_axle", {}).get("rear", float("nan"))
         c1, c2, c3 = st.columns(3)
         c1.metric("Front bump share", f"{_fmt(front_bump * 100.0, '.1f')} %")
-        c2.metric("Rear bump share",  f"{_fmt(rear_bump * 100.0, '.1f')} %")
+        c2.metric("Rear bump share", f"{_fmt(rear_bump * 100.0, '.1f')} %")
         c3.metric("Calibrated", "yes" if kpis.get("calibrated") else "no")
         for fig in figs:
             _plotly_chart(fig, use_container_width=True, theme=None)
     except Exception as exc:
         st.error(f"Damper histograms unavailable: {exc}")
 
+    try:
+        figs, _kpis = dyn.spring_velocity_histogram_figs(df, phase=phase)
+        for fig in figs:
+            _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception:
+        pass
+
     st.divider()
 
-    _render_ideal_braking_curve(dfs)
+    st.subheader("Static Fz Reference")
+    st.caption("Per-corner weight from straight low-input samples vs CAT17x design (706 N/corner). Color: green ≤±5%, yellow ≤±10%, red >±10%.")
+    try:
+        fig, kpis = dyn.static_fz_reference_fig(df)
+        for w in kpis.get("warnings", []):
+            st.warning(w)
+        corners_data = kpis.get('corners', {})
+        c1, c2, c3, c4 = st.columns(4)
+        for col, corner in zip([c1, c2, c3, c4], ['FL', 'FR', 'RL', 'RR']):
+            cd = corners_data.get(corner, {})
+            col.metric(
+                corner,
+                f"{_fmt(cd.get('measured_n', float('nan')), '.0f')} N",
+                f"{_fmt(cd.get('deviation_pct', float('nan')), '+.1f')} % vs design",
+            )
+        c1, c2, c3, c4 = st.columns(4)
+        fs = kpis.get('front_share_pct', float('nan'))
+        ls = kpis.get('left_share_pct', float('nan'))
+        cw = kpis.get('cross_weight_pct', float('nan'))
+        c1.metric("Front share", f"{_fmt(fs, '.1f')} %", f"{_fmt(fs - 50.0, '+.1f')} % vs 50%")
+        c2.metric("Left share", f"{_fmt(ls, '.1f')} %", f"{_fmt(ls - 50.0, '+.1f')} % vs 50%")
+        c3.metric("Cross weight (FL+RR)", f"{_fmt(cw, '.1f')} %", f"{_fmt(cw - 50.0, '+.1f')} % vs 50%")
+        c4.metric("Samples", str(kpis.get("samples", 0)))
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.error(f"Static Fz reference unavailable: {exc}")
+
+    try:
+        fig, _kpis = dyn.aero_load_heave_fig(df)
+        st.caption("Add k_heave_F and k_heave_R to cat17x_parameters.md to overlay theoretical aero deflection.")
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception:
+        pass
 
 
 def _render_manual_gate_editor(
@@ -1795,7 +2733,7 @@ def _render_manual_gate_editor(
         assert preview_line is not None
         updated: list[str] = []
         with st.spinner("Recomputing laps from manual finish line..."):
-            for path in sorted(DATA_DIR.glob("*.csv")):
+            for path in _telemetry_csv_paths(DATA_DIR):
                 n = lapcount.detect_and_write_laps(path, gate_line_lonlat=preview_line)
                 updated.append(f"{path.name}: {n} laps")
         _clear_data_caches()
@@ -1810,7 +2748,7 @@ def _render_manual_gate_editor(
         st.session_state.pop("_dyn_manual_gate_line", None)
         updated: list[str] = []
         with st.spinner("Restoring automatic lap detection..."):
-            for path in sorted(DATA_DIR.glob("*.csv")):
+            for path in _telemetry_csv_paths(DATA_DIR):
                 n = lapcount.detect_and_write_laps(path)
                 updated.append(f"{path.name}: {n} laps")
         _clear_data_caches()
@@ -1871,373 +2809,18 @@ def _render_track_fullscreen_dialog(
 
 
 def _render_dynamics_cornering(dfs: dict[str, pl.DataFrame]) -> None:
-    # ── Interactive: track map + GG + driver traces ───────────────────────────
-    st.subheader("GG Diagram & Driver Traces")
-    st.caption(
-        "Track map phases: red = braking, yellow = cornering, green = straight. "
-        "White dashed gate = lap detection. Blue highlight = selected section."
-    )
-    lap_gates: dict[str, dict] = {}
-    run_source_files = st.session_state.get("_run_source_files", {})
-    for run_name in dfs:
-        try:
-            source_file = run_source_files.get(run_name, run_name)
-            run_path = DATA_DIR / source_file
-            gate = load_lap_gate(str(run_path), _file_signature(run_path))
-        except Exception:
-            gate = None
-        if gate is not None:
-            lap_gates[run_name] = gate
-    pool, entries = dyn.pool_arrays_from_dfs(dfs)
-    if not pool or not entries:
-        st.warning("Missing required columns (GPS, ax/ay, Brake, Throttle, Steering).")
-    else:
-        single_csv = len(dfs) == 1
-        ui_rev = "|".join(
-            f"{run_name}:{_lap_signature(df)}"
-            for run_name, df in sorted(dfs.items())
-        )
-        color_map  = dyn.build_color_map(entries)
-
-        # Clear stale cross/GG events when the active CSV set changes
-        _prev_ui_rev = st.session_state.get("_dyn_ui_rev", "")
-        if _prev_ui_rev != ui_rev:
-            for _k in ("_dyn_gg_event", "_dyn_cross_event", "_dyn_last_cross",
-                       "_dyn_cross_ver", "_dyn_gg_ver"):
-                st.session_state.pop(_k, None)
-            st.session_state["_dyn_ui_rev"] = ui_rev
-
-        # Read previous events from session state
-        prev_gg_event    = st.session_state.get("_dyn_gg_event")
-        prev_cross_event = st.session_state.get("_dyn_cross_event")
-        last_cross_chart = st.session_state.get("_dyn_last_cross", "")
-        _prev_cross_ver  = st.session_state.get("_dyn_cross_ver", 0)
-        _prev_gg_ver     = st.session_state.get("_dyn_gg_ver", 0)
-
-        cross_range = dyn.dist_range_from_event(prev_cross_event)
-        gg_idx      = dyn.extract_gg_pool_indices(prev_gg_event)
-
-        col_left, col_right = st.columns([11, 9])
-        with col_left:
-            cont_left_plots = st.container()
-            cont_left_sel   = st.container()
-
-        # Lap selector (bottom of left column) — one column per run, fastest → slowest
-        with cont_left_sel:
-            run_entries_dyn: dict[str, list[tuple[str, int, float]]] = {}
-            for _r, _l, _t in entries:
-                run_entries_dyn.setdefault(_r, []).append((_r, _l, _t))
-            for _rn in run_entries_dyn:
-                run_entries_dyn[_rn].sort(key=lambda e: e[2] if np.isfinite(e[2]) else 1e9)
-
-            sel_cols_dyn = st.columns(len(run_entries_dyn))
-            visible_keys: set[tuple[str, int]] = set()
-            for _col, (_rn, _run_ents) in zip(sel_cols_dyn, run_entries_dyn.items()):
-                _rcmap = dyn.build_color_map(_run_ents)
-                _rlabels = [
-                    f"L{l}  ({t:.2f}s)" if np.isfinite(t) else f"L{l}"
-                    for _, l, t in _run_ents
-                ]
-                _rl2key = {lbl: (r, l) for lbl, (r, l, _) in zip(_rlabels, _run_ents)}
-                with _col:
-                    st.markdown(f"**{_rn}**")
-                    st.markdown(" &nbsp;".join(
-                        f'<span style="color:{_rcmap.get((r, l), "#ccc")}">■</span>'
-                        f' <span style="color:#ccc">{lbl}</span>'
-                        for lbl, (r, l, _) in zip(_rlabels, _run_ents)
-                    ), unsafe_allow_html=True)
-                    _sel = st.multiselect(
-                        _rn,
-                        options=_rlabels,
-                        default=_rlabels,
-                        key=f"dyn_lap_sel_{_rn}_{ui_rev}",
-                        label_visibility="collapsed",
-                    )
-                    visible_keys.update(_rl2key[lbl] for lbl in _sel)
-        if not visible_keys:
-            st.warning("Select at least one lap.")
-            return
-
-        visible_mask = np.zeros(len(pool["run"]), dtype=bool)
-        for (run, lap) in visible_keys:
-            visible_mask |= (pool["run"] == run) & (pool["lap"] == lap)
-
-        # Right column: track map + GG
-        with col_right:
-            action_col, info_col = st.columns([1.8, 2.2])
-            with action_col:
-                manual_gate_line, open_fullscreen = _render_manual_gate_editor(ui_rev)
-            with info_col:
-                st.markdown(
-                    "**Track** — lasso = GG zone | draw line in map toolbar = finish line | "
-                    "white dashed = lap detection | "
-                    "blue = selected section"
-                )
-                if manual_gate_line is not None:
-                    st.caption(
-                        "Manual line: "
-                        f"({manual_gate_line[0][0]:.6f}, {manual_gate_line[0][1]:.6f}) → "
-                        f"({manual_gate_line[1][0]:.6f}, {manual_gate_line[1][1]:.6f})"
-                    )
-            track_fig = dyn.track_map_fig(
-                pool,
-                visible_mask,
-                cross_range,
-                gg_idx,
-                ui_rev,
-                lap_gates=lap_gates,
-                manual_gate_line=manual_gate_line,
-            )
-            track_event = tmc.render_track_map_component(
-                tmc.serialize_figure(track_fig),
-                height_px=390,
-                key="dyn_track_component_" + ui_rev,
-            )
-            _consume_track_component_event(
-                track_event,
-                pool_len=len(pool["ax"]),
-                event_state_key="_dyn_track_last_event_id",
-            )
-            if open_fullscreen or bool(st.session_state.get("_dyn_track_open_fullscreen", False)):
-                st.session_state["_dyn_track_open_fullscreen"] = False
-                _render_track_fullscreen_dialog(
-                    pool,
-                    visible_mask,
-                    cross_range,
-                    gg_idx,
-                    ui_rev,
-                    lap_gates,
-                )
-            zone_mask, zone_active = _track_zone_mask_from_session(len(pool["ax"]))
-            _vk_str = sorted(f"{r}:{l}" for r, l in visible_keys)
-            gg_key_suffix = (
-                "|".join(_vk_str)
-                + f"|zone:{int(zone_active)}|pts:{int(zone_mask.sum())}"
-            )
-            gg_ui_rev = (
-                ui_rev
-                + "|gg|"
-                + ",".join(_vk_str)
-            )
-
-            st.markdown(
-                "**GG Diagram** — drag to highlight on map"
-                + (f"  ·  zone: {int(zone_mask.sum())} pts" if zone_active else "")
-            )
-            gg_range = dyn.gg_axis_range(
-                pool,
-                visible_mask,
-                zone_mask if zone_active else None,
-            )
-            gg_fig = dyn.gg_diagram_fig(
-                pool, entries, visible_keys, color_map,
-                zone_mask, single_csv, gg_ui_rev, gg_range,
-            )
-            event_gg = _plotly_chart(
-                gg_fig, use_container_width=True, theme=None,
-                key="dyn_gg_" + ui_rev + "|" + gg_key_suffix,
-                on_select="rerun", selection_mode=("box", "lasso"),
-            )
-            if dyn.has_selection(event_gg) and event_gg is not prev_gg_event:
-                st.session_state["_dyn_gg_event"] = event_gg
-                st.session_state["_dyn_gg_ver"]   = _prev_gg_ver + 1
-            elif not dyn.has_selection(event_gg) and prev_gg_event is not None:
-                st.session_state.pop("_dyn_gg_event", None)
-                st.session_state["_dyn_gg_ver"] = _prev_gg_ver + 1
-
-        extra_mask = zone_mask if zone_active else None
-
-        def _store_cross(event, chart_id: str) -> None:
-            if dyn.has_selection(event):
-                st.session_state["_dyn_cross_event"] = event
-                st.session_state["_dyn_last_cross"]  = chart_id
-                st.session_state["_dyn_cross_ver"]   = _prev_cross_ver + 1
-            elif last_cross_chart == chart_id:
-                st.session_state.pop("_dyn_cross_event", None)
-                st.session_state.pop("_dyn_last_cross", None)
-                st.session_state["_dyn_cross_ver"] = _prev_cross_ver + 1
-
-        SIG = dyn.SIG_COLORS
-        dist_kwargs = dict(
-            pool=pool, entries=entries, visible_keys=visible_keys,
-            extra_mask=extra_mask, ui_rev=ui_rev, cross_range=cross_range,
-        )
-
-        with cont_left_plots:
-            # CSS to collapse Streamlit vertical gaps between stacked charts
-            st.markdown(
-                '<style>'
-                '[data-st-key="dyn_stacked_charts"] > div { gap: 0 !important; }'
-                '</style>'
-                '<span style="font-size:0.8em;color:#888">'
-                'solid=L1 · dash=L2 · dot=L3 · dashdot=L4+</span>',
-                unsafe_allow_html=True,
-            )
-
-            stacked = st.container(key="dyn_stacked_charts")
-            with stacked:
-                bt_fig = dyn.dist_plot_fig(
-                    sig1_key="thr", sig2_key="brk", ylabel="[%]",
-                    sig1_label="Throttle", sig1_color=SIG["throttle"],
-                    sig2_label="Brake",    sig2_color=SIG["brake"],
-                    sig2_yaxis="y", compact="top",
-                    **dist_kwargs,
-                )
-                event_bt = _plotly_chart(
-                    bt_fig, use_container_width=True, theme=None,
-                    key="dyn_bt_" + ui_rev,
-                    on_select="rerun", selection_mode=("box",),
-                )
-                _store_cross(event_bt, "bt")
-
-                mid_fig = dyn.dist_plot_fig(
-                    sig1_key="ste", sig2_key="vx", ylabel="Steering [deg]",
-                    sig1_label="Steering [deg]", sig1_color=SIG["steering"],
-                    sig2_label="VN_vx",    sig2_color=SIG["vx"],
-                    sig2_yaxis="y2",       right_yaxis_title="",
-                    compact="middle",
-                    **dist_kwargs,
-                )
-                event_mid = _plotly_chart(
-                    mid_fig, use_container_width=True, theme=None,
-                    key="dyn_mid_" + ui_rev,
-                    on_select="rerun", selection_mode=("box",),
-                )
-                _store_cross(event_mid, "mid")
-
-                bot_fig = dyn.dist_plot_fig(
-                    sig1_key="ax", sig2_key="ay", ylabel="[m/s²]",
-                    sig1_label="ax", sig1_color=SIG["ax"],
-                    sig2_label="ay", sig2_color=SIG["ay"],
-                    sig2_yaxis="y", compact="bottom",
-                    **dist_kwargs,
-                )
-                event_bot = _plotly_chart(
-                    bot_fig, use_container_width=True, theme=None,
-                    key="dyn_bot_" + ui_rev,
-                    on_select="rerun", selection_mode=("box",),
-                )
-                _store_cross(event_bot, "bot")
-
-        # Force rerun so map + all charts pick up new state (1-frame lag fix)
-        _cross_changed = st.session_state.get("_dyn_cross_ver", 0) != _prev_cross_ver
-        _gg_changed    = st.session_state.get("_dyn_gg_ver", 0) != _prev_gg_ver
-    if _cross_changed or _gg_changed:
-        st.rerun()
-
-    st.divider()
-
-    # ── Tire workload and body slip ───────────────────────────────────────────
+    """Cornering chassis balance without driver trace/map duplication."""
     _detail_run_name, df_single = _select_detail_run(dfs, key="dyn_corner_detail_run")
 
-    st.subheader("Tire Workload  ·  Friction Circle")
-    st.caption(
-        "Radius-filtered corners using the Driver/Lap Analysis logic "
-        "(R = V²/|ay| < 60 m). Utilization uses Est_FX/FY/FZ and μ tire."
-    )
-    try:
-        figs, kpis = dyn.friction_circle_figs(df_single)
-        for w in kpis.get("warnings", []):
-            st.warning(w)
-        wheel_kpis = kpis.get("wheels", {})
-        cols = st.columns(4)
-        for col, wheel in zip(cols, ("FL", "FR", "RL", "RR")):
-            wk = wheel_kpis.get(wheel, {})
-            col.metric(
-                f"{wheel} peak util",
-                _fmt(wk.get("peak_util", float("nan")), ".2f"),
-                help="99th percentile utilization in radius-filtered corners.",
-            )
-        cols = st.columns(4)
-        for col, wheel in zip(cols, ("FL", "FR", "RL", "RR")):
-            wk = wheel_kpis.get(wheel, {})
-            col.metric(f"{wheel} >0.95", f"{_fmt(wk.get('sat_time_pct', float('nan')), '.1f')} %")
-        filtered_figs = [
-            fig for fig in figs
-            if "Tire utilization vs distance" not in (fig.layout.title.text or "")
-        ]
-        for fig in filtered_figs:
-            _plotly_chart(fig, use_container_width=True, theme=None)
-    except Exception as exc:
-        st.warning(f"Friction circle unavailable: {exc}")
-
-    st.divider()
-
-    st.subheader("Body Slip Angle β")
-    st.caption(
-        "β = atan2(Est_vyCOG, Est_vxCOG). Apex samples use the same "
-        "radius-curvature corner definition as Driver → Lap Analysis."
-    )
-    try:
-        figs, kpis = dyn.body_slip_angle_fig(df_single)
-        for w in kpis.get("warnings", []):
-            st.warning(w)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("|β| peak", f"{_fmt(kpis.get('peak_abs_beta_deg'), '.2f')} deg")
-        c2.metric("|β| at apex", f"{_fmt(kpis.get('apex_abs_beta_deg'), '.2f')} deg")
-        c3.metric("max |dβ/dt|", f"{_fmt(kpis.get('max_beta_rate_degps'), '.1f')} deg/s")
-        c4.metric("Corner samples", str(kpis.get("corner_samples", 0)))
-        filtered_figs = [
-            fig for fig in figs
-            if "Body slip angle β vs distance" not in (fig.layout.title.text or "")
-        ]
-        for fig in filtered_figs:
-            _plotly_chart(fig, use_container_width=True, theme=None)
-    except Exception as exc:
-        st.warning(f"Body slip angle unavailable: {exc}")
-
-    st.divider()
-
-    # ── Per-run analysis: slip angle balance + understeer ────────────────────
-    st.subheader("Tyre Balance  ·  SA Front vs Rear")
-    st.caption(
-        "Balance index = (SA_rear - SA_front)/(SA_rear + SA_front). "
-        "Positive = rear tyres use more slip angle, usually oversteer tendency; "
-        "negative = front tyres use more slip angle, usually understeer tendency."
-    )
-    try:
-        balance_kpis = dyn.sa_balance_kpis(dfs)
-        valid_kpis = {
-            run_name: vals
-            for run_name, vals in balance_kpis.items()
-            if not vals.get("warnings")
-        }
-        for run_name, vals in balance_kpis.items():
-            for w in vals.get("warnings", []):
-                st.warning(f"{run_name}: {w}")
-        if len(valid_kpis) == 1:
-            _run_name, vals = next(iter(valid_kpis.items()))
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Mean balance", _fmt(vals.get("balance_index_mean"), "+.3f"))
-            c2.metric("Peak-|ay| balance", _fmt(vals.get("balance_index_at_peak"), "+.3f"))
-            c3.metric("OS fraction", f"{_fmt(vals.get('os_fraction', np.nan) * 100.0, '.1f')} %")
-            c4.metric("P95 SA front", f"{_fmt(vals.get('peak_sa_front_deg'), '.2f')} deg")
-            c5.metric("P95 SA rear", f"{_fmt(vals.get('peak_sa_rear_deg'), '.2f')} deg")
-        elif len(valid_kpis) > 1:
-            _show_summary_table([
-                {
-                    "Run": run_name,
-                    "Mean balance": round(vals.get("balance_index_mean", np.nan), 4),
-                    "Peak-|ay| balance": round(vals.get("balance_index_at_peak", np.nan), 4),
-                    "OS fraction [%]": round(vals.get("os_fraction", np.nan) * 100.0, 2),
-                    "P95 SA front [deg]": round(vals.get("peak_sa_front_deg", np.nan), 2),
-                    "P95 SA rear [deg]": round(vals.get("peak_sa_rear_deg", np.nan), 2),
-                    "Corner samples": int(vals.get("n_corner_samples", 0)),
-                }
-                for run_name, vals in valid_kpis.items()
-            ])
-        for fig in dyn.sa_balance_figs(dfs):
-            _plotly_chart(fig, use_container_width=True, theme=None)
-    except Exception as exc:
-        st.warning(f"SA balance unavailable: {exc}")
-
-    st.divider()
-
     st.subheader("Understeer Angle")
+    st.caption(
+        "Mean per-lap understeer angle using the same radius-corner definition "
+        "as Lap Analysis: R = V²/|ay| < 60 m."
+    )
     understeer_x_mode = _select_per_lap_axis("dyn_understeer_axis", default="laps")
     try:
         if len(dfs) == 1:
-            run_name, df = next(iter(dfs.items()))
+            _run_name, df = next(iter(dfs.items()))
             kpis = dyn.understeer_angle_kpis(df)
             for w in kpis.get("warnings", []):
                 st.warning(w)
@@ -2246,7 +2829,7 @@ def _render_dynamics_cornering(dfs: dict[str, pl.DataFrame]) -> None:
                 c1.metric("Valid laps", str(kpis["valid_laps"]))
                 c2.metric("Mean understeer", f"{_fmt(kpis['mean_understeer'], '.2f')} deg")
                 c3.metric("Min / Max", f"{_fmt(kpis['min_understeer'], '.2f')} / {_fmt(kpis['max_understeer'], '.2f')} deg")
-                c4.metric("Fastest valid lap", f"L{kpis['fastest_lap']} — {_fmt(kpis['fastest_lt'], '.2f')} s")
+                c4.metric("Fastest valid lap", f"L{kpis['fastest_lap']} - {_fmt(kpis['fastest_lt'], '.2f')} s")
             fig = dyn.understeer_angle_fig(df, x_mode=understeer_x_mode)
             _plotly_chart(fig, use_container_width=True, theme=None)
             if not kpis.get("warnings"):
@@ -2290,7 +2873,145 @@ def _render_dynamics_cornering(dfs: dict[str, pl.DataFrame]) -> None:
                     hide_index=True,
                 )
     except Exception as exc:
-        st.warning(f"Understeer angle: {exc}")
+        st.warning(f"Understeer angle unavailable: {exc}")
+
+    st.divider()
+
+    st.subheader("Steering vs Lateral Acceleration  ·  US/OS Curve")
+    st.caption(
+        "Steady-state samples are radius-filtered corners plus low ay and steer jerk. "
+        "Slope at low |ay| is the linear understeer gradient."
+    )
+    try:
+        fig, kpis = dyn.steering_vs_ay_fig(df_single)
+        for w in kpis.get("warnings", []):
+            st.warning(w)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("US gradient", f"{_fmt(kpis.get('understeer_gradient_deg_per_g'), '+.2f')} deg/g")
+        c2.metric("Median vx", f"{_fmt(kpis.get('vx_median_mps'), '.1f')} m/s")
+        c3.metric("Samples", str(kpis.get("samples", 0)))
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.warning(f"Steering vs ay unavailable: {exc}")
+
+    st.divider()
+
+    st.subheader("Lateral Load Transfer Distribution  ·  Front Share")
+    st.caption(
+        "Blue points are individual corner samples. The orange line is the median deviation "
+        "by |ay| band, and the blue band shows the P10-P90 spread. "
+        "Front LTD = |ΔFz_front| / (|ΔFz_front| + |ΔFz_rear|), using Est_FZ in "
+        "radius-filtered corners. The target comes from the roll "
+        f"stiffness split: Krollf / (Krollf + Krollr) = {dyn.KROLLF_NMRAD:.1f} / "
+        f"({dyn.KROLLF_NMRAD:.1f} + {dyn.KROLLR_NMRAD:.1f}) = "
+        f"{dyn.KROLLF_NMRAD / (dyn.KROLLF_NMRAD + dyn.KROLLR_NMRAD) * 100.0:.1f}%."
+    )
+    try:
+        fig, kpis = dyn.lateral_load_transfer_fig(df_single)
+        for w in kpis.get("warnings", []):
+            st.warning(w)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Median front LTD", f"{_fmt(kpis.get('ltd_front_mean') * 100.0, '.1f')} %")
+        c2.metric("Theoretical", f"{_fmt(kpis.get('ltd_theoretical') * 100.0, '.1f')} %")
+        c3.metric("Deviation", f"{_fmt(kpis.get('deviation_pct'), '+.1f')} %")
+        c4.metric("Samples", str(kpis.get("samples", 0)))
+        st.caption(
+            "Engineer read: use the orange line for the trend and the blue points/band for scatter. "
+            "If the orange line stays below zero, the rear axle is taking more transfer than target."
+        )
+        if np.isfinite(kpis.get("geom_ltd_front_mean", np.nan)):
+            st.caption(f"Roll-spring geometry cross-check: {_fmt(kpis.get('geom_ltd_front_mean') * 100.0, '.1f')}% front LTD.")
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.warning(f"LTD unavailable: {exc}")
+
+    st.divider()
+
+    with st.expander("Legacy · Tire Workload · Friction Circle", expanded=False):
+        st.caption(
+            "Radius-filtered corners using the Driver/Lap Analysis logic "
+            "(R = V²/|ay| < 60 m). Utilization uses Est_FX/FY/FZ and μ tire."
+        )
+        try:
+            figs, kpis = dyn.friction_circle_figs(df_single)
+            for w in kpis.get("warnings", []):
+                st.warning(w)
+            wheel_kpis = kpis.get("wheels", {})
+            cols = st.columns(4)
+            for col, wheel in zip(cols, ("FL", "FR", "RL", "RR")):
+                wk = wheel_kpis.get(wheel, {})
+                col.metric(f"{wheel} peak util", _fmt(wk.get("peak_util", float("nan")), ".2f"))
+            cols = st.columns(4)
+            for col, wheel in zip(cols, ("FL", "FR", "RL", "RR")):
+                wk = wheel_kpis.get(wheel, {})
+                col.metric(f"{wheel} >0.95", f"{_fmt(wk.get('sat_time_pct', float('nan')), '.1f')} %")
+            for fig in [
+                fig for fig in figs
+                if "Tire utilization vs distance" not in (fig.layout.title.text or "")
+            ]:
+                _plotly_chart(fig, use_container_width=True, theme=None)
+        except Exception as exc:
+            st.warning(f"Friction circle unavailable: {exc}")
+
+    with st.expander("Legacy · Body Slip Angle beta", expanded=False):
+        st.caption("beta = atan2(Est_vyCOG, Est_vxCOG). Apex samples use radius-curvature corners.")
+        try:
+            figs, kpis = dyn.body_slip_angle_fig(df_single)
+            for w in kpis.get("warnings", []):
+                st.warning(w)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("|beta| peak", f"{_fmt(kpis.get('peak_abs_beta_deg'), '.2f')} deg")
+            c2.metric("|beta| at apex", f"{_fmt(kpis.get('apex_abs_beta_deg'), '.2f')} deg")
+            c3.metric("max |dbeta/dt|", f"{_fmt(kpis.get('max_beta_rate_degps'), '.1f')} deg/s")
+            c4.metric("Corner samples", str(kpis.get("corner_samples", 0)))
+            for fig in [
+                fig for fig in figs
+                if "Body slip angle β vs distance" not in (fig.layout.title.text or "")
+            ]:
+                _plotly_chart(fig, use_container_width=True, theme=None)
+        except Exception as exc:
+            st.warning(f"Body slip angle unavailable: {exc}")
+
+    with st.expander("Legacy · Tyre Balance · SA Front vs Rear", expanded=False):
+        st.caption(
+            "Balance index = (SA_rear - SA_front)/(SA_rear + SA_front). "
+            "Positive = rear tyres use more slip angle; negative = front tyres use more."
+        )
+        try:
+            balance_kpis = dyn.sa_balance_kpis(dfs)
+            valid_kpis = {
+                run_name: vals
+                for run_name, vals in balance_kpis.items()
+                if not vals.get("warnings")
+            }
+            for run_name, vals in balance_kpis.items():
+                for w in vals.get("warnings", []):
+                    st.warning(f"{run_name}: {w}")
+            if len(valid_kpis) == 1:
+                _run_name, vals = next(iter(valid_kpis.items()))
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Mean balance", _fmt(vals.get("balance_index_mean"), "+.3f"))
+                c2.metric("Peak-|ay| balance", _fmt(vals.get("balance_index_at_peak"), "+.3f"))
+                c3.metric("OS fraction", f"{_fmt(vals.get('os_fraction', np.nan) * 100.0, '.1f')} %")
+                c4.metric("P95 SA front", f"{_fmt(vals.get('peak_sa_front_deg'), '.2f')} deg")
+                c5.metric("P95 SA rear", f"{_fmt(vals.get('peak_sa_rear_deg'), '.2f')} deg")
+            elif len(valid_kpis) > 1:
+                _show_summary_table([
+                    {
+                        "Run": run_name,
+                        "Mean balance": round(vals.get("balance_index_mean", np.nan), 4),
+                        "Peak-|ay| balance": round(vals.get("balance_index_at_peak", np.nan), 4),
+                        "OS fraction [%]": round(vals.get("os_fraction", np.nan) * 100.0, 2),
+                        "P95 SA front [deg]": round(vals.get("peak_sa_front_deg", np.nan), 2),
+                        "P95 SA rear [deg]": round(vals.get("peak_sa_rear_deg", np.nan), 2),
+                        "Corner samples": int(vals.get("n_corner_samples", 0)),
+                    }
+                    for run_name, vals in valid_kpis.items()
+                ])
+            for fig in dyn.sa_balance_figs(dfs):
+                _plotly_chart(fig, use_container_width=True, theme=None)
+        except Exception as exc:
+            st.warning(f"SA balance unavailable: {exc}")
 
 
 def _render_dynamics_grip_factors(dfs: dict[str, pl.DataFrame]) -> None:
@@ -3469,6 +4190,7 @@ def _render_driver_lap_analysis_subtab(
     turn_ids: list[int] = []
     included_turns_key = ""
     click_event_key = ""
+    R_thr_m = _curvature_thr_1pkm_to_R_thr_m(detection_values["curvature_thr_1pkm"])
     try:
         ref_lt = float(summary["ref_lap_time_s"])
         cmp_lt = float(summary["cmp_lap_time_s"])
@@ -3477,9 +4199,6 @@ def _render_driver_lap_analysis_subtab(
         )
         corner_run = ref_run if use_ref_for_corners else cmp_run
         corner_lap = int(ref_lap if use_ref_for_corners else cmp_lap)
-        R_thr_m = _curvature_thr_1pkm_to_R_thr_m(
-            detection_values["curvature_thr_1pkm"]
-        )
         turns = _driver_cornering_turns_cached(
             dfs,
             driver_run_tokens,
@@ -3558,32 +4277,11 @@ def _render_driver_lap_analysis_subtab(
         active_turns = []
 
     brake_thr = float(detection_values["brake_threshold_pct"])
-    throttle_thr = float(detection_values["throttle_threshold_pct"])
 
     phase_table = pl.DataFrame()
     phase_bounds: list = []
     map_phase_bounds = drv.compute_lap_analysis_corner_phases(turns) if turns else []
-
-    # 1) GPS maps side by side: loss-rate (left) + corner phase map (right).
-    map_left, map_right = st.columns(2)
-    with map_left:
-        try:
-            _plotly_chart(
-                drv.lap_comparison_track_fig(
-                    dfs,
-                    ref_run,
-                    int(ref_lap),
-                    cmp_run,
-                    int(cmp_lap),
-                    turns=turns,
-                    active_turn_ids=selected_turn_set if turns else None,
-                ),
-                use_container_width=True,
-                theme=None,
-                key=f"drv_lap_track_{ref_run}_{ref_lap}_{cmp_run}_{cmp_lap}",
-            )
-        except Exception as exc:
-            st.warning(f"Track map unavailable: {exc}")
+    lap_gates = _lap_gates_from_run_tokens(driver_run_tokens)
 
     if active_turns:
         try:
@@ -3596,9 +4294,62 @@ def _render_driver_lap_analysis_subtab(
         except Exception as exc:
             st.warning(f"Corner phase breakdown unavailable: {exc}")
 
-    with map_right:
+    def _sector_summary_for_run(run_name: str) -> dict[str, dict[str, float] | None] | None:
+        fastest_lap = _driver_fastest_lap_cached(dfs, driver_run_tokens, run_name)
+        if fastest_lap is None:
+            return None
+        run_turns = _driver_cornering_turns_cached(
+            dfs,
+            driver_run_tokens,
+            R_thr_m,
+            detection_values["min_dur_s"],
+            detection_values["corner_merge_gap_m"],
+            run_name,
+            int(fastest_lap),
+        )
+        if turns:
+            run_turns = [
+                turn for turn in run_turns
+                if int(turn.turn_id) in selected_turn_set
+            ]
+        turns_signature = _cornering_turns_signature(run_turns)
+        lap_end_m = lsec.lap_end_distance(dfs[run_name], int(fastest_lap))
+        sectors = _driver_lap_sectors_cached(
+            dfs,
+            driver_run_tokens,
+            run_name,
+            turns_signature,
+            round(float(lap_end_m), 1) if np.isfinite(lap_end_m) else np.nan,
+        )
+        sectors_token = tuple(
+            (
+                int(sector.index),
+                str(sector.kind),
+                round(float(sector.s_start_m), 2),
+                round(float(sector.s_end_m), 2),
+                int(sector.turn_id) if sector.turn_id is not None else -1,
+            )
+            for sector in sectors
+        )
+        return _driver_csv_sector_summary_cached(
+            dfs,
+            driver_run_tokens,
+            run_name,
+            sectors_token,
+        )
+
+    top_left, top_right = st.columns([1.15, 0.85])
+    with top_left:
         if map_phase_bounds:
             try:
+                gate_ui_rev = f"{ref_run}_{ref_lap}_{cmp_run}_{cmp_lap}"
+                manual_gate_line, open_fullscreen = _render_manual_gate_editor(f"driver_{gate_ui_rev}")
+                if manual_gate_line is not None:
+                    st.caption(
+                        "Manual line: "
+                        f"({manual_gate_line[0][0]:.6f}, {manual_gate_line[0][1]:.6f}) -> "
+                        f"({manual_gate_line[1][0]:.6f}, {manual_gate_line[1][1]:.6f})"
+                    )
                 phase_fig = drv.lap_phase_track_fig(
                     dfs,
                     ref_run,
@@ -3608,15 +4359,27 @@ def _render_driver_lap_analysis_subtab(
                     phases=map_phase_bounds,
                     active_turn_ids=selected_turn_set if turns else None,
                 )
+                phase_fig = _add_lap_detection_gates_to_fig(phase_fig, lap_gates)
+                phase_fig = _add_manual_gate_line_to_fig(phase_fig, manual_gate_line)
                 phase_fig_json = tmc.serialize_figure(phase_fig)
                 phase_event = tmc.render_track_map_component(
                     phase_fig_json,
                     height_px=430,
                     key=f"drv_lap_phase_map_click_{ref_run}_{ref_lap}_{cmp_run}_{cmp_lap}",
                 )
-                if bool(phase_event.get("fullscreen_event", False)):
+                _consume_track_component_event(
+                    phase_event,
+                    pool_len=0,
+                    event_state_key=f"drv_lap_phase_manual_{ref_run}_{ref_lap}_{cmp_run}_{cmp_lap}",
+                )
+                if (
+                    open_fullscreen
+                    or bool(st.session_state.get("_dyn_track_open_fullscreen", False))
+                    or bool(phase_event.get("fullscreen_event", False))
+                ):
+                    st.session_state["_dyn_track_open_fullscreen"] = False
                     _render_lap_phase_fullscreen_dialog(
-                        phase_fig_json,
+                        phase_fig,
                         turn_ids=turn_ids,
                         included_turns_key=included_turns_key,
                         event_state_key=click_event_key,
@@ -3633,24 +4396,63 @@ def _render_driver_lap_analysis_subtab(
         else:
             st.info("Corner phase map available once corners are detected.")
 
-    # 1b) Lap-wide cumulative Δt with corner bands.
-    try:
-        _plotly_chart(
-            drv.lap_delta_cumulative_fig(
-                dfs,
-                ref_run,
-                int(ref_lap),
-                cmp_run,
-                int(cmp_lap),
-                turns=turns,
-                active_turn_ids=selected_turn_set if turns else None,
-            ),
-            use_container_width=True,
-            theme=None,
-            key=f"drv_lap_delta_cum_{ref_run}_{ref_lap}_{cmp_run}_{cmp_lap}",
-        )
-    except Exception as exc:
-        st.warning(f"Cumulative Δt unavailable: {exc}")
+        top_runs = list(dfs.keys())[:2]
+        p1_run = top_runs[0] if top_runs else None
+        p2_run = top_runs[1] if len(top_runs) > 1 else None
+        if p1_run is not None:
+            p_caption = f"P1 = {Path(p1_run).stem}"
+            if p2_run is not None:
+                p_caption += f" | P2 = {Path(p2_run).stem}"
+            st.caption(p_caption)
+        if turns and not active_turns:
+            st.info("Metrics table available once at least one curve is included.")
+        elif p1_run is None:
+            st.info("Metrics table unavailable without loaded CSVs.")
+        else:
+            try:
+                p1_summary = _sector_summary_for_run(p1_run)
+                p2_summary = _sector_summary_for_run(p2_run) if p2_run is not None else None
+                metrics_table = lsec.build_metrics_table(
+                    p1_run,
+                    p2_run,
+                    _driver_whole_lap_metrics_cached(
+                        dfs, driver_run_tokens, ref_run, int(ref_lap)
+                    ),
+                    _driver_whole_lap_metrics_cached(
+                        dfs, driver_run_tokens, cmp_run, int(cmp_lap)
+                    ),
+                    p1_summary,
+                    p2_summary,
+                    int(ref_lap),
+                    int(cmp_lap),
+                )
+                st.dataframe(
+                    style_metrics_table(
+                        metrics_table,
+                        lower_better={
+                            "LapTime [s]": True,
+                            "Throttle [%]": False,
+                            "Braking [%]": True,
+                            "Coasting [%]": True,
+                            "Plausibility [%]": True,
+                        },
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            except Exception as exc:
+                st.warning(f"Metrics table unavailable: {exc}")
+
+    with top_right:
+        if phase_table.is_empty():
+            st.info("Where is the time? is available once at least one curve is included.")
+        else:
+            _plotly_chart(
+                drv.corner_phase_delta_fig(phase_table),
+                use_container_width=True,
+                theme=None,
+                key=f"drv_corner_phase_bars_{ref_run}_{ref_lap}_{cmp_run}_{cmp_lap}",
+            )
 
     # 2) Per-corner analysis: signal traces (left) + GG + Δt chart (right).
     if phase_bounds and not phase_table.is_empty():
@@ -3674,6 +4476,21 @@ def _render_driver_lap_analysis_subtab(
         )
 
         detail_col, right_col = st.columns([1.0, 1.0])
+        track_overview_fig: go.Figure | None = None
+        track_overview_error: str | None = None
+        try:
+            track_overview_fig = drv.lap_comparison_track_fig(
+                dfs,
+                ref_run,
+                int(ref_lap),
+                cmp_run,
+                int(cmp_lap),
+                turns=turns,
+                active_turn_ids=selected_turn_set if turns else None,
+            )
+            track_overview_fig = _add_lap_detection_gates_to_fig(track_overview_fig, lap_gates)
+        except Exception as exc:
+            track_overview_error = str(exc)
 
         # ── Left: signal selector controls + corner detail trace ──────────────
         with detail_col:
@@ -3742,6 +4559,7 @@ def _render_driver_lap_analysis_subtab(
                     x_axis_mode=corner_detail_x_axis,
                 )
                 fullscreen_figures = {}
+                fullscreen_gg_figures: dict[str, go.Figure] = {}
                 fullscreen_selected = (
                     f"T{int(sel_corner)}   Δt {total_by_id.get(int(sel_corner), 0.0):+.3f} s"
                 )
@@ -3759,6 +4577,21 @@ def _render_driver_lap_analysis_subtab(
                         signal_keys=selected_signal_keys,
                         x_axis_mode=corner_detail_x_axis,
                     )
+                for corner_id in corner_options:
+                    corner_label = (
+                        f"T{int(corner_id)}   Δt {total_by_id.get(int(corner_id), 0.0):+.3f} s"
+                    )
+                    try:
+                        fullscreen_gg_figures[corner_label] = drv.corner_gg_fig(
+                            dfs,
+                            ref_run,
+                            int(ref_lap),
+                            cmp_run,
+                            int(cmp_lap),
+                            phase_by_id[int(corner_id)],
+                        )
+                    except Exception:
+                        continue
                 _render_lap_detail_chart(
                     detail_fig,
                     key=(
@@ -3768,18 +4601,23 @@ def _render_driver_lap_analysis_subtab(
                     ),
                     fullscreen_figures=fullscreen_figures,
                     fullscreen_selected=fullscreen_selected,
+                    fullscreen_track_figure=track_overview_fig,
+                    fullscreen_gg_figures=fullscreen_gg_figures,
                 )
             except Exception as exc:
                 st.warning(f"Corner detail unavailable: {exc}")
 
-        # ── Right: Δt bar chart (top) + GG diagram (bottom) ──────────────────
+        # ── Right: track map + GG diagram ────────────────────────────────────
         with right_col:
-            _plotly_chart(
-                drv.corner_phase_delta_fig(phase_table),
-                use_container_width=True,
-                theme=None,
-                key=f"drv_corner_phase_bars_{ref_run}_{ref_lap}_{cmp_run}_{cmp_lap}",
-            )
+            if track_overview_fig is not None:
+                _plotly_chart(
+                    track_overview_fig,
+                    use_container_width=True,
+                    theme=None,
+                    key=f"drv_lap_track_{ref_run}_{ref_lap}_{cmp_run}_{cmp_lap}",
+                )
+            elif track_overview_error is not None:
+                st.warning(f"Track map unavailable: {track_overview_error}")
             try:
                 _plotly_chart(
                     drv.corner_gg_fig(
@@ -3976,6 +4814,14 @@ def _tab_rb(dfs: dict[str, pl.DataFrame]) -> None:
                 c10.metric("Wh / m braking", f"{_fmt(kpis['regen_density_wh_m'], '.4f')}")
                 c11.metric("Front regen share", f"{_fmt(kpis['front_regen_share_pct'], '.1f')}%")
                 c12.metric("Yaw disturbance P95", f"{_fmt(kpis['yaw_disturbance_p95_radps'], '.3f')} rad/s")
+                c13, c14, c15 = st.columns(3)
+                c13.metric("Yaw event P95", f"{_fmt(kpis['yaw_event_max_p95_radps'], '.3f')} rad/s")
+                c14.metric("β peak P95", f"{_fmt(kpis['beta_peak_p95_deg'], '.2f')} deg")
+                c15.metric("Lockup events", str(kpis["lockup_events_total"]))
+                c16, c17, c18 = st.columns(3)
+                c16.metric("SR osc P95", f"{_fmt(kpis['sr_steady_oscillation_p95'], '.4f')}")
+                c17.metric("Bias vs Fz MAE", f"{_fmt(kpis['bias_vs_fz_mae_mean_pct'], '.2f')}%")
+                c18.metric("Pitch peak P95", f"{_fmt(kpis['pitch_peak_p95_radps'], '.3f')} rad/s")
             for fig in figs:
                 _plotly_chart(fig, use_container_width=True, theme=None)
             if not kpis.get("warnings"):
@@ -4001,6 +4847,12 @@ def _tab_rb(dfs: dict[str, pl.DataFrame]) -> None:
                     "Current delay [ms]": round(kpis["delay_current_ms"], 1),
                     "Front share [%]": round(kpis["front_regen_share_pct"], 1),
                     "Yaw P95 [rad/s]": round(kpis["yaw_disturbance_p95_radps"], 3),
+                    "Yaw event P95 [rad/s]": round(kpis["yaw_event_max_p95_radps"], 3),
+                    "Beta peak P95 [deg]": round(kpis["beta_peak_p95_deg"], 3),
+                    "Lockup events": kpis["lockup_events_total"],
+                    "SR osc P95": round(kpis["sr_steady_oscillation_p95"], 4),
+                    "Bias vs Fz MAE [%]": round(kpis["bias_vs_fz_mae_mean_pct"], 2),
+                    "Pitch peak P95 [rad/s]": round(kpis["pitch_peak_p95_radps"], 3),
                 }
                 for run_name, (_figs, kpis) in run_results.items()
                 if not kpis.get("warnings")
@@ -4035,7 +4887,7 @@ def main() -> None:
     st.sidebar.caption("Formula Student Telemetry")
     st.sidebar.divider()
 
-    csv_files = sorted(p.name for p in DATA_DIR.glob("*.csv"))
+    csv_files = [p.name for p in _telemetry_csv_paths(DATA_DIR)]
     if not csv_files:
         st.error(f"No CSV files found in `{DATA_DIR}`.")
         return
@@ -4111,6 +4963,7 @@ def main() -> None:
         return
 
     st.session_state["_run_source_files"] = run_source_files
+    st.session_state["_run_file_signatures"] = run_file_signatures
 
     section_renderers = {
         "Driver": _tab_driver,

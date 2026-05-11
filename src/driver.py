@@ -44,7 +44,7 @@ from utils import (
     unique_laps,
 )
 
-from src.cornering import CornerPhases, TurnDef, compute_corner_phases
+from src.cornering import CornerPhases
 
 
 @dataclass(frozen=True)
@@ -2793,6 +2793,7 @@ def lap_event_detail_fig(
                 go.Scatter(
                     x=ref_x[mask],
                     y=ref_y[mask],
+                    customdata=s_m[mask],
                     mode="lines",
                     name=f"{ref_label}",
                     legendgroup=f"{key}_ref",
@@ -2812,6 +2813,7 @@ def lap_event_detail_fig(
                 go.Scatter(
                     x=cmp_x[mask],
                     y=cmp_y[mask],
+                    customdata=s_m[mask],
                     mode="lines",
                     name=f"{cmp_label}",
                     legendgroup=f"{key}_cmp",
@@ -2833,6 +2835,7 @@ def lap_event_detail_fig(
                 go.Scatter(
                     x=x_for_single[mask],
                     y=comp[comp_key][mask],
+                    customdata=s_m[mask],
                     mode="lines",
                     name=LAP_SIGNAL_OPTIONS[key]["label"],
                     showlegend=False,
@@ -3097,11 +3100,13 @@ def corner_gg_fig(
             continue
         ax = data["ax_mps2"][mask]
         ay = data["ay_mps2"][mask]
+        gg_s_m = s_m[mask]
         valid = np.isfinite(ax) & np.isfinite(ay)
         label = f"{run_name} L{int(lap_id)}"
         fig.add_trace(go.Scatter(
             x=ay[valid],
             y=ax[valid],
+            customdata=gg_s_m[valid],
             mode="markers",
             name=label,
             marker=dict(color=color, size=4, opacity=0.8),

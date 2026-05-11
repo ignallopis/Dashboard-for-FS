@@ -43,7 +43,7 @@ Roll stiffness ratio front/total = 36929 / (36929 + 40834) = **47.5 % front** �
 | Lift coefficient | `Vhcl.Coef_Lift` | −5.913 | — (downforce) |
 | CoP x (from front axle) | `Vhcl.CoP_x` | −0.7547 | m |
 | CoP z (from front axle) | `Vhcl.CoP_z` | 0.557 | m |
-
+Legacy
 ## Safety limits
 | Parameter | Value | Units |
 |-----------|-------|-------|
@@ -72,6 +72,8 @@ Roll stiffness ratio front/total = 36929 / (36929 + 40834) = **47.5 % front** �
 | Front balance | `brake.frontBalance` | 0.67 | — |
 | Rear balance | `brake.rearBalance` | 0.33 | — |
 | Max deceleration | `brake.MaxDeceleration` | 1.79 | g |
+
+TODO: add front and rear heave stiffness (`k_heave_F`, `k_heave_R`) to enable a theoretical Aero Load · Heave vs Speed overlay in Dynamics.
 
 ## Sensor positions (from front axle, positive forward/left/up)
 | Sensor | dx [m] | dz [m] |

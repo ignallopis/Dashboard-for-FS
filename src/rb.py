@@ -17,12 +17,14 @@ import plotly.graph_objects as go
 from utils import (
     COMPLETE_LAPS_MARKER,
     WHEEL_COLORS,
+    WHEEL_SYMBOLS,
     cols_to_numpy,
     ensure_complete_laps_df,
     exclude_lap0_and_last_lap,
     keep_min_duration_segments,
     make_dark_figure,
     robust_dt,
+    smooth_signal,
     unique_laps,
 )
 
@@ -44,6 +46,14 @@ MIN_SPEED = 4.0
 MIN_EVENT_DURATION = 0.15
 MIN_SAMPLES_PER_LAP = 40
 VEHICLE_MASS_KG = 288.0
+LOCKUP_SR_THRESHOLD = -0.30
+LOCKUP_MIN_DURATION_S = 0.05
+STEADY_MIN_DURATION_S = 0.20
+STEADY_SMOOTH_WINDOW_S = 0.30
+STEADY_BRAKE_STD_THRESHOLD = 5.0
+STEADY_JERK_THRESHOLD = 2.0
+STRAIGHT_STEER_THRESHOLD_RAD = 0.05
+STRAIGHT_AY_THRESHOLD_MS2 = 3.0
 
 
 def _load(columns: list[str]) -> dict[str, np.ndarray]:
@@ -72,6 +82,26 @@ def _ay_signal(columns: list[str]) -> str | None:
         return "Filtering_VN_ay"
     if "VN_ay" in columns:
         return "VN_ay"
+    return None
+
+
+def _yaw_signal(columns: list[str]) -> str | None:
+    if "VN_gz" in columns:
+        return "VN_gz"
+    if "AS_yaw_rate" in columns:
+        return "AS_yaw_rate"
+    return None
+
+
+def _pitch_rate_signal(columns: list[str]) -> str | None:
+    return "VN_gy" if "VN_gy" in columns else None
+
+
+def _vy_signal(columns: list[str]) -> str | None:
+    if "Est_vyCOG" in columns:
+        return "Est_vyCOG"
+    if "VN_vy" in columns:
+        return "VN_vy"
     return None
 
 
@@ -108,6 +138,10 @@ def _safe_p95(x: np.ndarray) -> float:
     return float(np.nanpercentile(x[np.isfinite(x)], 95)) if np.isfinite(x).any() else np.nan
 
 
+def _safe_max(x: np.ndarray) -> float:
+    return float(np.nanmax(x)) if np.isfinite(x).any() else np.nan
+
+
 def _segment_bounds(mask: np.ndarray) -> list[tuple[int, int]]:
     idx = np.flatnonzero(mask)
     if idx.size == 0:
@@ -129,6 +163,238 @@ def _first_delay_ms(
     if rel.size == 0:
         return np.nan
     return float(rel[0] * dt_s * 1000.0)
+
+
+def _rolling_std(signal: np.ndarray, window_samples: int) -> np.ndarray:
+    arr = np.asarray(signal, dtype=float)
+    if window_samples <= 1 or arr.size == 0:
+        return np.zeros_like(arr, dtype=float)
+
+    finite = np.isfinite(arr)
+    kernel = np.ones(int(window_samples), dtype=float)
+    sums = np.convolve(np.where(finite, arr, 0.0), kernel, mode="same")
+    sums_sq = np.convolve(np.where(finite, arr * arr, 0.0), kernel, mode="same")
+    counts = np.convolve(finite.astype(float), kernel, mode="same")
+
+    out = np.full(arr.shape, np.nan, dtype=float)
+    ok = counts >= max(2.0, 0.8 * window_samples)
+    if not np.any(ok):
+        return out
+
+    mean = sums[ok] / counts[ok]
+    variance = np.maximum(0.0, sums_sq[ok] / counts[ok] - mean * mean)
+    out[ok] = np.sqrt(variance)
+    return out
+
+
+def _event_duration_s(start: int, end: int, dt_s: float) -> float:
+    return float((end - start + 1) * dt_s)
+
+
+def _yaw_event_metrics(
+    yaw_rate_radps: np.ndarray,
+    start: int,
+    end: int,
+    dt_s: float,
+    is_straight_event: bool,
+) -> dict[str, float]:
+    seg = slice(start, end + 1)
+    mask = np.isfinite(yaw_rate_radps[seg])
+    if not is_straight_event or not np.any(mask):
+        return {
+            "Yaw straight peak [rad/s]": np.nan,
+            "Yaw straight integral [rad]": np.nan,
+        }
+
+    yaw_abs = np.abs(yaw_rate_radps[seg][mask])
+    return {
+        "Yaw straight peak [rad/s]": float(np.nanmax(yaw_abs)),
+        "Yaw straight integral [rad]": float(np.nansum(yaw_abs) * dt_s),
+    }
+
+
+def _is_straight_brake_event(
+    ay_ms2: np.ndarray,
+    steering_rad: np.ndarray,
+    start: int,
+    end: int,
+) -> bool:
+    seg = slice(start, end + 1)
+
+    ay_seg = ay_ms2[seg]
+    steer_seg = steering_rad[seg]
+    ay_ok = True
+    steer_ok = True
+    has_ref = False
+
+    ay_finite = np.isfinite(ay_seg)
+    if np.any(ay_finite):
+        has_ref = True
+        ay_ok = float(np.nanmax(np.abs(ay_seg[ay_finite]))) < STRAIGHT_AY_THRESHOLD_MS2
+
+    steer_finite = np.isfinite(steer_seg)
+    if np.any(steer_finite):
+        has_ref = True
+        steer_ok = float(np.nanmax(np.abs(steer_seg[steer_finite]))) < STRAIGHT_STEER_THRESHOLD_RAD
+
+    return has_ref and ay_ok and steer_ok
+
+
+def _beta_event_metrics(
+    vx_ms: np.ndarray,
+    vy_ms: np.ndarray,
+    start: int,
+    end: int,
+) -> dict[str, float]:
+    seg = slice(start, end + 1)
+    mask = np.isfinite(vx_ms[seg]) & np.isfinite(vy_ms[seg]) & (np.abs(vx_ms[seg]) > 1e-6)
+    if not np.any(mask):
+        return {"Beta peak [deg]": np.nan}
+
+    beta_deg = np.rad2deg(np.arctan2(vy_ms[seg][mask], vx_ms[seg][mask]))
+    return {"Beta peak [deg]": float(np.nanmax(np.abs(beta_deg)))}
+
+
+def _lr_decel_asymmetry(
+    wheel_decel_ms2: dict[str, np.ndarray],
+    start: int,
+    end: int,
+) -> dict[str, float]:
+    seg = slice(start, end + 1)
+    front_diff = np.abs(wheel_decel_ms2["FL"][seg] - wheel_decel_ms2["FR"][seg])
+    rear_diff = np.abs(wheel_decel_ms2["RL"][seg] - wheel_decel_ms2["RR"][seg])
+    return {
+        "Front L-R decel asym [m/s²]": _safe_mean(front_diff),
+        "Rear L-R decel asym [m/s²]": _safe_mean(rear_diff),
+    }
+
+
+def _lockup_events(
+    sr: dict[str, np.ndarray],
+    laps: np.ndarray,
+    brake_mask: np.ndarray,
+    dt_s: float,
+) -> dict[str, object]:
+    event_rows: list[dict[str, float | int | str]] = []
+    masks_by_wheel: dict[str, np.ndarray] = {}
+    counts_by_wheel = {w: 0 for w in WHEELS}
+    counts_by_lap: dict[int, dict[str, int]] = {}
+    worst_min_sr = np.nan
+
+    for wheel in WHEELS:
+        raw = brake_mask & np.isfinite(sr[wheel]) & (sr[wheel] < LOCKUP_SR_THRESHOLD)
+        lock_mask = keep_min_duration_segments(raw, LOCKUP_MIN_DURATION_S, dt_s)
+        masks_by_wheel[wheel] = lock_mask
+        for start, end in _segment_bounds(lock_mask):
+            seg = slice(start, end + 1)
+            lap = int(round(_safe_median(laps[seg])))
+            min_sr = float(np.nanmin(sr[wheel][seg]))
+            worst_min_sr = min_sr if not np.isfinite(worst_min_sr) else min(worst_min_sr, min_sr)
+            counts_by_wheel[wheel] += 1
+            counts_by_lap.setdefault(lap, {w: 0 for w in WHEELS})
+            counts_by_lap[lap][wheel] += 1
+            event_rows.append({
+                "wheel": wheel,
+                "lap": lap,
+                "start": start,
+                "end": end,
+                "min_sr": min_sr,
+                "duration_ms": _event_duration_s(start, end, dt_s) * 1000.0,
+            })
+
+    return {
+        "events": event_rows,
+        "masks_by_wheel": masks_by_wheel,
+        "counts_by_wheel": counts_by_wheel,
+        "counts_by_lap": counts_by_lap,
+        "worst_min_sr": worst_min_sr,
+        "count_total": int(sum(counts_by_wheel.values())),
+    }
+
+
+def _sr_steady_std(
+    sr: dict[str, np.ndarray],
+    steady_mask: np.ndarray,
+    start: int,
+    end: int,
+) -> dict[str, float]:
+    seg = slice(start, end + 1)
+    seg_mask = steady_mask[seg]
+    per_wheel: dict[str, float] = {}
+    for wheel in WHEELS:
+        vals = sr[wheel][seg][seg_mask]
+        per_wheel[wheel] = float(np.nanstd(vals)) if np.isfinite(vals).sum() >= 3 else np.nan
+
+    agg = np.array(list(per_wheel.values()), dtype=float)
+    return {
+        "steady_std_by_wheel": per_wheel,
+        "Steady SR osc mean [-]": _safe_mean(agg),
+        "Steady SR osc max [-]": _safe_max(agg),
+    }
+
+
+def _bias_vs_fz(
+    front_share: np.ndarray,
+    fz_front_share: np.ndarray,
+    start: int,
+    end: int,
+) -> dict[str, float]:
+    seg = slice(start, end + 1)
+    real = front_share[seg]
+    ideal = fz_front_share[seg]
+    mask = np.isfinite(real) & np.isfinite(ideal)
+    if not np.any(mask):
+        return {
+            "Front share mean [%]": np.nan,
+            "Fz front share mean [%]": np.nan,
+            "Front share vs Fz MAE [%]": np.nan,
+            "Front share vs Fz bias [%]": np.nan,
+        }
+
+    err_pct = (real[mask] - ideal[mask]) * 100.0
+    return {
+        "Front share mean [%]": float(np.nanmean(real[mask]) * 100.0),
+        "Fz front share mean [%]": float(np.nanmean(ideal[mask]) * 100.0),
+        "Front share vs Fz MAE [%]": float(np.nanmean(np.abs(err_pct))),
+        "Front share vs Fz bias [%]": float(np.nanmean(err_pct)),
+    }
+
+
+def _pitch_dive_event(
+    pitch_rate_radps: np.ndarray,
+    front_damper: np.ndarray,
+    rear_damper: np.ndarray,
+    start: int,
+    end: int,
+) -> dict[str, float]:
+    seg = slice(start, end + 1)
+    pitch = np.abs(pitch_rate_radps[seg])
+    peak_pitch = _safe_max(pitch)
+
+    front_seg = front_damper[seg]
+    rear_seg = rear_damper[seg]
+    if np.isfinite(front_seg).any() and np.isfinite(rear_seg).any():
+        front_ref = front_seg[np.isfinite(front_seg)][0]
+        rear_ref = rear_seg[np.isfinite(rear_seg)][0]
+        dive_trace = (front_seg - front_ref) - (rear_seg - rear_ref)
+        dive_peak = _safe_max(np.abs(dive_trace))
+    else:
+        dive_peak = np.nan
+
+    return {
+        "Pitch peak [rad/s]": peak_pitch,
+        "Dive asym peak [damper]": dive_peak,
+    }
+
+
+def _wheel_decel_from_speed(
+    wheel_speed_ms: np.ndarray,
+    dt_s: float,
+    smooth_samples: int,
+) -> np.ndarray:
+    if not np.isfinite(wheel_speed_ms).any():
+        return np.full_like(wheel_speed_ms, np.nan)
+    return -np.gradient(smooth_signal(wheel_speed_ms, smooth_samples), dt_s)
 
 
 def _prepare_arrays_from_df(
@@ -299,6 +565,12 @@ def _prepare_braking_regen_arrays(df: pl.DataFrame) -> dict[str, np.ndarray]:
     ax_col = _ax_signal(df.columns)
     vx_col = _vx_signal(df.columns)
     ay_col = _ay_signal(df.columns)
+    yaw_col = _yaw_signal(df.columns)
+    pitch_col = _pitch_rate_signal(df.columns)
+    vy_col = _vy_signal(df.columns)
+    wheel_speed_cols = [f"Est_VX{wheel}" for wheel in WHEELS]
+    fz_cols = [f"Est_FZ{wheel}" for wheel in WHEELS]
+    damper_cols = [f"Damp{wheel}" for wheel in WHEELS]
 
     required = [
         "TimeStamp", "laps", "laptime", "Brake", ax_col, vx_col,
@@ -306,12 +578,21 @@ def _prepare_braking_regen_arrays(df: pl.DataFrame) -> dict[str, np.ndarray]:
         "Est_SRFL", "Est_SRFR", "Est_SRRL", "Est_SRRR",
     ]
     optional = [
-        "dist_km", "AS_yaw_rate", "steering_actualPosRad",
+        "dist_km", "steering_actualPosRad",
         *MASTER_TORQUE_COLS.values(),
         *ACTUAL_TORQUE_COLS.values(),
+        *wheel_speed_cols,
+        *fz_cols,
+        *damper_cols,
     ]
     if ay_col is not None:
         optional.append(ay_col)
+    if yaw_col is not None:
+        optional.append(yaw_col)
+    if pitch_col is not None:
+        optional.append(pitch_col)
+    if vy_col is not None:
+        optional.append(vy_col)
 
     cols = required + [c for c in optional if c in df.columns and c not in required]
     if COMPLETE_LAPS_MARKER in df.columns and COMPLETE_LAPS_MARKER not in cols:
@@ -327,6 +608,9 @@ def _prepare_braking_regen_arrays(df: pl.DataFrame) -> dict[str, np.ndarray]:
     d["ax"] = d.pop(ax_col)
     d["vx"] = d.pop(vx_col)
     d["ay"] = d.pop(ay_col) if ay_col is not None else np.full(n, np.nan)
+    d["yaw_rate"] = d.pop(yaw_col) if yaw_col is not None else np.full(n, np.nan)
+    d["pitch_rate"] = d.pop(pitch_col) if pitch_col is not None else np.full(n, np.nan)
+    d["vy"] = d.pop(vy_col) if vy_col is not None else np.full(n, np.nan)
     d["distance_m"] = d["dist_km"] * 1000.0 if "dist_km" in d else np.full(n, np.nan)
 
     base_cols = ["time", "laps", "laptime", "Brake", "ax", "vx", "Vbat", "Current"]
@@ -339,6 +623,7 @@ def _braking_regen_analysis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
     d = _prepare_braking_regen_arrays(df)
     time_s = d["time"]
     dt_s = robust_dt(time_s)
+    smooth_samples = max(1, int(round(0.05 / dt_s)))
     speed_ms = np.abs(d["vx"])
     decel_ms2 = np.maximum(0.0, -d["ax"])
     p_bat_w = d["Vbat"] * d["Current"]
@@ -364,12 +649,26 @@ def _braking_regen_analysis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
         out=np.full_like(front_regen_nm, np.nan),
         where=regen_total_nm > 1e-6,
     )
+    front_fz_n = d["Est_FZFL"] + d["Est_FZFR"]
+    total_fz_n = front_fz_n + d["Est_FZRL"] + d["Est_FZRR"]
+    fz_front_share = np.divide(
+        front_fz_n,
+        total_fz_n,
+        out=np.full_like(front_fz_n, np.nan),
+        where=np.abs(total_fz_n) > 1e-6,
+    )
     lr_imbalance = np.divide(
         left_regen_nm - right_regen_nm,
         regen_total_nm,
         out=np.full_like(left_regen_nm, np.nan),
         where=regen_total_nm > 1e-6,
     )
+    wheel_decel_ms2 = {
+        wheel: _wheel_decel_from_speed(d[f"Est_VX{wheel}"], dt_s, smooth_samples)
+        for wheel in WHEELS
+    }
+    front_damper = 0.5 * (d["DampFL"] + d["DampFR"])
+    rear_damper = 0.5 * (d["DampRL"] + d["DampRR"])
 
     raw_brake = (d["Brake"] >= BRAKE_THRESHOLD) & (speed_ms >= MIN_SPEED)
     brake_event_mask = keep_min_duration_segments(raw_brake, MIN_EVENT_DURATION, dt_s)
@@ -397,7 +696,44 @@ def _braking_regen_analysis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
             distance_m[:first] = distance_m[first]
             distance_m = np.maximum.accumulate(np.where(finite_dist, distance_m, distance_m[first]))
 
+    steady_smooth_samples = max(1, int(round(STEADY_SMOOTH_WINDOW_S / dt_s)))
+    ax_smooth = smooth_signal(d["ax"], steady_smooth_samples)
+    jerk_ax = np.gradient(ax_smooth, dt_s)
+    brake_smoothed = smooth_signal(d["Brake"], steady_smooth_samples)
+    brake_std = _rolling_std(
+        brake_smoothed,
+        max(2, int(np.ceil(STEADY_MIN_DURATION_S / dt_s))),
+    )
+    steady_brake_mask = keep_min_duration_segments(
+        brake_event_mask
+        & np.isfinite(brake_std)
+        & (brake_std <= STEADY_BRAKE_STD_THRESHOLD)
+        & np.isfinite(jerk_ax)
+        & (np.abs(jerk_ax) <= STEADY_JERK_THRESHOLD),
+        STEADY_MIN_DURATION_S,
+        dt_s,
+    )
+    lockup_info = _lockup_events(
+        {wheel: d[f"Est_SR{wheel}"] for wheel in WHEELS},
+        d["laps"],
+        brake_event_mask,
+        dt_s,
+    )
+    sr = {wheel: d[f"Est_SR{wheel}"] for wheel in WHEELS}
+
     events: list[dict[str, float | int]] = []
+    yaw_event_peaks: list[float] = []
+    yaw_event_integrals: list[float] = []
+    beta_event_peaks: list[float] = []
+    front_asym_events: list[float] = []
+    rear_asym_events: list[float] = []
+    sr_steady_event_max: list[float] = []
+    sr_steady_by_wheel: dict[str, list[float]] = {wheel: [] for wheel in WHEELS}
+    front_bias_mae_events: list[float] = []
+    front_bias_signed_events: list[float] = []
+    pitch_peak_events: list[float] = []
+    dive_peak_events: list[float] = []
+    straight_event_mask = np.zeros_like(brake_event_mask, dtype=bool)
     event_id = 0
     for start, end in _segment_bounds(brake_event_mask):
         if end - start + 1 < max(2, int(round(MIN_EVENT_DURATION / dt_s))):
@@ -422,6 +758,82 @@ def _braking_regen_analysis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
         else:
             current_mae = np.nan
             current_near = np.nan
+        is_straight_event = _is_straight_brake_event(
+            d["ay"],
+            d["steering_actualPosRad"],
+            start,
+            end,
+        )
+        if is_straight_event:
+            straight_event_mask[start:end + 1] = True
+        yaw_metrics = _yaw_event_metrics(
+            d["yaw_rate"],
+            start,
+            end,
+            dt_s,
+            is_straight_event,
+        )
+        beta_metrics = _beta_event_metrics(d["vx"], d["vy"], start, end)
+        lr_asym = _lr_decel_asymmetry(wheel_decel_ms2, start, end)
+        steady_metrics = _sr_steady_std(sr, steady_brake_mask, start, end)
+        bias_metrics = _bias_vs_fz(front_share, fz_front_share, start, end)
+        pitch_metrics = _pitch_dive_event(d["pitch_rate"], front_damper, rear_damper, start, end)
+
+        lockup_counts = {}
+        min_sr_by_wheel = {}
+        event_lockups = 0
+        event_worst_sr = np.nan
+        fz_share_event_pct: dict[str, float] = {}
+        brake_share_event_pct: dict[str, float] = {}
+        mean_fz_event_n: dict[str, float] = {}
+        mean_trq_event_nm: dict[str, float] = {}
+        for wheel_idx, wheel in enumerate(WHEELS):
+            wheel_lock_mask = lockup_info["masks_by_wheel"][wheel][seg]
+            lockup_counts[wheel] = len(_segment_bounds(wheel_lock_mask))
+            event_lockups += lockup_counts[wheel]
+            wheel_sr = sr[wheel][seg]
+            min_sr_by_wheel[wheel] = float(np.nanmin(wheel_sr)) if np.isfinite(wheel_sr).any() else np.nan
+            if lockup_counts[wheel] > 0 and np.isfinite(min_sr_by_wheel[wheel]):
+                event_worst_sr = (
+                    min_sr_by_wheel[wheel]
+                    if not np.isfinite(event_worst_sr)
+                    else min(event_worst_sr, min_sr_by_wheel[wheel])
+                )
+            wheel_fz_share = np.divide(
+                d[f"Est_FZ{wheel}"][seg],
+                total_fz_n[seg],
+                out=np.full(seg.stop - seg.start, np.nan),
+                where=np.abs(total_fz_n[seg]) > 1e-6,
+            )
+            wheel_brake_share = np.divide(
+                master_regen_wheel_nm[seg, wheel_idx],
+                master_regen_nm[seg],
+                out=np.full(seg.stop - seg.start, np.nan),
+                where=np.abs(master_regen_nm[seg]) > 1e-6,
+            )
+            mean_fz_event_n[wheel] = _safe_mean(d[f"Est_FZ{wheel}"][seg])
+            mean_trq_event_nm[wheel] = _safe_mean(master_regen_wheel_nm[seg, wheel_idx])
+            fz_share_event_pct[wheel] = 100.0 * _safe_mean(wheel_fz_share)
+            brake_share_event_pct[wheel] = 100.0 * _safe_mean(wheel_brake_share)
+
+        for series, store in (
+            (yaw_metrics["Yaw straight peak [rad/s]"], yaw_event_peaks),
+            (yaw_metrics["Yaw straight integral [rad]"], yaw_event_integrals),
+            (beta_metrics["Beta peak [deg]"], beta_event_peaks),
+            (lr_asym["Front L-R decel asym [m/s²]"], front_asym_events),
+            (lr_asym["Rear L-R decel asym [m/s²]"], rear_asym_events),
+            (steady_metrics["Steady SR osc max [-]"], sr_steady_event_max),
+            (bias_metrics["Front share vs Fz MAE [%]"], front_bias_mae_events),
+            (bias_metrics["Front share vs Fz bias [%]"], front_bias_signed_events),
+            (pitch_metrics["Pitch peak [rad/s]"], pitch_peak_events),
+            (pitch_metrics["Dive asym peak [damper]"], dive_peak_events),
+        ):
+            if np.isfinite(series):
+                store.append(float(series))
+        for wheel in WHEELS:
+            val = steady_metrics["steady_std_by_wheel"][wheel]
+            if np.isfinite(val):
+                sr_steady_by_wheel[wheel].append(float(val))
 
         events.append({
             "Event": event_id,
@@ -449,6 +861,42 @@ def _braking_regen_analysis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
             "Delay Master [ms]": round(_first_delay_ms(master_regen_nm, start, end, 2.0, dt_s), 1),
             "Delay current [ms]": round(_first_delay_ms(regen_current_a, start, end, 2.0, dt_s), 1),
             "Delay decel [ms]": round(_first_delay_ms(decel_ms2, start, end, 0.5, dt_s), 1),
+            "Straight brake event": bool(is_straight_event),
+            "Yaw straight peak [rad/s]": round(yaw_metrics["Yaw straight peak [rad/s]"], 3),
+            "Yaw straight integral [rad]": round(yaw_metrics["Yaw straight integral [rad]"], 3),
+            "Beta peak [deg]": round(beta_metrics["Beta peak [deg]"], 3),
+            "Front L-R decel asym [m/s²]": round(lr_asym["Front L-R decel asym [m/s²]"], 3),
+            "Rear L-R decel asym [m/s²]": round(lr_asym["Rear L-R decel asym [m/s²]"], 3),
+            "Mean Fz FL [N]": round(mean_fz_event_n["FL"], 2),
+            "Mean Fz FR [N]": round(mean_fz_event_n["FR"], 2),
+            "Mean Fz RL [N]": round(mean_fz_event_n["RL"], 2),
+            "Mean Fz RR [N]": round(mean_fz_event_n["RR"], 2),
+            "Mean |Trq| FL [Nm]": round(mean_trq_event_nm["FL"], 2),
+            "Mean |Trq| FR [Nm]": round(mean_trq_event_nm["FR"], 2),
+            "Mean |Trq| RL [Nm]": round(mean_trq_event_nm["RL"], 2),
+            "Mean |Trq| RR [Nm]": round(mean_trq_event_nm["RR"], 2),
+            "Fz share FL [%]": round(fz_share_event_pct["FL"], 2),
+            "Fz share FR [%]": round(fz_share_event_pct["FR"], 2),
+            "Fz share RL [%]": round(fz_share_event_pct["RL"], 2),
+            "Fz share RR [%]": round(fz_share_event_pct["RR"], 2),
+            "Brake share FL [%]": round(brake_share_event_pct["FL"], 2),
+            "Brake share FR [%]": round(brake_share_event_pct["FR"], 2),
+            "Brake share RL [%]": round(brake_share_event_pct["RL"], 2),
+            "Brake share RR [%]": round(brake_share_event_pct["RR"], 2),
+            "Min SR FL": round(min_sr_by_wheel["FL"], 3),
+            "Min SR FR": round(min_sr_by_wheel["FR"], 3),
+            "Min SR RL": round(min_sr_by_wheel["RL"], 3),
+            "Min SR RR": round(min_sr_by_wheel["RR"], 3),
+            "Lockups": int(event_lockups),
+            "Lockup worst SR": round(event_worst_sr, 3),
+            "Steady SR osc mean [-]": round(steady_metrics["Steady SR osc mean [-]"], 4),
+            "Steady SR osc max [-]": round(steady_metrics["Steady SR osc max [-]"], 4),
+            "Front share mean [%]": round(bias_metrics["Front share mean [%]"], 2),
+            "Fz front share mean [%]": round(bias_metrics["Fz front share mean [%]"], 2),
+            "Front share vs Fz MAE [%]": round(bias_metrics["Front share vs Fz MAE [%]"], 2),
+            "Front share vs Fz bias [%]": round(bias_metrics["Front share vs Fz bias [%]"], 2),
+            "Pitch peak [rad/s]": round(pitch_metrics["Pitch peak [rad/s]"], 3),
+            "Dive asym peak [damper]": round(pitch_metrics["Dive asym peak [damper]"], 3),
         })
 
     table = pl.DataFrame(events) if events else pl.DataFrame()
@@ -464,18 +912,21 @@ def _braking_regen_analysis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
         power_ref = np.nanmedian(regen_power_w[brake_event_mask])
         current_shortfall = high_demand & (regen_power_w < power_ref)
 
-    straight_brake = (
-        brake_event_mask
-        & np.isfinite(d["AS_yaw_rate"])
-        & (np.abs(d["steering_actualPosRad"]) < 0.05)
-        & ((~np.isfinite(d["ay"])) | (np.abs(d["ay"]) < 2.0))
-    )
-
     total_recovered_wh = float(table["Recovered [Wh]"].sum())
     total_kinetic_wh = float(table["Kinetic lost [Wh]"].sum())
     total_duration_s = float(table["Duration [s]"].sum())
     total_distance_m = float(table["Distance [m]"].sum())
     total_delta_v_ms = float(table["Delta v [m/s]"].sum())
+    yaw_event_peaks_arr = np.array(yaw_event_peaks, dtype=float)
+    yaw_event_integrals_arr = np.array(yaw_event_integrals, dtype=float)
+    beta_event_peaks_arr = np.array(beta_event_peaks, dtype=float)
+    front_asym_arr = np.array(front_asym_events, dtype=float)
+    rear_asym_arr = np.array(rear_asym_events, dtype=float)
+    sr_steady_event_arr = np.array(sr_steady_event_max, dtype=float)
+    front_bias_mae_arr = np.array(front_bias_mae_events, dtype=float)
+    front_bias_signed_arr = np.array(front_bias_signed_events, dtype=float)
+    pitch_peak_arr = np.array(pitch_peak_events, dtype=float)
+    dive_peak_arr = np.array(dive_peak_events, dtype=float)
 
     kpis = {
         "event_count": int(table.height),
@@ -498,42 +949,210 @@ def _braking_regen_analysis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
         "delay_master_ms": float(table["Delay Master [ms]"].median()),
         "delay_current_ms": float(table["Delay current [ms]"].median()),
         "delay_decel_ms": float(table["Delay decel [ms]"].median()),
-        "yaw_disturbance_p95_radps": _safe_p95(np.abs(d["AS_yaw_rate"][straight_brake])),
-        "lr_yaw_corr": _finite_corr(lr_imbalance[straight_brake], d["AS_yaw_rate"][straight_brake]),
+        "yaw_disturbance_p95_radps": _safe_p95(np.abs(d["yaw_rate"][straight_event_mask])),
+        "lr_yaw_corr": _finite_corr(lr_imbalance[straight_event_mask], d["yaw_rate"][straight_event_mask]),
+        "yaw_event_max_p95_radps": _safe_p95(yaw_event_peaks_arr),
+        "yaw_event_max_worst_radps": _safe_max(yaw_event_peaks_arr),
+        "yaw_event_integral_p95_rad": _safe_p95(yaw_event_integrals_arr),
+        "yaw_event_integral_worst_rad": _safe_max(yaw_event_integrals_arr),
+        "beta_peak_p95_deg": _safe_p95(beta_event_peaks_arr),
+        "beta_peak_worst_deg": _safe_max(beta_event_peaks_arr),
+        "front_lr_decel_asym_p95_ms2": _safe_p95(front_asym_arr),
+        "rear_lr_decel_asym_p95_ms2": _safe_p95(rear_asym_arr),
+        "lockup_events_total": int(lockup_info["count_total"]),
+        "lockup_events_by_wheel": lockup_info["counts_by_wheel"],
+        "lockup_events_by_lap": lockup_info["counts_by_lap"],
+        "lockup_worst_sr": lockup_info["worst_min_sr"],
+        "sr_steady_oscillation_p95": _safe_p95(sr_steady_event_arr),
+        "sr_steady_oscillation_worst": _safe_max(sr_steady_event_arr),
+        "sr_steady_oscillation_p95_by_wheel": {
+            wheel: _safe_p95(np.array(vals, dtype=float))
+            for wheel, vals in sr_steady_by_wheel.items()
+        },
+        "bias_vs_fz_mae_pct": _safe_p95(front_bias_mae_arr) if front_bias_mae_arr.size else np.nan,
+        "bias_vs_fz_mae_mean_pct": _safe_mean(front_bias_mae_arr),
+        "bias_vs_fz_signed_pct": _safe_mean(front_bias_signed_arr),
+        "pitch_peak_p95_radps": _safe_p95(pitch_peak_arr),
+        "pitch_peak_worst_radps": _safe_max(pitch_peak_arr),
+        "dive_asym_p95_damper": _safe_p95(dive_peak_arr),
         "table": table,
         "warnings": [],
         "notes": [],
     }
+    if not np.isfinite(d["yaw_rate"]).any():
+        kpis["notes"].append("Yaw-event metrics skipped: no `VN_gz`/`AS_yaw_rate` channel.")
+    if not np.isfinite(d["vy"]).any():
+        kpis["notes"].append("Beta-event metrics skipped: no `Est_vyCOG`/`VN_vy` channel.")
+    if not np.isfinite(front_fz_n).any():
+        kpis["notes"].append("Front-bias-vs-Fz metrics skipped: missing `Est_FZ*` channels.")
+    if not np.isfinite(d["pitch_rate"]).any():
+        kpis["notes"].append("Pitch-event metrics skipped: no `VN_gy` channel.")
+    if not np.isfinite(front_damper).any() or not np.isfinite(rear_damper).any():
+        kpis["notes"].append("Dive asymmetry skipped: missing damper channels.")
 
     fig_torque_decel = make_dark_figure(
-        title="Master regen torque vs deceleration",
-        xlabel="Total negative Master torque [Nm]",
+        title="Slip ratio vs longitudinal deceleration during braking",
+        xlabel="Slip ratio [-]",
         ylabel="-ax [m/s²]",
     )
-    fig_torque_decel.add_trace(go.Scattergl(
-        x=master_regen_nm[response],
-        y=decel_ms2[response],
-        mode="markers",
-        name="Samples",
-        marker=dict(color="rgba(77,179,242,0.45)", size=4),
-    ))
-
-    fig_energy = make_dark_figure(
-        title="Recovered energy vs braking energy lost",
-        xlabel="Kinetic energy lost [Wh]",
-        ylabel="Recovered energy [Wh]",
+    for wheel in WHEELS:
+        slip = sr[wheel][response]
+        mask = np.isfinite(slip) & np.isfinite(decel_ms2[response])
+        mask &= (slip >= -0.7) & (slip <= 0.1)
+        if not np.any(mask):
+            continue
+        fig_torque_decel.add_trace(go.Scattergl(
+            x=slip[mask],
+            y=decel_ms2[response][mask],
+            mode="markers",
+            name=wheel,
+            marker=dict(
+                color=WHEEL_COLORS[wheel],
+                size=4,
+                opacity=0.45,
+                symbol=WHEEL_SYMBOLS[wheel],
+            ),
+        ))
+    fig_torque_decel.add_vrect(
+        x0=SR_TARGET_BRAKE - DELTA_SR,
+        x1=SR_TARGET_BRAKE + DELTA_SR,
+        fillcolor="rgba(115, 217, 115, 0.08)",
+        line_width=0,
     )
-    fig_energy.add_trace(go.Scatter(
-        x=table["Kinetic lost [Wh]"].to_numpy(),
-        y=table["Recovered [Wh]"].to_numpy(),
-        text=[f"E{int(e)} L{int(l)}" for e, l in zip(table["Event"], table["Lap"])],
-        mode="markers+text",
-        textposition="top center",
-        name="Brake event",
-        marker=dict(size=9, color="#73D973", line=dict(width=1, color="#1A1A1A")),
+    fig_torque_decel.add_vline(
+        x=SR_TARGET_BRAKE,
+        line=dict(color="rgba(255,255,255,0.6)", dash="dash", width=1.4),
+    )
+    fig_min_sr = make_dark_figure(
+        title="Minimum slip ratio by wheel across braking events",
+        xlabel="Wheel",
+        ylabel="Minimum SR [-]",
+    )
+    for wheel in WHEELS:
+        col = f"Min SR {wheel}"
+        valid_wheel = table[col].is_finite()
+        if not valid_wheel.any():
+            continue
+        wheel_table = table.filter(valid_wheel)
+        wheel_vals = wheel_table[col].to_numpy()
+        wheel_events = wheel_table["Event"].to_numpy()
+        wheel_laps = wheel_table["Lap"].to_numpy()
+        fig_min_sr.add_trace(go.Box(
+            x=np.full(wheel_vals.size, wheel),
+            y=wheel_vals,
+            name=wheel,
+            marker=dict(color=WHEEL_COLORS[wheel], size=5, opacity=0.45),
+            line=dict(color=WHEEL_COLORS[wheel]),
+            boxmean=True,
+            boxpoints="all",
+            jitter=0.28,
+            pointpos=0.0,
+            customdata=np.column_stack([wheel_events, wheel_laps]),
+            hovertemplate=(
+                "Wheel %{x}"
+                "<br>Min SR %{y:.3f}"
+                "<br>Event %{customdata[0]:.0f}"
+                "<br>Lap %{customdata[1]:.0f}"
+                "<extra></extra>"
+            ),
+        ))
+    fig_min_sr.add_trace(go.Scatter(
+        x=list(WHEELS),
+        y=[LOCKUP_SR_THRESHOLD] * len(WHEELS),
+        mode="lines",
+        name="Lockup threshold",
+        line=dict(color="rgba(255,255,255,0.65)", dash="dash", width=1.3),
+        hoverinfo="skip",
     ))
 
-    return [fig_torque_decel, fig_energy], kpis
+    fig_wheel_fz_torque = make_dark_figure(
+        title="Braking torque vs vertical load by wheel across braking events",
+        xlabel="Mean wheel Fz [N]",
+        ylabel="Mean |Master regen torque| [Nm]",
+    )
+    finite_fz_vals: list[np.ndarray] = []
+    finite_trq_vals: list[np.ndarray] = []
+    for wheel in WHEELS:
+        x_col = f"Mean Fz {wheel} [N]"
+        y_col = f"Mean |Trq| {wheel} [Nm]"
+        valid = table[x_col].is_finite() & table[y_col].is_finite()
+        if not valid.any():
+            continue
+        wheel_table = table.filter(valid)
+        x_vals = wheel_table[x_col].to_numpy()
+        y_vals = wheel_table[y_col].to_numpy()
+        finite_fz_vals.append(x_vals)
+        finite_trq_vals.append(y_vals)
+        fig_wheel_fz_torque.add_trace(go.Scattergl(
+            x=x_vals,
+            y=y_vals,
+            mode="markers",
+            name=wheel,
+            marker=dict(
+                color=WHEEL_COLORS[wheel],
+                size=7,
+                opacity=0.15,
+            ),
+            showlegend=False,
+            customdata=np.column_stack([
+                wheel_table["Event"].to_numpy(),
+                wheel_table["Lap"].to_numpy(),
+            ]),
+            hovertemplate=(
+                f"{wheel}"
+                "<br>Mean Fz %{x:.1f} N"
+                "<br>Mean |Trq| %{y:.2f} Nm"
+                "<br>Event %{customdata[0]:.0f}"
+                "<br>Lap %{customdata[1]:.0f}"
+                "<extra></extra>"
+            ),
+        ))
+        slope_nm_per_n = _origin_slope(x_vals, y_vals)
+        if np.isfinite(slope_nm_per_n):
+            x_line_max = float(np.nanmax(x_vals))
+            fig_wheel_fz_torque.add_trace(go.Scatter(
+                x=[0.0, x_line_max],
+                y=[0.0, slope_nm_per_n * x_line_max],
+                mode="lines",
+                name=wheel,
+                line=dict(color=WHEEL_COLORS[wheel], width=2.5),
+                hovertemplate=(
+                    f"{wheel}"
+                    "<br>Fz %{x:.1f} N"
+                    "<br>Fit |Trq| %{y:.2f} Nm"
+                    "<extra></extra>"
+                ),
+            ))
+    if finite_fz_vals and finite_trq_vals:
+        all_fz_vals = np.concatenate(finite_fz_vals)
+        all_trq_vals = np.concatenate(finite_trq_vals)
+        total_fz_samples = [table[f"Mean Fz {wheel} [N]"].to_numpy() for wheel in WHEELS]
+        total_trq_samples = [table[f"Mean |Trq| {wheel} [Nm]"].to_numpy() for wheel in WHEELS]
+        total_fz_vals = np.concatenate(total_fz_samples)
+        total_trq_vals = np.concatenate(total_trq_samples)
+        slope_nm_per_n = _origin_slope(total_fz_vals, total_trq_vals)
+        fz_min = max(0.0, float(np.nanmin(all_fz_vals)))
+        fz_max = float(np.nanmax(all_fz_vals))
+        fz_pad = max(25.0, 0.08 * (fz_max - fz_min))
+        x0 = max(0.0, fz_min - fz_pad)
+        x1 = fz_max + fz_pad
+        trq_min = max(0.0, float(np.nanmin(all_trq_vals)))
+        trq_max = float(np.nanmax(all_trq_vals))
+        trq_pad = max(1.0, 0.10 * (trq_max - trq_min))
+        if np.isfinite(slope_nm_per_n):
+            fig_wheel_fz_torque.add_trace(go.Scatter(
+                x=[0.0, x1],
+                y=[0.0, slope_nm_per_n * x1],
+                mode="lines",
+                name="Fz-proportional reference",
+                line=dict(color="rgba(255,255,255,0.55)", dash="dash", width=1.4),
+                hoverinfo="skip",
+                showlegend=False,
+            ))
+        fig_wheel_fz_torque.update_xaxes(range=[x0, x1])
+        fig_wheel_fz_torque.update_yaxes(range=[0.0, max(trq_max + trq_pad, slope_nm_per_n * x1 if np.isfinite(slope_nm_per_n) else 0.0)])
+
+    return [fig_torque_decel, fig_min_sr, fig_wheel_fz_torque], kpis
 
 
 def rb_figs_kpis(

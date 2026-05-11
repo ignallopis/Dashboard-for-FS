@@ -1,5 +1,7 @@
 """Shared utilities for CAT17x data analysis (Formula Student 4WD Electric)."""
 from __future__ import annotations
+from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 import numpy as np
 import polars as pl
@@ -28,6 +30,9 @@ _FILTERING_ACCEL_FALLBACKS = (
     ("Filtering_VN_ax", "VN_ax"),
     ("Filtering_VN_ay", "VN_ay"),
 )
+_SUSPENSION_LOOKUP_PATH = Path(__file__).resolve().parent / "data" / "Suspension_Data_CAT17x_Lookup_Table.csv"
+_POT_COUNTS_SCALE_RAD = 0.00513235
+_POT_COUNTS_OFFSET_RAD = -0.65180882
 
 
 # ── Figure helpers ────────────────────────────────────────────────────────────
@@ -722,10 +727,251 @@ def ensure_phase_masks_df(df: pl.DataFrame) -> pl.DataFrame:
     ])
 
 
+@lru_cache(maxsize=1)
+def _load_suspension_lookup() -> dict[str, np.ndarray]:
+    """Load CAT17x rocker lookup columns as numpy arrays."""
+    if not _SUSPENSION_LOOKUP_PATH.exists():
+        return {}
+    lkp = pl.read_csv(_SUSPENSION_LOOKUP_PATH)
+    return {col: lkp[col].to_numpy().astype(float) for col in lkp.columns}
+
+
+@lru_cache(maxsize=1)
+def _suspension_polyfits() -> dict[str, np.ndarray]:
+    """Cubic polyfits matching MATLAB fit(..., 'poly3') over rocker angle [deg]."""
+    lkp = _load_suspension_lookup()
+    if not lkp or "Theta_Rocker" not in lkp:
+        return {}
+    x_deg = np.rad2deg(lkp["Theta_Rocker"])
+    return {
+        col: np.polyfit(x_deg, values, 3)
+        for col, values in lkp.items()
+        if col != "Theta_Rocker"
+    }
+
+
+def _corr_finite(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> float:
+    m = mask & np.isfinite(a) & np.isfinite(b)
+    if int(m.sum()) < 30:
+        return np.nan
+    a_m = a[m]
+    b_m = b[m]
+    if float(np.nanstd(a_m)) <= 1e-9 or float(np.nanstd(b_m)) <= 1e-9:
+        return np.nan
+    return float(np.corrcoef(a_m, b_m)[0, 1])
+
+
+def _eval_poly(fits: dict[str, np.ndarray], col: str, angle_deg: np.ndarray) -> np.ndarray:
+    coeff = fits[col]
+    return np.polyval(coeff, angle_deg)
+
+
+def _straight_setup_mask(df: pl.DataFrame) -> np.ndarray:
+    n = df.height
+    cols = set(df.columns)
+    mask = np.ones(n, dtype=bool)
+    if "VN_vx" in cols:
+        mask &= np.abs(df["VN_vx"].to_numpy().astype(float)) > 4.0
+    if "Filtering_VN_ay" in cols:
+        mask &= np.abs(df["Filtering_VN_ay"].to_numpy().astype(float)) < 0.5
+    if "Throttle" in cols:
+        mask &= np.abs(df["Throttle"].to_numpy().astype(float)) < 5.0
+    if "Brake" in cols:
+        mask &= np.abs(df["Brake"].to_numpy().astype(float)) < 5.0
+    if int(mask.sum()) < 30:
+        return np.ones(n, dtype=bool)
+    return mask
+
+
+def _suspension_angles_deg(df: pl.DataFrame, convention: str) -> dict[str, np.ndarray]:
+    out: dict[str, np.ndarray] = {}
+    for wheel in ("FL", "FR", "RL", "RR"):
+        raw = df[f"Damp{wheel}"].to_numpy().astype(float)
+        if convention == "counts":
+            out[wheel] = np.rad2deg(raw * _POT_COUNTS_SCALE_RAD + _POT_COUNTS_OFFSET_RAD)
+        else:
+            out[wheel] = raw
+    return out
+
+
+def _build_suspension_t1_payload(
+    df: pl.DataFrame,
+    *,
+    convention: str,
+    jounce_sign: float,
+) -> dict[str, np.ndarray]:
+    fits = _suspension_polyfits()
+    angles = _suspension_angles_deg(df, convention)
+    straight = _straight_setup_mask(df)
+    n = df.height
+
+    payload: dict[str, np.ndarray] = {}
+    jounce: dict[str, np.ndarray] = {}
+    for wheel in ("FL", "FR", "RL", "RR"):
+        values = _eval_poly(fits, f"Jounce_{wheel}", jounce_sign * angles[wheel])
+        zero = float(np.nanmedian(values[straight])) if straight.any() else float(np.nanmedian(values))
+        jounce[wheel] = values - zero
+        payload[f"Jounce_{wheel}"] = jounce[wheel]
+        payload[f"Pot_Angle_{wheel}_deg"] = angles[wheel]
+
+    track_f_mm = 1225.0
+    track_r_mm = 1175.0
+    wheelbase_mm = 1530.0
+    payload["Roll_Front"] = np.rad2deg(np.arctan2(jounce["FR"] - jounce["FL"], track_f_mm))
+    payload["Roll_Rear"] = np.rad2deg(np.arctan2(jounce["RR"] - jounce["RL"], track_r_mm))
+    payload["Roll"] = 0.5 * (payload["Roll_Front"] + payload["Roll_Rear"])
+    payload["Pitch"] = np.rad2deg(np.arctan2(
+        (jounce["FL"] + jounce["FR"]) - (jounce["RL"] + jounce["RR"]),
+        2.0 * wheelbase_mm,
+    ))
+    payload["Heave_Front"] = 0.5 * (jounce["FL"] + jounce["FR"])
+    payload["Heave_Rear"] = 0.5 * (jounce["RL"] + jounce["RR"])
+    payload["Heave"] = 0.25 * (jounce["FL"] + jounce["FR"] + jounce["RL"] + jounce["RR"])
+
+    for axle, left, right, prefix in (
+        ("front", "FL", "FR", "Front"),
+        ("rear", "RL", "RR", "Rear"),
+    ):
+        for mode in ("Heave", "Roll"):
+            y_l = _eval_poly(fits, f"Points_Rock_{left}_Spring_{mode}_Y", angles[left])
+            z_l = _eval_poly(fits, f"Points_Rock_{left}_Spring_{mode}_Z", angles[left])
+            y_r = _eval_poly(fits, f"Points_Rock_{right}_Spring_{mode}_Y", angles[right])
+            z_r = _eval_poly(fits, f"Points_Rock_{right}_Spring_{mode}_Z", angles[right])
+            length = np.hypot(y_l - y_r, z_l - z_r)
+            zero = float(np.nanmedian(length[straight])) if straight.any() else float(np.nanmedian(length))
+            payload[f"{prefix}_{mode}_Spring_Length"] = length - zero
+
+    time_s = df["TimeStamp"].to_numpy().astype(float) if "TimeStamp" in df.columns else np.arange(n, dtype=float)
+    dt = np.diff(time_s, prepend=np.nan)
+    valid_dt = dt[np.isfinite(dt) & (dt > 0.0)]
+    fill_dt = float(np.nanmedian(valid_dt)) if valid_dt.size else 0.01
+    dt[~np.isfinite(dt) | (dt <= 0.0)] = fill_dt
+    sample_dt = float(np.nanmedian(dt[np.isfinite(dt) & (dt > 0.0)])) if np.isfinite(dt).any() else 0.01
+
+    for col in ("Roll_Front", "Roll_Rear", "Roll", "Pitch", "Heave_Front", "Heave_Rear", "Heave"):
+        payload[f"{col}_Speed"] = np.gradient(payload[col], sample_dt)
+    for wheel in ("FL", "FR", "RL", "RR"):
+        payload[f"Pot_Speed_{wheel}"] = np.gradient(payload[f"Jounce_{wheel}"], sample_dt)
+    for out_col, src_col in (
+        ("Length_front_heave_Speed", "Front_Heave_Spring_Length"),
+        ("Length_front_roll_Speed", "Front_Roll_Spring_Length"),
+        ("Length_rear_heave_Speed", "Rear_Heave_Spring_Length"),
+        ("Length_rear_roll_Speed", "Rear_Roll_Spring_Length"),
+    ):
+        payload[out_col] = np.gradient(payload[src_col], sample_dt)
+    return payload
+
+
+def _choose_suspension_payload(df: pl.DataFrame) -> tuple[dict[str, np.ndarray], dict[str, object]]:
+    ay = df["Filtering_VN_ay"].to_numpy().astype(float) if "Filtering_VN_ay" in df.columns else np.zeros(df.height)
+    ax = df["Filtering_VN_ax"].to_numpy().astype(float) if "Filtering_VN_ax" in df.columns else np.zeros(df.height)
+    roll_ref = None
+    pitch_ref = None
+    for candidate in ("VN_roll", "Roll_VN", "VN_phi", "Filtering_VN_roll"):
+        if candidate in df.columns:
+            roll_ref = df[candidate].to_numpy().astype(float)
+            break
+    for candidate in ("VN_pitch", "Pitch_VN", "VN_theta", "Filtering_VN_pitch"):
+        if candidate in df.columns:
+            pitch_ref = df[candidate].to_numpy().astype(float)
+            break
+
+    best_payload: dict[str, np.ndarray] = {}
+    best_meta: dict[str, object] = {
+        "status": "failed",
+        "convention": "unavailable",
+        "jounce_sign": np.nan,
+        "r_roll": np.nan,
+        "r_pitch": np.nan,
+        "message": "Calibration failed - VectorNav roll/pitch references are missing.",
+    }
+    best_score = -np.inf
+    fits = _suspension_polyfits()
+    x_min = float(np.nanmin(np.rad2deg(_load_suspension_lookup()["Theta_Rocker"])))
+    x_max = float(np.nanmax(np.rad2deg(_load_suspension_lookup()["Theta_Rocker"])))
+
+    for convention in ("counts", "degrees"):
+        angles = _suspension_angles_deg(df, convention)
+        range_score = float(np.mean([
+            np.nanmean((vals >= x_min - 3.0) & (vals <= x_max + 3.0))
+            for vals in angles.values()
+        ]))
+        if not fits:
+            continue
+        for sign in (-1.0, 1.0):
+            payload = _build_suspension_t1_payload(df, convention=convention, jounce_sign=sign)
+            r_roll = _corr_finite(payload["Roll"], roll_ref, np.abs(ay) > 0.5) if roll_ref is not None else np.nan
+            r_pitch = _corr_finite(payload["Pitch"], pitch_ref, np.abs(ax) > 0.5) if pitch_ref is not None else np.nan
+            corr_vals = np.abs(np.asarray([r_roll, r_pitch], dtype=float))
+            corr_score = float(np.nanmean(corr_vals[np.isfinite(corr_vals)])) if np.isfinite(corr_vals).any() else -1.0
+            score = corr_score + 0.1 * range_score
+            if score > best_score:
+                best_score = score
+                best_payload = payload
+                best_meta = {
+                    "status": "failed",
+                    "convention": convention if np.isfinite(corr_score) and corr_score >= 0.3 else f"{convention}-range",
+                    "jounce_sign": sign,
+                    "r_roll": r_roll,
+                    "r_pitch": r_pitch,
+                    "message": "Calibration failed - VectorNav roll/pitch references are missing.",
+                }
+                if roll_ref is not None and pitch_ref is not None:
+                    if np.nan_to_num(abs(r_roll), nan=0.0) > 0.7 and np.nan_to_num(abs(r_pitch), nan=0.0) > 0.7:
+                        best_meta["status"] = "validated"
+                        best_meta["message"] = "Potentiometers calibrated against VectorNav."
+                    elif np.nan_to_num(abs(r_roll), nan=0.0) > 0.3 or np.nan_to_num(abs(r_pitch), nan=0.0) > 0.3:
+                        best_meta["status"] = "partial"
+                        best_meta["message"] = "Partial potentiometer calibration - interpret with caution."
+                    else:
+                        best_meta["message"] = "Calibration failed - poor VectorNav correlation."
+
+    return best_payload, best_meta
+
+
+def ensure_suspension_t1_df(df: pl.DataFrame) -> pl.DataFrame:
+    """Add T1 suspension lookup channels when damper data and lookup are available."""
+    required = {"TimeStamp", "DampFL", "DampFR", "DampRL", "DampRR"}
+    if not required.issubset(df.columns):
+        return df
+    if "Pot_Calibration_Status" in df.columns:
+        return df
+    if not _suspension_polyfits():
+        return df.with_columns([
+            pl.lit("failed").alias("Pot_Calibration_Status"),
+            pl.lit("lookup-missing").alias("Pot_Calibration_Convention"),
+            pl.lit(float("nan")).alias("Pot_Calibration_r_roll"),
+            pl.lit(float("nan")).alias("Pot_Calibration_r_pitch"),
+            pl.lit("Calibration failed - lookup CSV missing.").alias("Pot_Calibration_Message"),
+        ])
+
+    try:
+        payload, meta = _choose_suspension_payload(df)
+    except Exception as exc:
+        return df.with_columns([
+            pl.lit("failed").alias("Pot_Calibration_Status"),
+            pl.lit("error").alias("Pot_Calibration_Convention"),
+            pl.lit(float("nan")).alias("Pot_Calibration_r_roll"),
+            pl.lit(float("nan")).alias("Pot_Calibration_r_pitch"),
+            pl.lit(f"Calibration failed - {exc}").alias("Pot_Calibration_Message"),
+        ])
+
+    exprs = [pl.Series(name, values) for name, values in payload.items()]
+    exprs.extend([
+        pl.lit(str(meta["status"])).alias("Pot_Calibration_Status"),
+        pl.lit(str(meta["convention"])).alias("Pot_Calibration_Convention"),
+        pl.lit(float(meta["r_roll"])).alias("Pot_Calibration_r_roll"),
+        pl.lit(float(meta["r_pitch"])).alias("Pot_Calibration_r_pitch"),
+        pl.lit(str(meta["message"])).alias("Pot_Calibration_Message"),
+    ])
+    return df.with_columns(exprs)
+
+
 def enrich_run_df(df: pl.DataFrame) -> pl.DataFrame:
     """Precompute cached columns used across multiple modules."""
     df = ensure_dist_m_df(df)
     df = ensure_phase_masks_df(df)
+    df = ensure_suspension_t1_df(df)
     return df
 
 
@@ -859,3 +1105,33 @@ def style_per_lap_table(df: pl.DataFrame) -> 'pd.io.formats.style.Styler':
         return result
 
     return pdf.style.apply(_apply_all, axis=None)
+
+
+def style_metrics_table(
+    df: pl.DataFrame,
+    *,
+    lower_better: dict[str, bool],
+) -> 'pd.io.formats.style.Styler':
+    """Return a pandas Styler with rank-based colours applied per metric row."""
+    import pandas as pd  # noqa: PLC0415
+
+    pdf = df.to_pandas()
+    numeric_cols = [
+        col for col in pdf.columns
+        if col != 'Metric' and pd.api.types.is_numeric_dtype(pdf[col])
+    ]
+
+    def _apply_row(row: pd.Series) -> list[str]:
+        styles = [''] * len(row)
+        metric_name = row.get('Metric')
+        if metric_name not in lower_better or not numeric_cols:
+            return styles
+        ranked = _rank_color_styles(
+            row[numeric_cols].to_numpy(dtype=float, na_value=np.nan),
+            bool(lower_better[metric_name]),
+        )
+        for idx, col in enumerate(numeric_cols):
+            styles[pdf.columns.get_loc(col)] = ranked[idx]
+        return styles
+
+    return pdf.style.apply(_apply_row, axis=1)
