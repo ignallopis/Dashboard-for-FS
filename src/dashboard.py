@@ -690,7 +690,13 @@ def _render_event_mode_selector(
         for csv_path, label in pending_changes:
             gate_line = manual_gate
             if label == "Skidpad" and gate_line is None:
-                gate_line = _stored_gate_line(raw_dfs.get(csv_path.name))
+                # Only reuse a persisted gate if it was written by skidpad
+                # detection; the gate stored after circuit/auto runs is a
+                # finish-line, not a centre-gate, and would silently feed a
+                # stale gate to skidpad detection.
+                raw_df = raw_dfs.get(csv_path.name)
+                if _current_event_mode_label(raw_df) == "Skidpad":
+                    gate_line = _stored_gate_line(raw_df)
             ok, msg = _redetect_with_event_mode(csv_path, label, gate_line=gate_line)
             messages.append((ok, msg))
             if ok:
