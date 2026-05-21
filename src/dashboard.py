@@ -688,15 +688,19 @@ def _render_event_mode_selector(
     manual_gate = st.session_state.get("_dyn_manual_gate_line")
     with st.spinner("Re-detecting laps with the new event mode..."):
         for csv_path, label in pending_changes:
-            gate_line = manual_gate
-            if label == "Skidpad" and gate_line is None:
-                # Only reuse a persisted gate if it was written by skidpad
-                # detection; the gate stored after circuit/auto runs is a
-                # finish-line, not a centre-gate, and would silently feed a
-                # stale gate to skidpad detection.
+            if label == "Skidpad":
+                # _dyn_manual_gate_line is a circuit finish-line, not a
+                # skidpad centre-gate, so do not forward it. Only reuse the
+                # CSV's persisted gate when the stored mode is also Skidpad;
+                # otherwise let lapcount auto-estimate the centre-gate from
+                # GPS.
                 raw_df = raw_dfs.get(csv_path.name)
                 if _current_event_mode_label(raw_df) == "Skidpad":
                     gate_line = _stored_gate_line(raw_df)
+                else:
+                    gate_line = None
+            else:
+                gate_line = manual_gate
             ok, msg = _redetect_with_event_mode(csv_path, label, gate_line=gate_line)
             messages.append((ok, msg))
             if ok:
