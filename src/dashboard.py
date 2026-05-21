@@ -283,8 +283,14 @@ def _consume_track_component_event(
             manual_gate_line = st.session_state.get("_dyn_manual_gate_line")
         else:
             st.session_state["_dyn_manual_gate_line"] = manual_gate_line
+            # Stamp each draw with the originating track-component event_id
+            # so downstream consumers can detect "already used" gates.
+            st.session_state["_dyn_manual_gate_event_id"] = event_id
+            st.session_state.pop("_dyn_manual_gate_consumed_event_id", None)
     else:
         st.session_state.pop("_dyn_manual_gate_line", None)
+        st.session_state.pop("_dyn_manual_gate_event_id", None)
+        st.session_state.pop("_dyn_manual_gate_consumed_event_id", None)
     st.rerun()
 
 
@@ -593,6 +599,32 @@ def _current_event_mode_label(raw_df: pl.DataFrame | None) -> str:
     return _EVENT_MODE_TO_LABEL.get(str(values[0]).strip().lower(), "Auto")
 
 
+def _fresh_manual_gate_line(
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """Return the session manual gate only if it has not been consumed yet.
+
+    A single drawn line carries the originating ``event_id`` of the track
+    component event. Each consuming action (mode switch, "Apply To All CSVs",
+    ...) marks the same event_id as consumed. Subsequent consumers see the
+    stamp matches and treat the gate as stale, which prevents e.g. a circuit
+    finish-line drawn for a prior "Apply To All CSVs" from silently being
+    reused as a skidpad centre-gate when the event-mode selector changes.
+    """
+    gate = st.session_state.get("_dyn_manual_gate_line")
+    event_id = st.session_state.get("_dyn_manual_gate_event_id")
+    consumed = st.session_state.get("_dyn_manual_gate_consumed_event_id")
+    if gate is None or event_id is None or event_id == consumed:
+        return None
+    return gate
+
+
+def _mark_manual_gate_consumed() -> None:
+    """Record that the current manual gate has been used by some action."""
+    event_id = st.session_state.get("_dyn_manual_gate_event_id")
+    if event_id is not None:
+        st.session_state["_dyn_manual_gate_consumed_event_id"] = event_id
+
+
 def _stored_gate_line(raw_df: pl.DataFrame | None
                       ) -> tuple[tuple[float, float], tuple[float, float]] | None:
     """Recover a previously written gate line (lon, lat) from CSV metadata."""
@@ -685,26 +717,31 @@ def _render_event_mode_selector(
 
     messages: list[tuple[bool, str]] = []
     any_success = False
-    manual_gate = st.session_state.get("_dyn_manual_gate_line")
+    # Only forward the session manual gate when it has not yet been used by
+    # another action (e.g. a previous "Apply To All CSVs" that consumed it
+    # as a circuit finish-line). The gate's event_id encodes "this draw";
+    # a user who wants the same line re-applied to a different mode must
+    # redraw it. Do NOT fall back to the CSV's persisted gate for any
+    # target mode either: gates persisted from circuit/auto runs are
+    # finish-lines, not centre-gates, and would silently feed the wrong
+    # geometry to skidpad detection.
+    fresh_gate = _fresh_manual_gate_line()
+    consumed_fresh_gate = False
     with st.spinner("Re-detecting laps with the new event mode..."):
         for csv_path, label in pending_changes:
-            # Forward the session manual gate as-is so users can retry
-            # detection with a freshly drawn line (including a skidpad
-            # centre-gate). Do NOT fall back to the CSV's persisted gate
-            # for Skidpad: a gate previously written by circuit/auto runs
-            # is a finish-line, not a centre-gate, and would silently feed
-            # the wrong geometry to skidpad detection. lapcount's skidpad
-            # path itself recovers via GPS auto-estimation when a provided
-            # gate yields no plausible laps.
-            gate_line = manual_gate
+            gate_line = fresh_gate
             ok, msg = _redetect_with_event_mode(csv_path, label, gate_line=gate_line)
             messages.append((ok, msg))
             if ok:
                 any_success = True
+                if gate_line is not None:
+                    consumed_fresh_gate = True
             else:
                 st.session_state[f"event_mode_{csv_path.name}"] = (
                     _current_event_mode_label(raw_dfs.get(csv_path.name))
                 )
+    if consumed_fresh_gate:
+        _mark_manual_gate_consumed()
     for ok, msg in messages:
         (st.sidebar.success if ok else st.sidebar.error)(msg)
     if any_success:
@@ -3326,6 +3363,8 @@ def _render_manual_gate_editor(
     ):
         for key in (
             "_dyn_manual_gate_line",
+            "_dyn_manual_gate_event_id",
+            "_dyn_manual_gate_consumed_event_id",
             "_dyn_manual_gate_result",
             "_dyn_track_last_event_id",
         ):
@@ -3345,6 +3384,7 @@ def _render_manual_gate_editor(
                 n = lapcount.detect_and_write_laps(path, gate_line_lonlat=preview_line)
                 updated.append(f"{path.name}: {n} laps")
         _clear_data_caches()
+        _mark_manual_gate_consumed()
         st.session_state["_dyn_manual_gate_result"] = updated
         st.rerun()
 
@@ -3354,6 +3394,8 @@ def _render_manual_gate_editor(
         use_container_width=True,
     ):
         st.session_state.pop("_dyn_manual_gate_line", None)
+        st.session_state.pop("_dyn_manual_gate_event_id", None)
+        st.session_state.pop("_dyn_manual_gate_consumed_event_id", None)
         updated: list[str] = []
         with st.spinner("Restoring automatic lap detection..."):
             for path in _telemetry_csv_paths(DATA_DIR):
