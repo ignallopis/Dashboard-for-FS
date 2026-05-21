@@ -8,10 +8,15 @@ Metrics:
   3. Throttle Speed per lap                     (median |dTP/dt| with TP < 100 %
                                                  and brake released)
   4. Braking Effort                             (Brake [%] vs Filtering_VN_ax [m/s²])
-  5. Braking Aggressiveness per lap             (mean dBrake/dt for dBrake/dt > 5 %/s)
-  6. Brake Release Smoothness per lap           (mean |dBrake/dt| for dBrake/dt < -5 %/s)
-  7. Steering Smoothness                        (mean |dSteering/dt| per lap)
-  8. Corner Curvature                           (mean |ay| / vx² per lap)
+  5. Brake Application Point                    (box plot by significant braking zone)
+  6. Braking Aggressiveness per lap             (mean dBrake/dt for dBrake/dt > 5 %/s)
+  7. Brake Release Smoothness per lap           (mean |dBrake/dt| for dBrake/dt < -5 %/s)
+  8. Steering Smoothness                        (mean |Steering - smooth_1s(Steering)|
+                                                 per lap)
+  9. Steering Integral                          (∫|Steering| ds per lap)
+ 10. Corner Curvature                           (mean |ay| / vx² per lap)
+ 11. Steering Stability                         (∫|dSteering/dt| over straight-line braking,
+                                                 box plot per significant braking zone)
 
 All figure builders accept a `dfs: dict[str, pl.DataFrame]` so a single run
 or a multi-run comparison (driver A vs driver B) share the same code path.
@@ -72,14 +77,22 @@ BRAKE_EFFORT_AX_MAX     = -0.5   # [m/s²] require actual longitudinal decelerat
 BRAKE_EVENT_MIN_TIME_S  = 0.10   # [s]   ignore isolated brake spikes
 BRAKE_EVENT_MAX_GAP_S   = 0.08   # [s]   bridge short drops inside one braking zone
 BRAKE_SMOOTH_WINDOW_S   = 0.31   # [s]   light smoothing before differentiation
+BRAKE_APPLICATION_MIN_PEAK_PCT = 15.0     # [%]    minimum peak demand for a real braking zone
+BRAKE_APPLICATION_MIN_DECEL_MPS2 = -0.75  # [m/s²] minimum achieved deceleration
+BRAKE_APPLICATION_MIN_DV_MPS = 2.0        # [m/s]  minimum speed drop across the event
+BRAKE_APPLICATION_ZONE_GAP_FRAC = 0.035   # [-]    max start-position gap inside one zone
 STEERING_SMOOTH_WINDOW_S = 0.21  # [s]   light smoothing before differentiating steering
+STEERING_SMOOTHNESS_WINDOW_S = 1.00  # [s]   baseline trend for steering-correction KPI
 CURVATURE_MIN_SPEED_MPS  = 3.0   # [m/s] avoid ay / vx² blow-ups near standstill
+STEERING_STAB_AY_LIMIT_MPS2     = 0.2 * 9.80665  # [m/s²] |ay| < 0.2 g for "straight-line" braking
+STEERING_STAB_MIN_STRAIGHT_FRAC = 0.10           # [-]    require enough straight-brake samples to avoid one-sample noise
 _LONG_ACCEL_CANDIDATES  = ("Filtering_VN_ax", "VN_ax")
 _LAT_ACCEL_CANDIDATES   = ("Filtering_VN_ay",)
 _SPEED_CANDIDATES       = ("VN_vx",)
 
 # Per-driver/run colours — extend if needed
 DRIVER_COLORS = ("#4DB3F2", "#F27070", "#F2C94C", "#73D973")
+POTENTIAL_LAP_RUN = "__potential_lap__"
 
 _REQUIRED_COLS = ("TimeStamp", "laps", "laptime", "Throttle", "Brake")
 
@@ -430,6 +443,23 @@ def _speed_col(df: pl.DataFrame) -> str:
     )
 
 
+def _prep_steering_metrics(df: pl.DataFrame) -> tuple[dict[str, np.ndarray], str, str]:
+    """Prepare steering metric arrays and attach lap distance when available."""
+    lat_accel_col = _lateral_accel_col(df)
+    speed_col = _speed_col(df)
+    prepared_df = ensure_complete_laps_df(df)
+    d = _prep(prepared_df, extra_cols=("Steering", lat_accel_col, speed_col))
+
+    try:
+        dist_m = lap_dist_from_gps(prepared_df)
+    except (KeyError, ValueError):
+        dist_m = None
+    if dist_m is not None and len(dist_m) == len(d["time"]):
+        d["dist_m"] = dist_m
+
+    return d, lat_accel_col, speed_col
+
+
 def _savgol_window_samples(n_samples: int, dt_s: float, window_s: float) -> int:
     """Odd Savitzky-Golay window length compatible with *n_samples*."""
     if n_samples < 5 or not np.isfinite(dt_s) or dt_s <= 0.0:
@@ -451,12 +481,33 @@ def _smooth_brake_signal(brake_pct: np.ndarray, dt_s: float) -> np.ndarray:
     return np.clip(smoothed, 0.0, 100.0)
 
 
-def _smooth_steering_signal(steering_rad: np.ndarray, dt_s: float) -> np.ndarray:
-    """Lightly smooth steering so quantisation noise does not dominate dSteering/dt."""
-    window = _savgol_window_samples(len(steering_rad), dt_s, STEERING_SMOOTH_WINDOW_S)
+def _smooth_steering_signal(
+    steering_rad: np.ndarray,
+    dt_s: float,
+    window_s: float = STEERING_SMOOTH_WINDOW_S,
+) -> np.ndarray:
+    """Smooth steering over *window_s* seconds."""
+    window = _savgol_window_samples(len(steering_rad), dt_s, window_s)
     if window == 0:
         return steering_rad.copy()
     return savgol_filter(steering_rad, window_length=window, polyorder=2, mode="interp")
+
+
+def _steering_integral_degm(steering_rad: np.ndarray, dist_m: np.ndarray) -> float:
+    """Distance integral of absolute steering angle [deg*m]."""
+    valid = np.isfinite(steering_rad) & np.isfinite(dist_m)
+    if int(valid.sum()) < 2:
+        return np.nan
+
+    steering_abs_deg = np.abs(np.rad2deg(steering_rad[valid]))
+    s_m = dist_m[valid]
+    ds_m = np.diff(s_m)
+    positive = np.isfinite(ds_m) & (ds_m > 0.0)
+    if not positive.any():
+        return np.nan
+
+    area = 0.5 * (steering_abs_deg[:-1] + steering_abs_deg[1:]) * ds_m
+    return float(np.sum(area[positive]))
 
 
 def _brake_rate_arrays(
@@ -545,12 +596,385 @@ def _braking_effort_events(
     )
 
 
+def _prep_brake_application(
+    df: pl.DataFrame,
+    accel_col: str,
+    speed_col: str,
+    extra_cols: tuple[str, ...] = (),
+) -> dict[str, np.ndarray]:
+    """Prepare aligned arrays for distance-based brake-application analysis."""
+    df = ensure_complete_laps_df(df)
+    required_cols = list(
+        dict.fromkeys([*_REQUIRED_COLS, accel_col, speed_col, *extra_cols])
+    )
+    d = cols_to_numpy(df, required_cols)
+    d["dist_m"] = lap_dist_from_gps(df)
+    if COMPLETE_LAPS_MARKER in df.columns:
+        d[COMPLETE_LAPS_MARKER] = cols_to_numpy(df, [COMPLETE_LAPS_MARKER])[COMPLETE_LAPS_MARKER]
+    d["time"] = d["TimeStamp"] - d["TimeStamp"][0]
+    return d
+
+
+def _iter_significant_brake_event_segments(
+    d: dict[str, np.ndarray],
+    accel_col: str,
+    speed_col: str,
+) -> list[tuple[int, int, dict[str, float]]]:
+    """Yield (start_idx, end_idx, base_meta) for each qualifying brake event.
+
+    `base_meta` carries the per-event geometry shared by every consumer of
+    significant brake events: lap, start_dist_m, progress, lap_len_m,
+    duration_s, peak_brake_pct, min_accel_mps2, speed_drop_mps. The caller
+    decides what additional value to compute over `[start_idx, end_idx]`.
+    """
+    time_s = d["time"]
+    laps = d["laps"]
+    brake_pct = d["Brake"]
+    accel_mps2 = d[accel_col]
+    speed_mps = d[speed_col]
+    dist_m = d["dist_m"]
+    dt_s = robust_dt(time_s)
+    brake_smooth = _smooth_brake_signal(brake_pct, dt_s)
+
+    event_mask = keep_min_duration_segments(
+        brake_smooth >= BRAKE_EFFORT_MIN,
+        BRAKE_EVENT_MIN_TIME_S,
+        dt_s,
+    )
+    event_mask = fill_short_false_gaps(event_mask, BRAKE_EVENT_MAX_GAP_S, dt_s)
+
+    out: list[tuple[int, int, dict[str, float]]] = []
+    for lap in unique_laps(laps):
+        lap_mask = laps == lap
+        if not lap_mask.any():
+            continue
+
+        lap_dist = dist_m[lap_mask]
+        lap_len_m = float(np.nanmax(lap_dist))
+        if not np.isfinite(lap_len_m) or lap_len_m <= 10.0:
+            continue
+
+        for start_idx, end_idx in _true_segments(lap_mask & event_mask):
+            seg = slice(start_idx, end_idx + 1)
+            peak_brake_pct = float(np.nanmax(brake_pct[seg]))
+            min_accel_mps2 = float(np.nanmin(accel_mps2[seg]))
+            entry_speed_mps = float(speed_mps[start_idx])
+            min_speed_mps = float(np.nanmin(speed_mps[seg]))
+            speed_drop_mps = entry_speed_mps - min_speed_mps
+
+            if peak_brake_pct < BRAKE_APPLICATION_MIN_PEAK_PCT:
+                continue
+            if min_accel_mps2 > BRAKE_APPLICATION_MIN_DECEL_MPS2:
+                continue
+            if speed_drop_mps < BRAKE_APPLICATION_MIN_DV_MPS:
+                continue
+
+            start_dist_m = float(dist_m[start_idx])
+            progress = start_dist_m / lap_len_m
+            base = {
+                "lap": float(lap),
+                "start_dist_m": start_dist_m,
+                "progress": float(np.clip(progress, 0.0, 1.0)),
+                "lap_len_m": lap_len_m,
+                "duration_s": float(time_s[end_idx] - time_s[start_idx]),
+                "peak_brake_pct": peak_brake_pct,
+                "min_accel_mps2": min_accel_mps2,
+                "speed_drop_mps": float(speed_drop_mps),
+            }
+            out.append((start_idx, end_idx, base))
+    return out
+
+
+def _significant_brake_application_events(
+    df: pl.DataFrame,
+    accel_col: str,
+    speed_col: str,
+) -> list[dict[str, float]]:
+    """Return significant brake-on events with their application distance.
+
+    A significant zone needs a sustained brake signal, meaningful peak demand,
+    real deceleration, and a measurable speed drop. This avoids creating boxes
+    for every minor lift/tap before a geometric corner.
+    """
+    d = _prep_brake_application(df, accel_col, speed_col)
+    valid = np.all(
+        np.stack(
+            [
+                np.isfinite(d["time"]),
+                np.isfinite(d["laps"]),
+                np.isfinite(d["Brake"]),
+                np.isfinite(d[accel_col]),
+                np.isfinite(d[speed_col]),
+                np.isfinite(d["dist_m"]),
+            ],
+            axis=1,
+        ),
+        axis=1,
+    )
+    d = {k: v[valid] for k, v in d.items()}
+    d = exclude_lap0_and_last_lap(d)
+    return [base for _, _, base in _iter_significant_brake_event_segments(d, accel_col, speed_col)]
+
+
+def _steering_stability_events(
+    df: pl.DataFrame,
+    accel_col: str,
+    speed_col: str,
+    lat_accel_col: str,
+) -> list[dict[str, float]]:
+    """Return steering stability per significant braking event [deg].
+
+    Uses the same brake-event detection as `_significant_brake_application_events`
+    (peak brake / decel / Δv filters). Zone clustering happens later on this
+    complete event list, so the x-axis zones match Brake Application Point.
+    For each event, integrates |dSteering/dt| over the samples where the car is
+    in straight-line braking — i.e. |lateral acceleration| < STEERING_STAB_AY_LIMIT_MPS2
+    (≈ 0.2 g, matching the slide). Higher values mean the driver did more
+    corrective steering while braking.
+    """
+    d = _prep_brake_application(
+        df, accel_col, speed_col, extra_cols=(lat_accel_col, "Steering"),
+    )
+    # Same `valid` mask as _significant_brake_application_events — the brake-event
+    # detection must be identical. NaNs in steering/ay are handled below.
+    valid = np.all(
+        np.stack(
+            [
+                np.isfinite(d["time"]),
+                np.isfinite(d["laps"]),
+                np.isfinite(d["Brake"]),
+                np.isfinite(d[accel_col]),
+                np.isfinite(d[speed_col]),
+                np.isfinite(d["dist_m"]),
+            ],
+            axis=1,
+        ),
+        axis=1,
+    )
+    d = {k: v[valid] for k, v in d.items()}
+    d = exclude_lap0_and_last_lap(d)
+
+    time_s = d["time"]
+    ay_mps2 = d[lat_accel_col]
+    steering_rad = d["Steering"]
+
+    dt_s = robust_dt(time_s)
+    steering_finite = np.isfinite(steering_rad)
+    ay_finite = np.isfinite(ay_mps2)
+    # Linear interpolation across NaN gaps keeps the Savitzky-Golay smoother
+    # continuous. Filling with zero here was wrong — the artificial step would
+    # leak a giant fake gradient spike into the ~½-window of finite samples on
+    # either side of the gap, inflating the integrated rate. Events that touch
+    # any NaN within the smoothing pad are rejected below, so this scaffolding
+    # never contributes to a reported value.
+    steering_for_smoothing = steering_rad.copy()
+    if not steering_finite.all() and steering_finite.any():
+        finite_idx = np.flatnonzero(steering_finite)
+        nan_idx = np.flatnonzero(~steering_finite)
+        steering_for_smoothing[nan_idx] = np.interp(
+            nan_idx, finite_idx, steering_rad[finite_idx],
+        )
+    steering_smooth = _smooth_steering_signal(steering_for_smoothing, dt_s)
+    steer_rate_abs_degps = np.abs(np.rad2deg(np.gradient(steering_smooth, time_s)))
+    straight_mask = ay_finite & (np.abs(ay_mps2) < STEERING_STAB_AY_LIMIT_MPS2)
+
+    n_samples = len(time_s)
+    # Contamination radius of one interpolated sample on the rate signal:
+    # Savitzky-Golay half-width  +  one extra sample for the central-difference
+    # gradient stencil. Use the actual SG window the smoother chose to avoid an
+    # off-by-one when the configured window doesn't divide evenly by dt.
+    sg_window = _savgol_window_samples(n_samples, dt_s, STEERING_SMOOTH_WINDOW_S)
+    sg_pad = (sg_window // 2 + 1) if sg_window else 1
+
+    rows: list[dict[str, float]] = []
+    for start_idx, end_idx, base in _iter_significant_brake_event_segments(d, accel_col, speed_col):
+        seg = slice(start_idx, end_idx + 1)
+        row = dict(base)
+        row["steering_stability_deg"] = np.nan
+        row["straight_frac"] = np.nan
+
+        win_lo = max(0, start_idx - sg_pad)
+        win_hi = min(n_samples, end_idx + 1 + sg_pad)
+        # Reject any event whose smoothing window touches a NaN — that's where
+        # the contamination would creep in. Keep the row so zone detection stays
+        # identical to Brake Application Point.
+        if not steering_finite[win_lo:win_hi].all():
+            rows.append(row)
+            continue
+        if not ay_finite[seg].all():
+            rows.append(row)
+            continue
+        seg_straight = straight_mask[seg]
+        straight_frac = float(seg_straight.mean())
+        row["straight_frac"] = straight_frac
+        if not seg_straight.any():
+            rows.append(row)
+            continue
+        if straight_frac < STEERING_STAB_MIN_STRAIGHT_FRAC:
+            rows.append(row)
+            continue
+        seg_t = time_s[seg]
+        seg_rate = np.where(seg_straight, steer_rate_abs_degps[seg], 0.0)
+        steering_stability_deg = float(np.trapezoid(seg_rate, seg_t))
+        if np.isfinite(steering_stability_deg):
+            row["steering_stability_deg"] = steering_stability_deg
+        rows.append(row)
+    return rows
+
+
+def _assign_brake_application_zones(events: list[dict]) -> list[dict]:
+    """Cluster significant brake events into repeated track zones."""
+    if not events:
+        return []
+
+    order = np.argsort([float(row["progress"]) for row in events], kind="mergesort")
+    clusters: list[list[int]] = [[int(order[0])]]
+    prev_progress = float(events[int(order[0])]["progress"])
+
+    for idx_raw in order[1:]:
+        idx = int(idx_raw)
+        progress = float(events[idx]["progress"])
+        if progress - prev_progress <= BRAKE_APPLICATION_ZONE_GAP_FRAC:
+            clusters[-1].append(idx)
+        else:
+            clusters.append([idx])
+        prev_progress = progress
+
+    selected_laps = {
+        (str(row["run"]), int(row["lap"]))
+        for row in events
+    }
+    min_zone_events = 1 if len(selected_laps) <= 1 else 2
+
+    cluster_meta: list[tuple[float, list[int]]] = []
+    for cluster in clusters:
+        if len(cluster) < min_zone_events:
+            continue
+        progress_vals = np.asarray([float(events[idx]["progress"]) for idx in cluster])
+        angles = 2.0 * np.pi * progress_vals
+        center = float(
+            (
+                np.arctan2(np.sin(angles).mean(), np.cos(angles).mean())
+                / (2.0 * np.pi)
+            ) % 1.0
+        )
+        cluster_meta.append((center, cluster))
+
+    if not cluster_meta:
+        return []
+
+    cluster_meta.sort(key=lambda item: item[0])
+    out: list[dict] = []
+    for zone_idx, (center, cluster) in enumerate(cluster_meta, start=1):
+        zone_label = f"Zone {zone_idx}"
+        for event_idx in cluster:
+            row = events[event_idx].copy()
+            row["zone"] = zone_label
+            row["zone_center_progress"] = center
+            out.append(row)
+    return _first_event_per_zone_lap(out)
+
+
+def _braking_turn_label(
+    start_dist_m: float,
+    turns: list[object] | None,
+) -> tuple[str | None, int | None]:
+    """Return the turn label for a brake application point."""
+    if not turns or not np.isfinite(start_dist_m):
+        return None, None
+
+    candidates = [
+        turn for turn in turns
+        if np.isfinite(float(turn.s_entry_m))
+        and np.isfinite(float(turn.s_apex_m))
+        and np.isfinite(float(turn.s_exit_m))
+    ]
+    if not candidates:
+        return None, None
+    candidates.sort(key=lambda turn: float(turn.s_entry_m))
+
+    for turn in candidates:
+        turn_id = int(turn.turn_id)
+        if (
+            float(turn.s_entry_m) <= start_dist_m <= float(turn.s_exit_m)
+            and start_dist_m <= float(turn.s_apex_m)
+        ):
+            return f"T{turn_id} Braking", turn_id
+
+    ahead = [
+        turn for turn in candidates
+        if float(turn.s_entry_m) >= start_dist_m
+    ]
+    if ahead:
+        turn = min(ahead, key=lambda item: float(item.s_entry_m))
+    else:
+        turn = candidates[0]
+    turn_id = int(turn.turn_id)
+    return f"T{turn_id} Braking", turn_id
+
+
+def _label_brake_application_zones(
+    events: list[dict],
+    turns: list[object] | None,
+) -> list[dict]:
+    """Rename clustered braking zones with their associated detected turn."""
+    if not turns or not events:
+        return events
+
+    zone_order = {
+        zone: idx
+        for idx, zone in enumerate(
+            sorted(
+                {str(row["zone"]) for row in events},
+                key=lambda label: int(label.split()[-1]),
+            )
+        )
+    }
+    zone_labels: dict[str, tuple[str, int | None]] = {}
+    used_labels: set[str] = set()
+    for zone in zone_order:
+        rows = [row for row in events if str(row["zone"]) == zone]
+        first_application_m = float(np.nanmin([
+            float(row["start_dist_m"]) for row in rows
+        ]))
+        label, turn_id = _braking_turn_label(first_application_m, turns)
+        if label is None:
+            label = zone
+        if label in used_labels:
+            label = f"{label} ({zone})"
+        used_labels.add(label)
+        zone_labels[zone] = (label, turn_id)
+
+    out: list[dict] = []
+    for row in events:
+        old_zone = str(row["zone"])
+        label, turn_id = zone_labels[old_zone]
+        mapped = row.copy()
+        mapped["zone_raw"] = old_zone
+        mapped["zone"] = label
+        mapped["turn_id"] = turn_id
+        mapped["zone_order"] = zone_order[old_zone]
+        out.append(mapped)
+    return out
+
+
+def _first_event_per_zone_lap(events: list[dict]) -> list[dict]:
+    """Keep one brake-application point per run/lap/zone."""
+    first: dict[tuple[str, int, str], dict] = {}
+    for row in events:
+        key = (str(row["run"]), int(row["lap"]), str(row["zone"]))
+        current = first.get(key)
+        if current is None or float(row["start_dist_m"]) < float(current["start_dist_m"]):
+            first[key] = row
+    return list(first.values())
+
+
 def _steering_metrics_per_lap(
     d: dict[str, np.ndarray],
     lat_accel_col: str,
     speed_col: str,
 ) -> dict:
-    """Return steering smoothness and curvature metrics per lap."""
+    """Return steering smoothness, integral, and curvature metrics per lap."""
     valid = np.all(
         np.stack(
             [
@@ -575,10 +999,6 @@ def _steering_metrics_per_lap(
     ay_mps2 = d[lat_accel_col]
     vx_mps = np.abs(d[speed_col])
 
-    dt_s = robust_dt(time_s)
-    steering_smooth = _smooth_steering_signal(steering_rad, dt_s)
-    steering_rate_abs_degps = np.abs(np.rad2deg(np.gradient(steering_smooth, time_s)))
-
     curvature_inv_m = np.full(len(vx_mps), np.nan)
     curvature_mask = np.isfinite(ay_mps2) & np.isfinite(vx_mps) & (vx_mps >= CURVATURE_MIN_SPEED_MPS)
     curvature_inv_m[curvature_mask] = np.abs(ay_mps2[curvature_mask]) / np.square(vx_mps[curvature_mask])
@@ -587,6 +1007,7 @@ def _steering_metrics_per_lap(
     n = len(lap_list)
     lt_val = np.full(n, np.nan)
     mean_steering_smoothness = np.full(n, np.nan)
+    steering_integral_degm = np.full(n, np.nan)
     mean_curvature = np.full(n, np.nan)
 
     for i, lap in enumerate(lap_list):
@@ -594,16 +1015,26 @@ def _steering_metrics_per_lap(
         if not lm.any():
             continue
         lt_val[i] = float(np.nanmax(laptime[lm]))
-        sm = lm & np.isfinite(steering_rate_abs_degps)
-        if sm.any():
-            mean_steering_smoothness[i] = float(np.nanmean(steering_rate_abs_degps[sm]))
+        lap_steering = steering_rad[lm]
+        lap_dt_s = robust_dt(time_s[lm])
+        steering_baseline_rad = _smooth_steering_signal(
+            lap_steering, lap_dt_s, STEERING_SMOOTHNESS_WINDOW_S,
+        )
+        steering_smoothness_deg = np.abs(np.rad2deg(lap_steering - steering_baseline_rad))
+        if np.isfinite(steering_smoothness_deg).any():
+            mean_steering_smoothness[i] = float(np.nanmean(steering_smoothness_deg))
+        if "dist_m" in d:
+            steering_integral_degm[i] = _steering_integral_degm(
+                lap_steering, d["dist_m"][lm],
+            )
         cm = lm & np.isfinite(curvature_inv_m)
         if cm.any():
             mean_curvature[i] = float(np.nanmean(curvature_inv_m[cm]))
 
     table = pl.DataFrame({
         "Lap": lap_list.astype(int),
-        "Steering smoothness [deg/s]": np.round(mean_steering_smoothness, 4),
+        "Steering smoothness [deg]": np.round(mean_steering_smoothness, 4),
+        "Steering integral [deg*m]": np.round(steering_integral_degm, 1),
         "Curvature [1/m]": np.round(mean_curvature, 5),
     })
 
@@ -611,6 +1042,7 @@ def _steering_metrics_per_lap(
         "lap_list": lap_list,
         "lt_val": lt_val,
         "mean_steering_smoothness": mean_steering_smoothness,
+        "steering_integral_degm": steering_integral_degm,
         "mean_curvature": mean_curvature,
         "table": table,
     }
@@ -706,9 +1138,7 @@ def driver_summary(df: pl.DataFrame) -> dict:
     steer_res: dict | None = None
     if "Steering" in df.columns:
         try:
-            lat_accel_col = _lateral_accel_col(df)
-            speed_col = _speed_col(df)
-            steer_d = _prep(df, extra_cols=("Steering", lat_accel_col, speed_col))
+            steer_d, lat_accel_col, speed_col = _prep_steering_metrics(df)
             steer_res = _steering_metrics_per_lap(steer_d, lat_accel_col, speed_col)
             res["table"] = res["table"].join(steer_res["table"], on="Lap", how="left")
         except KeyError:
@@ -734,6 +1164,11 @@ def driver_summary(df: pl.DataFrame) -> dict:
     brake_release_vals    = res["mean_brake_release"][brake_release_ok_mask]
     steering_vals = (
         steer_res["mean_steering_smoothness"][np.isfinite(steer_res["mean_steering_smoothness"])]
+        if steer_res is not None
+        else np.asarray([], dtype=float)
+    )
+    steering_integral_vals = (
+        steer_res["steering_integral_degm"][np.isfinite(steer_res["steering_integral_degm"])]
         if steer_res is not None
         else np.asarray([], dtype=float)
     )
@@ -770,6 +1205,12 @@ def driver_summary(df: pl.DataFrame) -> dict:
         ),
         "max_steering_smoothness": (
             float(np.nanmax(steering_vals)) if steering_vals.size else np.nan
+        ),
+        "mean_steering_integral": (
+            float(np.nanmean(steering_integral_vals)) if steering_integral_vals.size else np.nan
+        ),
+        "max_steering_integral": (
+            float(np.nanmax(steering_integral_vals)) if steering_integral_vals.size else np.nan
         ),
         "mean_curvature": (
             float(np.nanmean(curvature_vals)) if curvature_vals.size else np.nan
@@ -974,6 +1415,110 @@ def braking_effort_fig(dfs: dict[str, pl.DataFrame]) -> go.Figure:
     return fig
 
 
+def brake_application_point_fig(
+    dfs: dict[str, pl.DataFrame],
+    turns: list[object] | None = None,
+) -> go.Figure:
+    """Box plot of brake application point for repeated significant braking zones."""
+    fig = make_dark_figure(
+        title="Brake Application Point — significant braking zones",
+        xlabel="Turn / braking zone",
+        ylabel="Brake application point [m]",
+    )
+
+    events: list[dict] = []
+    run_order = list(dfs.keys())
+    for run_name, df in dfs.items():
+        accel_col = _longitudinal_accel_col(df)
+        speed_col = _speed_col(df)
+        for row in _significant_brake_application_events(df, accel_col, speed_col):
+            row["run"] = run_name
+            row["accel_col"] = accel_col
+            events.append(row)
+
+    zoned_events = _label_brake_application_zones(
+        _assign_brake_application_zones(events),
+        turns,
+    )
+    if not zoned_events:
+        raise ValueError(
+            "No repeated significant braking zones found. "
+            f"Filters: peak Brake >= {BRAKE_APPLICATION_MIN_PEAK_PCT:.0f} %, "
+            f"min ax <= {BRAKE_APPLICATION_MIN_DECEL_MPS2:.2f} m/s², "
+            f"speed drop >= {BRAKE_APPLICATION_MIN_DV_MPS:.1f} m/s."
+        )
+
+    if turns:
+        zone_sort = {
+            str(row["zone"]): int(row.get("zone_order", 0))
+            for row in zoned_events
+        }
+        zone_order = sorted(
+            {str(row["zone"]) for row in zoned_events},
+            key=lambda label: zone_sort.get(label, 10_000),
+        )
+    else:
+        zone_order = sorted(
+            {str(row["zone"]) for row in zoned_events},
+            key=lambda label: int(label.split()[-1]),
+        )
+    any_trace = False
+    for run_idx, run_name in enumerate(run_order):
+        run_rows = [row for row in zoned_events if row["run"] == run_name]
+        if not run_rows:
+            continue
+
+        x_vals = [str(row["zone"]) for row in run_rows]
+        y_vals = [float(row["start_dist_m"]) for row in run_rows]
+        customdata = np.asarray(
+            [
+                [
+                    float(row["lap"]),
+                    float(row["duration_s"]),
+                    float(row["peak_brake_pct"]),
+                    float(row["min_accel_mps2"]),
+                    float(row["speed_drop_mps"]),
+                ]
+                for row in run_rows
+            ],
+            dtype=float,
+        )
+        color = _driver_color(run_name, run_idx)
+        any_trace = True
+        fig.add_trace(go.Box(
+            x=x_vals,
+            y=y_vals,
+            name=run_name,
+            marker=dict(color=color, size=5, opacity=0.65),
+            line=dict(color=color, width=1.6),
+            boxmean=True,
+            boxpoints="all",
+            jitter=0.35,
+            pointpos=0.0,
+            customdata=customdata,
+            hovertemplate=(
+                "Turn/zone: %{x}<br>"
+                "Lap: %{customdata[0]:.0f}<br>"
+                "Application: %{y:.1f} m<br>"
+                "Duration: %{customdata[1]:.2f} s<br>"
+                "Peak Brake: %{customdata[2]:.1f} %<br>"
+                "Min ax: %{customdata[3]:.2f} m/s²<br>"
+                "Speed drop: %{customdata[4]:.1f} m/s"
+                f"<extra>{run_name}</extra>"
+            ),
+        ))
+
+    if not any_trace:
+        raise ValueError("No valid brake-application points after zone grouping.")
+
+    fig.update_layout(
+        boxmode="group",
+        legend=dict(itemsizing="constant"),
+    )
+    fig.update_xaxes(categoryorder="array", categoryarray=zone_order)
+    return fig
+
+
 def braking_aggressiveness_fig(
     dfs: dict[str, pl.DataFrame],
     x_mode: str = "laps",
@@ -1042,18 +1587,16 @@ def steering_smoothness_fig(
     dfs: dict[str, pl.DataFrame],
     x_mode: str = "laps",
 ) -> go.Figure:
-    """Average steering smoothness per lap."""
+    """Average steering correction amplitude per lap."""
     fig = make_dark_figure(
-        title="Steering Smoothness per Lap",
+        title="Steering Smoothness per Lap — mean |Steering - smooth_1s(Steering)|",
         xlabel="Lap" if x_mode == "laps" else "Lap time [s]",
-        ylabel="Average steering smoothness [deg/s]",
+        ylabel="Average steering smoothness [deg]",
     )
     all_laps: list[np.ndarray] = []
 
     for i, (run_name, df) in enumerate(dfs.items()):
-        lat_accel_col = _lateral_accel_col(df)
-        speed_col = _speed_col(df)
-        d = _prep(df, extra_cols=("Steering", lat_accel_col, speed_col))
+        d, lat_accel_col, speed_col = _prep_steering_metrics(df)
         res = _steering_metrics_per_lap(d, lat_accel_col, speed_col)
         ok = np.isfinite(res["mean_steering_smoothness"]) & np.isfinite(res["lt_val"])
         if not ok.any():
@@ -1071,6 +1614,155 @@ def steering_smoothness_fig(
     if x_mode == "laps" and all_laps:
         ticks = np.unique(np.concatenate(all_laps)).astype(int)
         fig.update_xaxes(tickvals=ticks)
+    return fig
+
+
+def steering_integral_fig(
+    dfs: dict[str, pl.DataFrame],
+    x_mode: str = "laps",
+) -> go.Figure:
+    """Distance integral of absolute steering per lap."""
+    fig = make_dark_figure(
+        title="Steering Integral per Lap — integral of |Steering| over distance",
+        xlabel="Lap" if x_mode == "laps" else "Lap time [s]",
+        ylabel="Steering integral [deg*m]",
+    )
+    all_laps: list[np.ndarray] = []
+
+    for i, (run_name, df) in enumerate(dfs.items()):
+        d, lat_accel_col, speed_col = _prep_steering_metrics(df)
+        res = _steering_metrics_per_lap(d, lat_accel_col, speed_col)
+        ok = np.isfinite(res["steering_integral_degm"]) & np.isfinite(res["lt_val"])
+        if not ok.any():
+            continue
+        x_arr, order, _ = per_lap_axis(
+            res["lap_list"][ok], res["lt_val"][ok], x_mode,
+        )
+        y_arr = res["steering_integral_degm"][ok][order]
+        lap_ord = res["lap_list"][ok][order]
+        color = _driver_color(run_name, i)
+        add_lap_scatter(fig, x_arr, y_arr, lap_ord, name=run_name, color=color)
+        add_trend_line(fig, x_arr, y_arr, color=color)
+        all_laps.append(res["lap_list"][ok])
+
+    if x_mode == "laps" and all_laps:
+        ticks = np.unique(np.concatenate(all_laps)).astype(int)
+        fig.update_xaxes(tickvals=ticks)
+    return fig
+
+
+def steering_stability_fig(
+    dfs: dict[str, pl.DataFrame],
+    turns: list[object] | None = None,
+) -> go.Figure:
+    """Box plot of steering stability per significant braking zone.
+
+    For each significant brake application (same detection as Brake Application
+    Point), integrate |dSteering/dt| over the samples that are also in
+    straight-line braking (|ay| < 0.2 g). Higher value means the driver was
+    making more steering corrections during the braking event.
+    """
+    ay_threshold_g = STEERING_STAB_AY_LIMIT_MPS2 / 9.80665
+    fig = make_dark_figure(
+        title="Steering Stability — significant braking zones (straight-line)",
+        xlabel="Turn / braking zone",
+        ylabel="Steering stability [deg]",
+    )
+
+    events: list[dict] = []
+    run_order = list(dfs.keys())
+    for run_name, df in dfs.items():
+        accel_col = _longitudinal_accel_col(df)
+        speed_col = _speed_col(df)
+        lat_accel_col = _lateral_accel_col(df)
+        for row in _steering_stability_events(df, accel_col, speed_col, lat_accel_col):
+            row["run"] = run_name
+            events.append(row)
+
+    zoned_events = _label_brake_application_zones(
+        _assign_brake_application_zones(events),
+        turns,
+    )
+    if not zoned_events:
+        raise ValueError(
+            "No repeated significant braking zones found for steering stability. "
+            f"Filters: peak Brake >= {BRAKE_APPLICATION_MIN_PEAK_PCT:.0f} %, "
+            f"min ax <= {BRAKE_APPLICATION_MIN_DECEL_MPS2:.2f} m/s², "
+            f"speed drop >= {BRAKE_APPLICATION_MIN_DV_MPS:.1f} m/s, "
+            f"|ay| < {ay_threshold_g:.2f} g (straight-line)."
+        )
+
+    if turns:
+        zone_sort = {
+            str(row["zone"]): int(row.get("zone_order", 0))
+            for row in zoned_events
+        }
+        zone_order = sorted(
+            {str(row["zone"]) for row in zoned_events},
+            key=lambda label: zone_sort.get(label, 10_000),
+        )
+    else:
+        zone_order = sorted(
+            {str(row["zone"]) for row in zoned_events},
+            key=lambda label: int(label.split()[-1]),
+        )
+
+    any_trace = False
+    for run_idx, run_name in enumerate(run_order):
+        run_rows = [row for row in zoned_events if row["run"] == run_name]
+        if not run_rows:
+            continue
+
+        x_vals = [str(row["zone"]) for row in run_rows]
+        y_vals = [float(row["steering_stability_deg"]) for row in run_rows]
+        customdata = np.asarray(
+            [
+                [
+                    float(row["lap"]),
+                    float(row["duration_s"]),
+                    float(row["peak_brake_pct"]),
+                    float(row["min_accel_mps2"]),
+                    float(row["speed_drop_mps"]),
+                    float(row["straight_frac"]) * 100.0,
+                ]
+                for row in run_rows
+            ],
+            dtype=float,
+        )
+        color = _driver_color(run_name, run_idx)
+        any_trace = True
+        fig.add_trace(go.Box(
+            x=x_vals,
+            y=y_vals,
+            name=run_name,
+            marker=dict(color=color, size=5, opacity=0.65),
+            line=dict(color=color, width=1.6),
+            boxmean=True,
+            boxpoints="all",
+            jitter=0.35,
+            pointpos=0.0,
+            customdata=customdata,
+            hovertemplate=(
+                "Turn/zone: %{x}<br>"
+                "Lap: %{customdata[0]:.0f}<br>"
+                "Steering stability: %{y:.1f} deg<br>"
+                "Event duration: %{customdata[1]:.2f} s<br>"
+                "Straight-line samples: %{customdata[5]:.0f} %<br>"
+                "Peak Brake: %{customdata[2]:.1f} %<br>"
+                "Min ax: %{customdata[3]:.2f} m/s²<br>"
+                "Speed drop: %{customdata[4]:.1f} m/s"
+                f"<extra>{run_name}</extra>"
+            ),
+        ))
+
+    if not any_trace:
+        raise ValueError("No valid steering-stability points after zone grouping.")
+
+    fig.update_layout(
+        boxmode="group",
+        legend=dict(itemsizing="constant"),
+    )
+    fig.update_xaxes(categoryorder="array", categoryarray=zone_order)
     return fig
 
 
@@ -1349,6 +2041,180 @@ def _interp_on_grid(
     return np.interp(grid, s_m[valid], values[valid])
 
 
+def _comparison_lap_label(run_name: str, lap_id: int) -> str:
+    if run_name == POTENTIAL_LAP_RUN:
+        return "Potential lap"
+    return f"{run_name} L{int(lap_id)}"
+
+
+def _lap_duration_between_distances(
+    data: dict[str, np.ndarray | float],
+    start_m: float,
+    end_m: float,
+) -> float:
+    """Return elapsed lap time [s] between two distance coordinates."""
+    s_m = np.asarray(data.get("s_m", []), dtype=float)
+    time_s = np.asarray(data.get("time_s", []), dtype=float)
+    if s_m.size < 2 or time_s.size != s_m.size:
+        return np.nan
+    if not (np.isfinite(start_m) and np.isfinite(end_m)) or end_m <= start_m:
+        return np.nan
+
+    valid = np.isfinite(s_m) & np.isfinite(time_s)
+    if int(valid.sum()) < 2:
+        return np.nan
+    s_valid = s_m[valid]
+    t_valid = time_s[valid]
+    if start_m < float(s_valid[0]) or end_m > float(s_valid[-1]):
+        return np.nan
+    t0 = float(np.interp(float(start_m), s_valid, t_valid))
+    t1 = float(np.interp(float(end_m), s_valid, t_valid))
+    duration_s = t1 - t0
+    return duration_s if np.isfinite(duration_s) and duration_s > 0.0 else np.nan
+
+
+def best_lap_for_distance_window(
+    dfs: dict[str, pl.DataFrame],
+    start_m: float,
+    end_m: float,
+) -> dict[str, float | int | str] | None:
+    """Find the real lap with the shortest elapsed time in a distance window.
+
+    Lap 0 and each run's last lap are excluded unless the dashboard already
+    applied an explicit lap selection. The returned lap is a real `(run, lap)`
+    source, not a stitched synthetic lap.
+    """
+    best: dict[str, float | int | str] | None = None
+    best_duration_s = np.inf
+
+    for run_name, df in dfs.items():
+        try:
+            lap_ids = available_laps(df).astype(int)
+        except Exception:
+            continue
+        if lap_ids.size == 0:
+            continue
+        explicit_lap_selection = COMPLETE_LAPS_MARKER in df.columns
+        max_lap = int(np.max(lap_ids))
+        for lap_id in lap_ids:
+            lap_int = int(lap_id)
+            if lap_int <= 0 or (not explicit_lap_selection and lap_int >= max_lap):
+                continue
+            try:
+                data = _lap_comparison_data(df, lap_int)
+            except Exception:
+                continue
+            duration_s = _lap_duration_between_distances(data, start_m, end_m)
+            if np.isfinite(duration_s) and duration_s < best_duration_s:
+                best_duration_s = float(duration_s)
+                best = {
+                    "run": run_name,
+                    "lap": lap_int,
+                    "duration_s": best_duration_s,
+                    "start_m": float(start_m),
+                    "end_m": float(end_m),
+                }
+    return best
+
+
+def potential_lap_from_sectors(
+    dfs: dict[str, pl.DataFrame],
+    sectors: list[object],
+    *,
+    target_spacing_m: float = 1.0,
+) -> tuple[pl.DataFrame, dict[str, object]] | None:
+    """Build a synthetic potential lap from the fastest real sector sources.
+
+    Each sector is copied from the real `(run, lap)` with the shortest elapsed
+    time over that sector's distance window. The resulting DataFrame is a
+    telemetry reference lap with stitched signals, a synthetic monotonic
+    timestamp, `laps == 1`, and a cached `dist_m` column so downstream Lap
+    Analysis code can consume it like any other lap.
+    """
+    valid_sectors = [
+        sector for sector in sectors
+        if (
+            np.isfinite(float(sector.s_start_m))
+            and np.isfinite(float(sector.s_end_m))
+            and float(sector.s_end_m) > float(sector.s_start_m)
+        )
+    ]
+    if not valid_sectors:
+        return None
+
+    segment_rows: list[dict[str, np.ndarray]] = []
+    segment_meta: list[dict[str, float | int | str | None]] = []
+    elapsed_offset_s = 0.0
+
+    for sector_idx, sector in enumerate(valid_sectors):
+        start_m = float(sector.s_start_m)
+        end_m = float(sector.s_end_m)
+        source = best_lap_for_distance_window(dfs, start_m, end_m)
+        if source is None:
+            return None
+
+        run_name = str(source["run"])
+        lap_id = int(source["lap"])
+        data = _lap_comparison_data(dfs[run_name], lap_id)
+        duration_s = float(source["duration_s"])
+        n_points = max(3, int(np.ceil((end_m - start_m) / max(target_spacing_m, 0.2))) + 1)
+        include_endpoint = sector_idx == len(valid_sectors) - 1
+        s_grid = np.linspace(start_m, end_m, n_points, endpoint=include_endpoint)
+        if s_grid.size < 2:
+            continue
+
+        src_time = _interp_on_grid(data, "time_s", s_grid)
+        src_t0 = float(np.interp(start_m, data["s_m"], data["time_s"]))
+        time_s = elapsed_offset_s + (src_time - src_t0)
+
+        rows = {
+            "TimeStamp": time_s,
+            "laps": np.full(len(s_grid), 1.0),
+            "laptime": np.full(len(s_grid), np.nan),
+            "dist_m": s_grid,
+            "VN_vx": _interp_on_grid(data, "vx_mps", s_grid),
+            "Throttle": _interp_on_grid(data, "throttle_pct", s_grid),
+            "Brake": _interp_on_grid(data, "brake_pct", s_grid),
+            "Steering": _interp_on_grid(data, "steering_rad", s_grid),
+            "Filtering_VN_ay": _interp_on_grid(data, "ay_mps2", s_grid),
+            "Filtering_VN_ax": _interp_on_grid(data, "ax_mps2", s_grid),
+            "VN_latitude": _interp_on_grid(data, "latitude", s_grid),
+            "VN_longitude": _interp_on_grid(data, "longitude", s_grid),
+        }
+        segment_rows.append(rows)
+        segment_meta.append({
+            "sector_index": int(getattr(sector, "index", sector_idx)),
+            "kind": str(getattr(sector, "kind", "")),
+            "turn_id": (
+                None
+                if getattr(sector, "turn_id", None) is None
+                else int(getattr(sector, "turn_id"))
+            ),
+            "s_start_m": start_m,
+            "s_end_m": end_m,
+            "run": run_name,
+            "lap": lap_id,
+            "duration_s": duration_s,
+        })
+        elapsed_offset_s += duration_s
+
+    if not segment_rows or not np.isfinite(elapsed_offset_s) or elapsed_offset_s <= 0.0:
+        return None
+
+    columns = list(segment_rows[0].keys())
+    stitched = {
+        col: np.concatenate([rows[col] for rows in segment_rows])
+        for col in columns
+    }
+    stitched["laptime"] = np.full(len(stitched["TimeStamp"]), elapsed_offset_s)
+    out = pl.DataFrame(stitched)
+    metadata: dict[str, object] = {
+        "lap_time_s": float(elapsed_offset_s),
+        "segments": segment_meta,
+    }
+    return out, metadata
+
+
 def lap_delta_fig(
     dfs: dict[str, pl.DataFrame],
     ref_run: str,
@@ -1372,8 +2238,8 @@ def lap_delta_fig(
     ref_t = np.interp(grid, ref["s_m"], ref["time_s"])
     cmp_t = np.interp(grid, cmp["s_m"], cmp["time_s"])
     delta = cmp_t - ref_t
-    ref_label = f"{ref_run} L{int(ref_lap)}"
-    cmp_label = f"{cmp_run} L{int(cmp_lap)}"
+    ref_label = _comparison_lap_label(ref_run, int(ref_lap))
+    cmp_label = _comparison_lap_label(cmp_run, int(cmp_lap))
 
     fig.add_trace(go.Scatter(
         x=grid,
@@ -1520,8 +2386,8 @@ def lap_comparison_arrays(
         "phase": _classify_comparison_phase(
             ref_brake, cmp_brake, ref_thr, cmp_thr, ref_ay, cmp_ay
         ),
-        "ref_label": f"{ref_run} L{int(ref_lap)}",
-        "cmp_label": f"{cmp_run} L{int(cmp_lap)}",
+        "ref_label": _comparison_lap_label(ref_run, int(ref_lap)),
+        "cmp_label": _comparison_lap_label(cmp_run, int(cmp_lap)),
         "ref_lap_time_s": float(ref["lap_time_s"]),
         "cmp_lap_time_s": float(cmp["lap_time_s"]),
     }
@@ -2498,6 +3364,18 @@ def compute_lap_analysis_corner_phases(
     return phases
 
 
+def _full_session_gps(df: pl.DataFrame | None) -> tuple[np.ndarray, np.ndarray]:
+    """Return finite (lat, lng) arrays for the entire run, in sample order."""
+    if df is None or df.is_empty():
+        return np.empty(0, dtype=float), np.empty(0, dtype=float)
+    if "VN_latitude" not in df.columns or "VN_longitude" not in df.columns:
+        return np.empty(0, dtype=float), np.empty(0, dtype=float)
+    lat = df["VN_latitude"].to_numpy().astype(float)
+    lng = df["VN_longitude"].to_numpy().astype(float)
+    ok = np.isfinite(lat) & np.isfinite(lng)
+    return lat[ok], lng[ok]
+
+
 def lap_phase_track_fig(
     dfs: dict[str, pl.DataFrame],
     ref_run: str,
@@ -2521,19 +3399,32 @@ def lap_phase_track_fig(
 
     fig = make_dark_figure("Lap Analysis Phase Map", "Longitude", "Latitude")
 
+    # Full-session GPS as a grey context layer so the user always sees the
+    # whole track (figure-8 in skidpad, full lap in circuit) rather than only
+    # the reference lap. Falls back silently if the run lacks GPS columns.
+    full_lat, full_lng = _full_session_gps(dfs.get(ref_run))
+    if full_lat.size > 0:
+        fig.add_trace(go.Scattergl(
+            x=full_lng, y=full_lat,
+            mode="lines",
+            line=dict(color="rgba(160,160,160,0.18)", width=2),
+            showlegend=False, hoverinfo="skip",
+        ))
+
     if not ok.any():
-        fig.add_annotation(
-            x=0.5, y=0.5, xref="paper", yref="paper",
-            text="GPS not available", showarrow=False,
-            font=dict(color="#EBEBEB"),
-        )
+        if full_lat.size == 0:
+            fig.add_annotation(
+                x=0.5, y=0.5, xref="paper", yref="paper",
+                text="GPS not available", showarrow=False,
+                font=dict(color="#EBEBEB"),
+            )
         return fig
 
-    # Grey baseline track
+    # Brighter outline for the reference lap on top of the session context.
     fig.add_trace(go.Scattergl(
         x=lng[ok], y=lat[ok],
         mode="lines",
-        line=dict(color="rgba(160,160,160,0.25)", width=5),
+        line=dict(color="rgba(160,160,160,0.45)", width=4),
         showlegend=False, hoverinfo="skip",
     ))
 
@@ -2638,6 +3529,17 @@ def lap_phase_track_fig(
         ),
     )
     fig.update_yaxes(scaleanchor="x", scaleratio=1.0)
+
+    # Force the visible bbox to cover the full session GPS so the second skidpad
+    # circle (or far parts of a circuit) are not clipped by scaleanchor's
+    # auto-shrinking behaviour.
+    if full_lat.size > 0:
+        lat_lo, lat_hi = float(full_lat.min()), float(full_lat.max())
+        lng_lo, lng_hi = float(full_lng.min()), float(full_lng.max())
+        lat_pad = max(0.05 * (lat_hi - lat_lo), 1e-5)
+        lng_pad = max(0.05 * (lng_hi - lng_lo), 1e-5)
+        fig.update_xaxes(range=[lng_lo - lng_pad, lng_hi + lng_pad])
+        fig.update_yaxes(range=[lat_lo - lat_pad, lat_hi + lat_pad])
     return fig
 
 
@@ -3102,7 +4004,7 @@ def corner_gg_fig(
         ay = data["ay_mps2"][mask]
         gg_s_m = s_m[mask]
         valid = np.isfinite(ax) & np.isfinite(ay)
-        label = f"{run_name} L{int(lap_id)}"
+        label = _comparison_lap_label(run_name, int(lap_id))
         fig.add_trace(go.Scatter(
             x=ay[valid],
             y=ax[valid],
@@ -3323,9 +4225,7 @@ def corner_curvature_fig(
     all_laps: list[np.ndarray] = []
 
     for i, (run_name, df) in enumerate(dfs.items()):
-        lat_accel_col = _lateral_accel_col(df)
-        speed_col = _speed_col(df)
-        d = _prep(df, extra_cols=("Steering", lat_accel_col, speed_col))
+        d, lat_accel_col, speed_col = _prep_steering_metrics(df)
         res = _steering_metrics_per_lap(d, lat_accel_col, speed_col)
         ok = np.isfinite(res["mean_curvature"]) & np.isfinite(res["lt_val"])
         if not ok.any():
@@ -3368,7 +4268,8 @@ def main() -> None:
         f"(per-lap max {summary['max_speed']:.1f})\n"
         f"Brake aggressiveness: {summary['mean_brake_aggr']:.1f}%/s | "
         f"Brake release smoothness: {summary['mean_brake_release']:.1f}%/s\n"
-        f"Steering smoothness: {summary['mean_steering_smoothness']:.3f} deg/s | "
+        f"Steering smoothness: {summary['mean_steering_smoothness']:.3f} deg | "
+        f"Steering integral: {summary['mean_steering_integral']:.1f} deg*m | "
         f"Curvature: {summary['mean_curvature']:.5f} 1/m"
     )
     print(summary["table"])
@@ -3381,6 +4282,7 @@ def main() -> None:
     braking_aggressiveness_fig(dfs).show()
     brake_release_smoothness_fig(dfs).show()
     steering_smoothness_fig(dfs).show()
+    steering_integral_fig(dfs).show()
     corner_curvature_fig(dfs).show()
 
 

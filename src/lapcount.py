@@ -26,7 +26,7 @@ from utils import cols_to_numpy, read_telemetry_csv
 
 # ── Default detection parameters ──────────────────────────────────────────────
 _EARTH_RADIUS_M = 6_378_137.0
-_LAPCOUNT_ALGO_VERSION = 3
+_LAPCOUNT_ALGO_VERSION = 4
 _LAPCOUNT_VERSION_COL = 'lapcount_version'
 _LAPCOUNT_MIN_VEL_COL = 'lapcount_min_vel_mps'
 _LAPCOUNT_GATE_HALF_WIDTH_COL = 'lapcount_gate_half_width_m'
@@ -63,7 +63,8 @@ SKIDPAD_PARAMS: dict[str, Any] = {
     'min_vel': 1.0,          # [m/s] ROS lapcount default
     'rearm_distance': 3.0,   # [m]   equivalent to ROS distMax near-line latch
     'dist_max': 3.0,         # [m]   ROS finish-line distance tolerance
-    'min_lap_time': 1.0,
+    'min_lap_time': 1.0,     # [s]   real skidpad laps are ~4-7 s; allow some slack
+    'max_lap_time': 15.0,    # [s]   anything longer is a transition between attempts
 }
 
 # Progressive fallbacks tried when the default params yield no laps.
@@ -523,7 +524,9 @@ def build_manual_lap_samples(
 
     The gate exists independently of the telemetry start, so lap 0 spans from
     the file start until the first crossing. Full laps begin at the first
-    accepted crossing and end at the next one.
+    accepted crossing and end at the next one. Pairs whose duration is NaN
+    (e.g. transitions between two skidpad attempts) are skipped and their
+    samples remain NaN; the surviving laps are numbered consecutively.
     """
     laps_s = np.full(N, np.nan)
     laptime_s = np.full(N, np.nan)
@@ -539,12 +542,17 @@ def build_manual_lap_samples(
     if len(crossing_idx) < 2 or len(lap_durations) == 0:
         return laps_s, laptime_s
 
-    for lap_id, ldur in enumerate(lap_durations, start=1):
-        start = int(np.clip(crossing_idx[lap_id - 1], 0, N))
-        end = int(np.clip(crossing_idx[lap_id], start, N))
+    next_lap_id = 1
+    for i in range(min(len(crossing_idx) - 1, len(lap_durations))):
+        ldur = float(lap_durations[i])
+        if not np.isfinite(ldur):
+            continue
+        start = int(np.clip(crossing_idx[i], 0, N))
+        end = int(np.clip(crossing_idx[i + 1], start, N))
         if end > start:
-            laps_s[start:end] = float(lap_id)
-            laptime_s[start:end] = float(ldur)
+            laps_s[start:end] = float(next_lap_id)
+            laptime_s[start:end] = ldur
+        next_lap_id += 1
 
     return laps_s, laptime_s
 
@@ -718,7 +726,14 @@ def detect_skidpad_laps_from_gate(
     t_hat: np.ndarray,
     params: dict,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Detect skidpad crossings from a centre gate, matching ROS mission 1."""
+    """Detect skidpad crossings from a centre gate, matching ROS mission 1.
+
+    ``lap_durations`` is kept aligned with ``crossing_idx`` (length =
+    ``len(crossing_idx) - 1``) by writing ``np.nan`` for gaps that fall outside
+    ``[min_lap_time, max_lap_time]``. ``build_manual_lap_samples`` interprets
+    NaN as "skip this segment", so transitions between consecutive skidpad
+    attempts are not persisted as fake laps.
+    """
     n_hat = np.array([-t_hat[1], t_hat[0]], dtype=float)
     signed_dist = (xg - finish_x) * n_hat[0] + (yg - finish_y) * n_hat[1]
 
@@ -743,8 +758,7 @@ def detect_skidpad_laps_from_gate(
             if last_cross_time is not None:
                 lap_t_cand = float(t[k] - last_cross_time)
                 valid_time = params['min_lap_time'] <= lap_t_cand <= params['max_lap_time']
-                if valid_time:
-                    lap_durations.append(lap_t_cand)
+                lap_durations.append(lap_t_cand if valid_time else np.nan)
             last_cross_time = float(t[k])
         else:
             changed = False
@@ -805,7 +819,7 @@ def _run_skidpad_detection(
         crossing_idx, crossing_times, lap_durations = detect_skidpad_laps_from_gate(
             prep['xg'], prep['yg'], prep['t'], finish_x, finish_y, cand_t_hat, gate_params,
         )
-        n_laps = int(len(lap_durations))
+        n_laps = int(np.sum(np.isfinite(lap_durations)))
         n_crossings = int(len(crossing_idx))
         if (n_laps > best_laps) or (n_laps == best_laps and n_crossings > best_crossings):
             best_result = (
@@ -818,6 +832,100 @@ def _run_skidpad_detection(
     if best_result is None:
         raise ValueError('Skidpad gate line could not be evaluated.')
     return best_result
+
+
+def _skidpad_window_xy(
+    df: pl.DataFrame, prep: dict[str, Any]
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Pick the local-XY samples that look like the skidpad-active portion.
+
+    Filters by sustained |ay| (the figure-8 corners) when ay is logged, and
+    falls back to "moving" samples otherwise. Returns None when there is not
+    enough data to estimate a gate.
+    """
+    speed = prep['speed_gps']
+    if 'Filtering_VN_ay' in df.columns:
+        ay = np.abs(
+            df['Filtering_VN_ay'].to_numpy().astype(float)[prep['valid_idx']]
+        )
+        ay_smooth = uniform_filter1d(np.where(np.isfinite(ay), ay, 0.0), size=200)
+        win = ay_smooth > 3.0
+        if int(win.sum()) < 500:
+            win = ay_smooth > 2.0
+    else:
+        win = speed > 5.0
+    if int(win.sum()) < 300:
+        return None
+    return prep['xg'][win], prep['yg'][win]
+
+
+def estimate_skidpad_gate_from_gps(
+    df: pl.DataFrame,
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """Estimate a skidpad centre-gate line from GPS via a local search.
+
+    Strategy: anchor on the mean of the high-|ay| samples, derive a starting
+    orientation from PCA (the gate is perpendicular to the long axis of the
+    figure-8), then sweep a small grid of positions and orientations and pick
+    the gate whose detected lap_durations are most numerous and consistent.
+    Returns ``((lon0, lat0), (lon1, lat1))`` or ``None`` when no plausible
+    gate could be found.
+    """
+    try:
+        prep = _prepare_detection_inputs(df)
+    except Exception:
+        return None
+    win = _skidpad_window_xy(df, prep)
+    if win is None:
+        return None
+    x_in, y_in = win
+    midx0, midy0 = float(np.mean(x_in)), float(np.mean(y_in))
+    cov = np.cov(x_in - midx0, y_in - midy0)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    pc1 = eigvecs[:, int(np.argmax(eigvals))]
+    base_angle = float(np.arctan2(-pc1[0], pc1[1]))  # perpendicular to PC1
+
+    pos_offsets = np.linspace(-6.0, 6.0, 5)
+    angle_offsets = np.deg2rad([-20.0, -10.0, 0.0, 10.0, 20.0])
+    half_m = 5.0
+
+    best_score = (-1, -1.0)
+    best_gate: tuple[tuple[float, float], tuple[float, float]] | None = None
+    for dx in pos_offsets:
+        for dy in pos_offsets:
+            cx, cy = midx0 + dx, midy0 + dy
+            for ang_off in angle_offsets:
+                theta = base_angle + ang_off
+                t_hat = np.array([np.cos(theta), np.sin(theta)], dtype=float)
+                gx = np.array([cx + half_m * t_hat[0], cx - half_m * t_hat[0]])
+                gy = np.array([cy + half_m * t_hat[1], cy - half_m * t_hat[1]])
+                gate_lat, gate_lon = local_xy_to_gps(
+                    gx, gy, prep['lat0_deg'], prep['lon0_deg'],
+                )
+                gate = (
+                    (float(gate_lon[0]), float(gate_lat[0])),
+                    (float(gate_lon[1]), float(gate_lat[1])),
+                )
+                try:
+                    _, _, lap_durations, *_ = _run_skidpad_detection(prep, gate)
+                except Exception:
+                    continue
+                durs = np.asarray(lap_durations, dtype=float)
+                plausible = durs[(durs >= 3.0) & (durs <= 15.0)]
+                n = int(len(plausible))
+                if n >= 2:
+                    cv = float(np.std(plausible) / max(np.mean(plausible), 1e-3))
+                    consistency = 1.0 / (1.0 + cv)
+                else:
+                    consistency = 0.0
+                score = (n, consistency)
+                if score > best_score:
+                    best_score = score
+                    best_gate = gate
+
+    if best_score[0] <= 0:
+        return None
+    return best_gate
 
 
 def _write_csv_atomic(df: pl.DataFrame, csv_path: str | pathlib.Path) -> None:
@@ -928,30 +1036,67 @@ def detect_and_write_laps(
         )
         detected_laps = int(len(lap_durations))
     elif lap_mode == 'skidpad':
-        if gate_line_lonlat is None:
-            raise ValueError(
-                'Skidpad lap detection requires gate_line_lonlat. '
-                'The ROS lapcount receives this line from SkidpadData; '
-                'offline CSV detection needs the equivalent user-defined gate.'
-            )
-        skidpad_result = _run_skidpad_detection(prep, gate_line_lonlat, params=params)
+        # Try the explicit (manual) gate first when supplied; if it yields no
+        # plausible laps, fall back to GPS-based auto-estimation. This keeps
+        # user-drawn gates authoritative while rescuing CSVs whose stored
+        # gate is mis-positioned (e.g. copied from another test).
+        chosen_gate = gate_line_lonlat
+        skidpad_result = None
+        if chosen_gate is not None:
+            try:
+                skidpad_result = _run_skidpad_detection(prep, chosen_gate, params=params)
+            except Exception:
+                skidpad_result = None
+            if skidpad_result is not None and int(np.sum(np.isfinite(skidpad_result[2]))) < 2:
+                skidpad_result = None
+        if skidpad_result is None:
+            auto_gate = estimate_skidpad_gate_from_gps(df)
+            if auto_gate is None:
+                if chosen_gate is None:
+                    raise ValueError(
+                        'Skidpad lap detection needs a centre-gate line and '
+                        'GPS auto-estimation could not find one. Draw the '
+                        'gate manually in the dashboard.'
+                    )
+                # Stick with the user gate even if it produced 0 laps so the
+                # CSV records what was attempted; downstream UI surfaces 0 laps.
+                skidpad_result = _run_skidpad_detection(prep, chosen_gate, params=params)
+            else:
+                chosen_gate = auto_gate
+                skidpad_result = _run_skidpad_detection(prep, chosen_gate, params=params)
         crossing_idx_valid, _, lap_durations, _fx, _fy, _t_hat, used_params = skidpad_result
         laps_valid, laptime_valid = build_manual_lap_samples(
             crossing_idx_valid, lap_durations, len(prep['valid_idx']),
         )
-        gate_lon0 = float(gate_line_lonlat[0][0])
-        gate_lat0 = float(gate_line_lonlat[0][1])
-        gate_lon1 = float(gate_line_lonlat[1][0])
-        gate_lat1 = float(gate_line_lonlat[1][1])
+        gate_lon0 = float(chosen_gate[0][0])
+        gate_lat0 = float(chosen_gate[0][1])
+        gate_lon1 = float(chosen_gate[1][0])
+        gate_lat1 = float(chosen_gate[1][1])
         used_params = {**used_params, 'min_vel': np.nan}
-        detected_laps = int(len(lap_durations))
+        detected_laps = int(np.sum(np.isfinite(lap_durations)))
     elif gate_line_lonlat is None:
         result = _run_detection_attempts(
             prep['xg'], prep['yg'], prep['speed_gps'], prep['t'], params=params,
         )
         if result is not None:
-            crossing_idx_valid, _, lap_durations, gate_idx_valid, *_tail, used_params = result
+            (
+                crossing_idx_valid,
+                _crossing_times,
+                lap_durations,
+                gate_idx_valid,
+                finish_x,
+                finish_y,
+                t_hat,
+                used_params,
+            ) = result
             gate_time_s = float(prep['t'][gate_idx_valid])
+            gate_lon0, gate_lat0, gate_lon1, gate_lat1 = _gate_lonlat_from_local(
+                prep,
+                finish_x,
+                finish_y,
+                t_hat,
+                float(used_params['gate_half_width']),
+            )
         laps_valid, laptime_valid = build_lap_samples(
             gate_idx_valid, crossing_idx_valid, lap_durations, len(prep['valid_idx']),
         )

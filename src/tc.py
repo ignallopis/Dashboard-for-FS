@@ -815,14 +815,6 @@ def _tc_objective_figures(
                 "<extra></extra>"
             ),
         ))
-    fig_box.add_trace(go.Scatter(
-        x=list(WHEELS),
-        y=[over_thr] * len(WHEELS),
-        mode="lines",
-        name="Overslip threshold",
-        line=dict(color="rgba(255,255,255,0.65)", dash="dash", width=1.3),
-        hoverinfo="skip",
-    ))
     fig_box.update_yaxes(range=[-0.02, 0.45])
     figs.append(fig_box)
 

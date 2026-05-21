@@ -789,6 +789,65 @@ def select_reference_lap(dfs: dict[str, pl.DataFrame]) -> tuple[str, int]:
     raise ValueError("No valid laps available for cornering reference selection.")
 
 
+def detect_skidpad_turn_on_lap(
+    d: dict[str, np.ndarray], lap_id: int,
+) -> list[TurnDef]:
+    """Skidpad: each timed lap is a single sustained-radius circle.
+
+    Returns a single TurnDef spanning the full lap, with the apex placed at
+    the point of minimum smoothed radius (max curvature). Used in place of
+    `detect_turns_on_lap` when the data is tagged as a skidpad event, since
+    the generic detector splits the constant-radius circle into spurious
+    sub-corners.
+    """
+    lap = _lap_arrays(d, lap_id)
+    n = len(lap["s_lap_m"])
+    if n < 2:
+        return []
+    finite_geom = (
+        np.isfinite(lap["s_lap_m"])
+        & np.isfinite(lap["lat"])
+        & np.isfinite(lap["lng"])
+    )
+    if not np.any(finite_geom):
+        return []
+    valid_idx = np.where(finite_geom)[0]
+    start = int(valid_idx[0])
+    end = int(valid_idx[-1])
+    segment = slice(start, end + 1)
+
+    curvature_seg = lap["curvature_smooth_1pm"][segment]
+    finite_curvature = np.isfinite(curvature_seg)
+    if np.any(finite_curvature):
+        local = int(np.nanargmax(np.where(finite_curvature, curvature_seg, np.nan)))
+        apex_idx = start + local
+        s_apex, apex_lat, apex_lng = _refine_apex(
+            lap["curvature_smooth_1pm"],
+            lap["s_lap_m"],
+            lap["lat"],
+            lap["lng"],
+            apex_idx,
+        )
+    else:
+        mid = (start + end) // 2
+        s_apex = float(lap["s_lap_m"][mid])
+        apex_lat = float(lap["lat"][mid])
+        apex_lng = float(lap["lng"][mid])
+
+    return [
+        TurnDef(
+            turn_id=1,
+            s_entry_m=float(lap["s_lap_m"][start]),
+            s_apex_m=s_apex,
+            s_exit_m=float(lap["s_lap_m"][end]),
+            apex_lat=apex_lat,
+            apex_lng=apex_lng,
+            lat=lap["lat"][segment].copy(),
+            lng=lap["lng"][segment].copy(),
+        )
+    ]
+
+
 def detect_turns_on_lap(
     d: dict[str, np.ndarray], run_name: str, lap_id: int,
     *, R_thr_m: float = 60.0, min_dur_s: float = 0.5, merge_gap_m: float = 8.0,

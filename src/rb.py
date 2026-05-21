@@ -23,6 +23,7 @@ from utils import (
     exclude_lap0_and_last_lap,
     keep_min_duration_segments,
     make_dark_figure,
+    per_lap_axis,
     robust_dt,
     smooth_signal,
     unique_laps,
@@ -309,6 +310,73 @@ def _lockup_events(
         "counts_by_lap": counts_by_lap,
         "worst_min_sr": worst_min_sr,
         "count_total": int(sum(counts_by_wheel.values())),
+    }
+
+
+def _lockup_per_lap(
+    laps: np.ndarray,
+    laptime_s: np.ndarray,
+    brake_mask: np.ndarray,
+    lock_masks_by_wheel: dict[str, np.ndarray],
+    dt_s: float,
+) -> dict[str, object]:
+    lap_list = unique_laps(laps)
+    n_laps = len(lap_list)
+    lap_time_vals_s = np.full(n_laps, np.nan, dtype=float)
+    brake_time_s = np.full(n_laps, np.nan, dtype=float)
+    total_lock_time_s = np.full(n_laps, np.nan, dtype=float)
+    total_lock_pct_brake = np.full(n_laps, np.nan, dtype=float)
+    lock_time_s_by_wheel = {
+        wheel: np.full(n_laps, np.nan, dtype=float) for wheel in WHEELS
+    }
+    lock_events_by_wheel = {
+        wheel: np.zeros(n_laps, dtype=int) for wheel in WHEELS
+    }
+
+    for idx, lap in enumerate(lap_list):
+        lap_mask = laps == lap
+        if not np.any(lap_mask):
+            continue
+
+        lap_time_vals_s[idx] = float(np.nanmax(laptime_s[lap_mask]))
+        lap_brake_time_s = float(np.sum(brake_mask[lap_mask]) * dt_s)
+        brake_time_s[idx] = lap_brake_time_s
+
+        lap_total_lock_time_s = 0.0
+        for wheel in WHEELS:
+            wheel_lock_mask = lap_mask & lock_masks_by_wheel[wheel]
+            wheel_lock_time_s = float(np.sum(wheel_lock_mask) * dt_s)
+            lock_time_s_by_wheel[wheel][idx] = wheel_lock_time_s
+            lock_events_by_wheel[wheel][idx] = len(_segment_bounds(wheel_lock_mask))
+            lap_total_lock_time_s += wheel_lock_time_s
+
+        total_lock_time_s[idx] = lap_total_lock_time_s
+        total_lock_pct_brake[idx] = (
+            100.0 * lap_total_lock_time_s / lap_brake_time_s
+            if lap_brake_time_s > 1e-9
+            else np.nan
+        )
+
+    table_dict: dict[str, np.ndarray] = {
+        "Lap": lap_list.astype(int),
+        "LapTime [s]": np.round(lap_time_vals_s, 3),
+        "Brake time [s]": np.round(brake_time_s, 3),
+        "Total lock time [s]": np.round(total_lock_time_s, 3),
+        "Total lock / brake [%]": np.round(total_lock_pct_brake, 2),
+    }
+    for wheel in WHEELS:
+        table_dict[f"{wheel} lock time [s]"] = np.round(lock_time_s_by_wheel[wheel], 3)
+        table_dict[f"{wheel} lock events"] = lock_events_by_wheel[wheel].astype(int)
+
+    return {
+        "lap_list": lap_list,
+        "lap_time_vals_s": lap_time_vals_s,
+        "brake_time_s": brake_time_s,
+        "total_lock_time_s": total_lock_time_s,
+        "total_lock_pct_brake": total_lock_pct_brake,
+        "lock_time_s_by_wheel": lock_time_s_by_wheel,
+        "lock_events_by_wheel": lock_events_by_wheel,
+        "table": pl.DataFrame(table_dict),
     }
 
 
@@ -619,7 +687,10 @@ def _prepare_braking_regen_arrays(df: pl.DataFrame) -> dict[str, np.ndarray]:
     return exclude_lap0_and_last_lap(d)
 
 
-def _braking_regen_analysis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
+def _braking_regen_analysis(
+    df: pl.DataFrame,
+    x_mode: str = "laps",
+) -> tuple[list[go.Figure], dict]:
     d = _prepare_braking_regen_arrays(df)
     time_s = d["time"]
     dt_s = robust_dt(time_s)
@@ -717,6 +788,13 @@ def _braking_regen_analysis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
         {wheel: d[f"Est_SR{wheel}"] for wheel in WHEELS},
         d["laps"],
         brake_event_mask,
+        dt_s,
+    )
+    lockup_per_lap = _lockup_per_lap(
+        d["laps"],
+        d["laptime"],
+        brake_event_mask,
+        lockup_info["masks_by_wheel"],
         dt_s,
     )
     sr = {wheel: d[f"Est_SR{wheel}"] for wheel in WHEELS}
@@ -963,6 +1041,11 @@ def _braking_regen_analysis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
         "lockup_events_by_wheel": lockup_info["counts_by_wheel"],
         "lockup_events_by_lap": lockup_info["counts_by_lap"],
         "lockup_worst_sr": lockup_info["worst_min_sr"],
+        "lockup_total_time_s": float(np.nansum(lockup_per_lap["total_lock_time_s"])),
+        "lockup_mean_time_per_lap_s": _safe_mean(lockup_per_lap["total_lock_time_s"]),
+        "lockup_peak_lap_time_s": _safe_max(lockup_per_lap["total_lock_time_s"]),
+        "lockup_total_pct_brake": _safe_mean(lockup_per_lap["total_lock_pct_brake"]),
+        "lockup_per_lap_table": lockup_per_lap["table"],
         "sr_steady_oscillation_p95": _safe_p95(sr_steady_event_arr),
         "sr_steady_oscillation_worst": _safe_max(sr_steady_event_arr),
         "sr_steady_oscillation_p95_by_wheel": {
@@ -1065,6 +1148,45 @@ def _braking_regen_analysis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
         hoverinfo="skip",
     ))
 
+    x_axis_mode = x_mode if x_mode in ("laps", "laptime") else "laps"
+    lock_x, lock_order, lock_xlabel = per_lap_axis(
+        lockup_per_lap["lap_list"],
+        lockup_per_lap["lap_time_vals_s"],
+        x_axis_mode,
+    )
+    fig_lock_time = make_dark_figure(
+        title="Wheel locking time per lap",
+        xlabel=lock_xlabel,
+        ylabel="Lock time [s]",
+    )
+    for wheel in WHEELS:
+        wheel_vals = lockup_per_lap["lock_time_s_by_wheel"][wheel][lock_order]
+        fig_lock_time.add_trace(go.Scatter(
+            x=lock_x,
+            y=wheel_vals,
+            mode="lines+markers",
+            name=wheel,
+            line=dict(color=WHEEL_COLORS[wheel], width=2.0),
+            marker=dict(
+                color=WHEEL_COLORS[wheel],
+                size=7,
+                symbol=WHEEL_SYMBOLS[wheel],
+            ),
+            customdata=np.column_stack([
+                lockup_per_lap["lap_list"][lock_order],
+                lockup_per_lap["lock_events_by_wheel"][wheel][lock_order],
+            ]),
+            hovertemplate=(
+                f"{wheel}"
+                f"<br>{lock_xlabel} %{{x:.3f}}" if x_axis_mode == "laptime"
+                else f"{wheel}<br>{lock_xlabel} %{{x:.0f}}"
+            )
+            + "<br>Lock time %{y:.3f} s"
+            + "<br>Lock events %{customdata[1]:.0f}"
+            + "<br>Lap %{customdata[0]:.0f}"
+            + "<extra></extra>",
+        ))
+
     fig_wheel_fz_torque = make_dark_figure(
         title="Braking torque vs vertical load by wheel across braking events",
         xlabel="Mean wheel Fz [N]",
@@ -1152,7 +1274,7 @@ def _braking_regen_analysis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
         fig_wheel_fz_torque.update_xaxes(range=[x0, x1])
         fig_wheel_fz_torque.update_yaxes(range=[0.0, max(trq_max + trq_pad, slope_nm_per_n * x1 if np.isfinite(slope_nm_per_n) else 0.0)])
 
-    return [fig_torque_decel, fig_min_sr, fig_wheel_fz_torque], kpis
+    return [fig_torque_decel, fig_min_sr, fig_lock_time, fig_wheel_fz_torque], kpis
 
 
 def rb_figs_kpis(
@@ -1160,8 +1282,8 @@ def rb_figs_kpis(
     brake_mask: np.ndarray | None = None,
     x_mode: str = "laps",
 ) -> tuple[list[go.Figure], dict]:
-    del brake_mask, x_mode
-    return _braking_regen_analysis(df)
+    del brake_mask
+    return _braking_regen_analysis(df, x_mode=x_mode)
 
 
 def main() -> None:

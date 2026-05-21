@@ -15,7 +15,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from src import cornering
-from src.dynamics import IZ_KGM2
+from src.dynamics import IZ_KGM2, STEERING_RATIO
 
 from utils import (
     COMPLETE_LAPS_MARKER,
@@ -687,7 +687,7 @@ def yaw_rate_triple_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
         real = desired - arr['TV_errorYawRate']
 
     vx = arr[vx_col]
-    steer = arr['Steering']
+    steer = arr['Steering'] / STEERING_RATIO
     with np.errstate(divide='ignore', invalid='ignore'):
         implied = steer * vx / WHEELBASE_M
     implied = np.where(np.abs(vx) >= MIN_SPEED, implied, np.nan)
@@ -778,7 +778,7 @@ def tv_control_attribution_figs_kpis(df: pl.DataFrame) -> tuple[list[go.Figure],
 
     time_s = df["TimeStamp"].to_numpy().astype(float) - float(df["TimeStamp"][0])
     dist_m = lap_dist_from_gps(df)
-    steering = df["Steering"].to_numpy().astype(float)
+    steering = df["Steering"].to_numpy().astype(float) / STEERING_RATIO
     ay_col = _ay_signal(df.columns)
     vx_col = _vx_signal(df.columns)
     ay = df[ay_col].to_numpy().astype(float)

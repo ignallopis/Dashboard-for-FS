@@ -36,6 +36,7 @@ MIN_CORNER_DURATION = 0.20   # [s]    min cornering event length
 MIN_CORNER_SAMPLES  = 50     # per lap
 
 WHEELBASE_EQ        = 1.53   # [m]  equivalent wheelbase for bicycle model
+STEERING_RATIO      = 3.15   # [-]  Steering channel to road-wheel angle
 MIN_SA_MEAN_DEG     = 1.0    # [deg] slip angles below this are ignored
 MAX_SA_MEAN_DEG     = 15.0   # [deg]
 MAX_SA_EFF          = 5.0    # [m/s²/deg] sanity cap on efficiency
@@ -102,6 +103,11 @@ _US_COLS_COG = ['TimeStamp', 'laps', 'laptime',
                 'Steering', 'Filtering_VN_ay', 'Est_vxCOG']
 _US_COLS_VX  = ['TimeStamp', 'laps', 'laptime',
                 'Steering', 'Filtering_VN_ay', 'VN_vx']
+_US_LLTD_FZ_COLS = ['Est_FZFL', 'Est_FZFR', 'Est_FZRL', 'Est_FZRR']
+_LLTD_SETUP_COLS = [
+    'TimeStamp', 'laps', 'laptime', 'Filtering_VN_ay', 'VN_vx',
+    'Est_FZFL', 'Est_FZFR', 'Est_FZRL', 'Est_FZRR',
+]
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -419,7 +425,7 @@ def _compute_understeer(
     d = exclude_lap0_and_last_lap(d)
 
     dt       = robust_dt(d['time'])
-    steering = d['Steering']
+    steering = d['Steering'] / STEERING_RATIO
     ay_filt  = d['Filtering_VN_ay']
     vx       = d['vx']
     laps     = d['laps']
@@ -437,7 +443,8 @@ def _compute_understeer(
             min_duration_s=MIN_CORNER_DURATION,
         )
 
-    # Bicycle model: δ_ideal = L·ay / vx²
+    # Bicycle model: δ_ideal = L·ay / vx².  `Steering` is converted to
+    # road-wheel angle with the CAT17x steering ratio before comparison.
     ideal_steer = WHEELBASE_EQ * ay_filt / (vx ** 2)
     und_rad     = np.abs(steering) - np.abs(ideal_steer)
     und_deg     = np.rad2deg(und_rad)
@@ -559,6 +566,421 @@ def understeer_angle_kpis(
         "mean_corner_samples": float(np.nanmean(valid_samples)),
         "table": table,
         "warnings": [],
+    }
+
+
+def _understeer_lltd_table_for_run(df: pl.DataFrame, run_name: str) -> tuple[pl.DataFrame, list[str]]:
+    """Per-lap understeer angle and front lateral load transfer distribution."""
+    vx_col = 'Est_vxCOG' if 'Est_vxCOG' in df.columns else 'VN_vx'
+    required = ['TimeStamp', 'laps', 'laptime', 'Steering', 'Filtering_VN_ay', vx_col, *_US_LLTD_FZ_COLS]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        return pl.DataFrame(), [f"Missing understeer/LLTD columns: {missing}"]
+
+    try:
+        arr = _from_df(df, required)
+    except Exception as exc:
+        return pl.DataFrame(), [str(exc)]
+
+    arr['vx'] = arr.pop(vx_col)
+    valid_cols = [c for c in required if c != vx_col] + ['vx']
+    valid = _base_validity(*(arr[c] for c in valid_cols if c in arr)) & (np.abs(arr['vx']) >= 4.0)
+    arr = {k: v[valid] for k, v in arr.items()}
+    try:
+        arr = exclude_lap0_and_last_lap(arr)
+    except ValueError as exc:
+        return pl.DataFrame(), [str(exc)]
+    if arr['TimeStamp'].size == 0:
+        return pl.DataFrame(), ["No valid samples for understeer/LLTD."]
+
+    time_s = arr['TimeStamp'] - arr['TimeStamp'][0]
+    dt = robust_dt(time_s)
+    vx = arr['vx']
+    ay = arr['Filtering_VN_ay']
+    corner_mask, _radius_m = _radius_corner_mask(
+        vx,
+        ay,
+        dt,
+        radius_threshold_m=60.0,
+        min_speed_mps=4.0,
+        min_duration_s=MIN_CORNER_DURATION,
+    )
+
+    steering = arr['Steering'] / STEERING_RATIO
+    ideal_steer = WHEELBASE_EQ * ay / (vx ** 2)
+    understeer_deg = np.rad2deg(np.abs(steering) - np.abs(ideal_steer))
+
+    dfz_front_n = arr['Est_FZFR'] - arr['Est_FZFL']
+    dfz_rear_n = arr['Est_FZRR'] - arr['Est_FZRL']
+    denom_n = np.abs(dfz_front_n) + np.abs(dfz_rear_n)
+    lltd_front_pct = 100.0 * np.divide(
+        np.abs(dfz_front_n),
+        denom_n,
+        out=np.full_like(denom_n, np.nan, dtype=float),
+        where=np.isfinite(denom_n) & (denom_n > 1.0),
+    )
+
+    rows: list[dict[str, object]] = []
+    laps = arr['laps']
+    laptime = arr['laptime']
+    for lap in unique_laps(laps):
+        lap_mask = laps == lap
+        corner_lap_mask = (
+            lap_mask
+            & corner_mask
+            & np.isfinite(understeer_deg)
+            & np.isfinite(lltd_front_pct)
+        )
+        n_samples = int(corner_lap_mask.sum())
+        if n_samples < MIN_CORNER_SAMPLES:
+            continue
+        us_mean_deg = float(np.nanmean(understeer_deg[corner_lap_mask]))
+        lltd_median_pct = float(np.nanmedian(lltd_front_pct[corner_lap_mask]))
+        if not np.isfinite(us_mean_deg) or not np.isfinite(lltd_median_pct):
+            continue
+        if abs(us_mean_deg) >= 20.0:
+            continue
+        rows.append({
+            'Run': run_name,
+            'Lap': int(_display_laps(np.array([lap]))[0]),
+            'LapTime [s]': float(np.nanmax(laptime[lap_mask])) if lap_mask.any() else np.nan,
+            'Mean understeer [deg]': us_mean_deg,
+            'Front LLTD [%]': lltd_median_pct,
+            'Corner samples': n_samples,
+        })
+
+    if not rows:
+        return pl.DataFrame(), ["No valid radius-filtered corner laps for understeer/LLTD."]
+    return pl.DataFrame(rows), []
+
+
+def understeer_vs_lltd_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Per-lap understeer angle versus front lateral load transfer distribution."""
+    fig = make_dark_figure(
+        'Understeer Angle vs LLTD',
+        'Front lateral load transfer distribution [%]',
+        'Mean understeer angle [deg]',
+    )
+
+    tables: list[pl.DataFrame] = []
+    warnings: list[str] = []
+    run_summaries: dict[str, dict[str, float | int]] = {}
+    all_x: list[float] = []
+    all_y: list[float] = []
+    colors = ['#4DB3F2', '#F28C40', '#73D973', '#F27070', '#D973D9', '#F2C94C']
+
+    for run_idx, (run_name, df) in enumerate(dfs.items()):
+        table, run_warnings = _understeer_lltd_table_for_run(df, run_name)
+        warnings.extend(f"{run_name}: {w}" for w in run_warnings)
+        if table.is_empty():
+            continue
+        tables.append(table)
+        x = table['Front LLTD [%]'].to_numpy()
+        y = table['Mean understeer [deg]'].to_numpy()
+        laps = table['Lap'].to_numpy()
+        laptimes = table['LapTime [s]'].to_numpy()
+        samples = table['Corner samples'].to_numpy()
+        color = colors[run_idx % len(colors)]
+        customdata = np.column_stack([laps, laptimes, samples])
+        fig.add_trace(go.Scatter(
+            x=x,
+            y=y,
+            mode='markers',
+            name=run_name,
+            marker=dict(
+                color=color,
+                size=10,
+                opacity=0.82,
+                line=dict(color='#EBEBEB', width=0.7),
+            ),
+            customdata=customdata,
+            hovertemplate=(
+                'Front LLTD=%{x:.1f}%<br>'
+                'Mean understeer=%{y:+.2f} deg<br>'
+                'Lap=%{customdata[0]:.0f}<br>'
+                'LapTime=%{customdata[1]:.2f} s<br>'
+                'samples=%{customdata[2]:.0f}<extra></extra>'
+            ),
+        ))
+        run_summaries[run_name] = {
+            'points': int(len(x)),
+            'lltd_front_mean_pct': float(np.nanmean(x)),
+            'understeer_mean_deg': float(np.nanmean(y)),
+        }
+        all_x.extend(x[np.isfinite(x) & np.isfinite(y)].astype(float).tolist())
+        all_y.extend(y[np.isfinite(x) & np.isfinite(y)].astype(float).tolist())
+
+    x_all = np.asarray(all_x, dtype=float)
+    y_all = np.asarray(all_y, dtype=float)
+    slope = np.nan
+    intercept = np.nan
+    r2 = np.nan
+    lltd_span_pct = float(np.nanmax(x_all) - np.nanmin(x_all)) if x_all.size else np.nan
+    if x_all.size >= 2 and lltd_span_pct >= 0.25:
+        slope, intercept = np.polyfit(x_all, y_all, 1)
+        x_fit = np.linspace(float(np.nanmin(x_all)), float(np.nanmax(x_all)), 120)
+        y_fit = slope * x_fit + intercept
+        y_hat = slope * x_all + intercept
+        ss_res = float(np.nansum((y_all - y_hat) ** 2))
+        ss_tot = float(np.nansum((y_all - np.nanmean(y_all)) ** 2))
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else np.nan
+        fig.add_trace(go.Scatter(
+            x=x_fit,
+            y=y_fit,
+            mode='lines',
+            name='Trend',
+            line=dict(color='#F2D44D', width=2.0, dash='dash'),
+            hovertemplate='Trend<br>LLTD=%{x:.1f}%<br>US=%{y:+.2f} deg<extra></extra>',
+        ))
+        fig.add_annotation(
+            xref='paper',
+            yref='paper',
+            x=0.99,
+            y=0.98,
+            xanchor='right',
+            yanchor='top',
+            showarrow=False,
+            text=f'y = {slope:+.2f}x {intercept:+.2f}<br>R² = {r2:.2f}',
+            font=dict(size=12, color='#EBEBEB'),
+            bgcolor='rgba(20,20,23,0.78)',
+            bordercolor='rgba(128,128,128,0.30)',
+            borderwidth=1,
+            borderpad=4,
+        )
+    elif x_all.size >= 2:
+        warnings.append(
+            f"Front LLTD span is only {lltd_span_pct:.2f} percentage points; "
+            "trend fit is not meaningful. The Est_FZ front/rear transfer is "
+            "effectively proportional in this data selection, so LLTD behaves "
+            "like a fixed setup parameter."
+        )
+
+    theory_share_pct = KROLLF_NMRAD / (KROLLF_NMRAD + KROLLR_NMRAD) * 100.0
+    fig.add_vline(
+        x=theory_share_pct,
+        line=dict(color='#73D973', width=1.6, dash='dot'),
+        annotation_text=f'Kroll split {theory_share_pct:.1f}%',
+        annotation_position='top left',
+    )
+    fig.add_hline(y=0.0, line=dict(color='rgba(200,200,200,0.5)', width=1.2, dash='dash'))
+    fig.update_layout(
+        height=540,
+        margin=dict(l=70, r=35, t=55, b=65),
+        hovermode='closest',
+        legend=dict(
+            bgcolor='rgba(20,20,23,0.85)',
+            bordercolor='rgba(128,128,128,0.3)',
+            orientation='h',
+            yanchor='bottom',
+            y=1.02,
+            xanchor='right',
+            x=1.0,
+        ),
+    )
+    if x_all.size:
+        x_pad = max(1.0, (float(np.nanmax(x_all)) - float(np.nanmin(x_all))) * 0.12)
+        y_pad = max(0.5, (float(np.nanmax(y_all)) - float(np.nanmin(y_all))) * 0.16)
+        fig.update_xaxes(range=[float(np.nanmin(x_all)) - x_pad, float(np.nanmax(x_all)) + x_pad])
+        fig.update_yaxes(range=[float(np.nanmin(y_all)) - y_pad, float(np.nanmax(y_all)) + y_pad])
+
+    table_all = pl.concat(tables, how='vertical') if tables else pl.DataFrame()
+    return fig, {
+        'points': int(x_all.size),
+        'slope_deg_per_lltd_pct': float(slope),
+        'intercept_deg': float(intercept),
+        'r2': float(r2),
+        'lltd_mean_pct': float(np.nanmean(x_all)) if x_all.size else np.nan,
+        'lltd_span_pct': float(lltd_span_pct),
+        'lltd_theoretical_pct': float(theory_share_pct),
+        'table': table_all,
+        'runs': run_summaries,
+        'warnings': warnings,
+    }
+
+
+def _lltd_mid_corner_table_for_run(df: pl.DataFrame, run_name: str) -> tuple[pl.DataFrame, list[str]]:
+    """Per-lap front LLTD using only mid-corner samples."""
+    missing = [c for c in _LLTD_SETUP_COLS if c not in df.columns]
+    if missing:
+        return pl.DataFrame(), [f"Missing LLTD setup columns: {missing}"]
+    try:
+        arr = _from_df(df, _LLTD_SETUP_COLS)
+    except Exception as exc:
+        return pl.DataFrame(), [str(exc)]
+
+    valid = _base_validity(*(arr[c] for c in _LLTD_SETUP_COLS)) & (np.abs(arr['VN_vx']) >= 4.0)
+    arr = {k: v[valid] for k, v in arr.items()}
+    try:
+        arr = exclude_lap0_and_last_lap(arr)
+    except ValueError as exc:
+        return pl.DataFrame(), [str(exc)]
+    if arr['TimeStamp'].size == 0:
+        return pl.DataFrame(), ["No valid samples for LLTD setup metric."]
+
+    time_s = arr['TimeStamp'] - arr['TimeStamp'][0]
+    dt = robust_dt(time_s)
+    corner_mask, _radius_m = _radius_corner_mask(
+        arr['VN_vx'],
+        arr['Filtering_VN_ay'],
+        dt,
+        radius_threshold_m=60.0,
+        min_speed_mps=4.0,
+        min_duration_s=MIN_CORNER_DURATION,
+    )
+
+    dfz_front_n = arr['Est_FZFR'] - arr['Est_FZFL']
+    dfz_rear_n = arr['Est_FZRR'] - arr['Est_FZRL']
+    denom_n = np.abs(dfz_front_n) + np.abs(dfz_rear_n)
+    lltd_front_pct = 100.0 * np.divide(
+        np.abs(dfz_front_n),
+        denom_n,
+        out=np.full_like(denom_n, np.nan, dtype=float),
+        where=np.isfinite(denom_n) & (denom_n > 1.0),
+    )
+    ay_abs = np.abs(arr['Filtering_VN_ay'])
+
+    rows: list[dict[str, object]] = []
+    for lap in unique_laps(arr['laps']):
+        lap_mask = arr['laps'] == lap
+        lap_corner = lap_mask & corner_mask & np.isfinite(lltd_front_pct) & np.isfinite(ay_abs)
+        if int(lap_corner.sum()) < MIN_CORNER_SAMPLES:
+            continue
+        ay_corner = ay_abs[lap_corner]
+        ay_threshold = max(AY_THRESHOLD, float(np.nanpercentile(ay_corner, 60.0)))
+        mid_corner = lap_corner & (ay_abs >= ay_threshold)
+        if int(mid_corner.sum()) < max(20, MIN_CORNER_SAMPLES // 5):
+            mid_corner = lap_corner
+        lltd_vals = lltd_front_pct[mid_corner]
+        if not np.any(np.isfinite(lltd_vals)):
+            continue
+        rows.append({
+            'Run': run_name,
+            'Lap': int(_display_laps(np.array([lap]))[0]),
+            'LapTime [s]': float(np.nanmax(arr['laptime'][lap_mask])) if lap_mask.any() else np.nan,
+            'LLTD mid-corner avg [%]': float(np.nanmean(lltd_vals)),
+            'LLTD mid-corner median [%]': float(np.nanmedian(lltd_vals)),
+            'LLTD mid-corner span [pp]': float(np.nanmax(lltd_vals) - np.nanmin(lltd_vals)),
+            'Mid-corner samples': int(mid_corner.sum()),
+            'Corner samples': int(lap_corner.sum()),
+        })
+
+    if not rows:
+        return pl.DataFrame(), ["No valid mid-corner samples for LLTD setup metric."]
+    return pl.DataFrame(rows), []
+
+
+def lltd_mid_corner_per_lap_fig(
+    dfs: dict[str, pl.DataFrame],
+    x_mode: str = 'laps',
+) -> tuple[go.Figure, dict]:
+    """Setup metric: average front LLTD in mid-corner samples, per lap."""
+    fig = make_dark_figure(
+        'LLTD Mid-Corner Avg',
+        'Lap',
+        'Front LLTD mid-corner avg [%]',
+    )
+    tables: list[pl.DataFrame] = []
+    warnings: list[str] = []
+    runs: dict[str, dict[str, float | int]] = {}
+    colors = ['#4DB3F2', '#F28C40', '#73D973', '#F27070', '#D973D9', '#F2C94C']
+
+    for idx, (run_name, df) in enumerate(dfs.items()):
+        table, run_warnings = _lltd_mid_corner_table_for_run(df, run_name)
+        warnings.extend(f"{run_name}: {w}" for w in run_warnings)
+        if table.is_empty():
+            continue
+        tables.append(table)
+        laps = table['Lap'].to_numpy()
+        laptimes = table['LapTime [s]'].to_numpy()
+        y = table['LLTD mid-corner avg [%]'].to_numpy()
+        spans = table['LLTD mid-corner span [pp]'].to_numpy()
+        samples = table['Mid-corner samples'].to_numpy()
+        x, order, xlabel = per_lap_axis(laps, laptimes, x_mode)
+        color = colors[idx % len(colors)]
+        customdata = np.column_stack([laps[order], laptimes[order], spans[order], samples[order]])
+        fig.add_trace(go.Scatter(
+            x=x,
+            y=y[order],
+            mode='lines+markers',
+            name=run_name,
+            line=dict(color=color, width=2.2),
+            marker=dict(
+                color=color,
+                size=9,
+                line=dict(color='#EBEBEB', width=0.6),
+            ),
+            customdata=customdata,
+            hovertemplate=(
+                'Lap=%{customdata[0]:.0f}<br>'
+                'LapTime=%{customdata[1]:.2f} s<br>'
+                'LLTD avg=%{y:.3f}%<br>'
+                'Lap LLTD span=%{customdata[2]:.4f} pp<br>'
+                'samples=%{customdata[3]:.0f}<extra></extra>'
+            ),
+        ))
+
+        # Short rolling reference line, matching the setup-change reading in the slide.
+        if len(y) >= 3:
+            y_ordered = y[order]
+            roll = np.array([
+                np.nanmedian(y_ordered[max(0, i - 1): min(len(y_ordered), i + 2)])
+                for i in range(len(y_ordered))
+            ])
+            fig.add_trace(go.Scatter(
+                x=x,
+                y=roll,
+                mode='lines',
+                name=f'{run_name} trend',
+                legendgroup=run_name,
+                showlegend=False,
+                line=dict(color=color, width=1.7, dash='dash'),
+                hoverinfo='skip',
+            ))
+
+        runs[run_name] = {
+            'laps': int(len(table)),
+            'lltd_mean_pct': float(np.nanmean(y)),
+            'lltd_min_pct': float(np.nanmin(y)),
+            'lltd_max_pct': float(np.nanmax(y)),
+            'lltd_span_pct_points': float(np.nanmax(y) - np.nanmin(y)),
+            'samples_mean': float(np.nanmean(samples)),
+        }
+        fig.update_xaxes(title_text=xlabel)
+
+    kroll_split_pct = KROLLF_NMRAD / (KROLLF_NMRAD + KROLLR_NMRAD) * 100.0
+    fig.add_hline(
+        y=kroll_split_pct,
+        line=dict(color='#73D973', width=1.5, dash='dot'),
+        annotation_text=f'Kroll split {kroll_split_pct:.1f}%',
+        annotation_position='top right',
+    )
+    fig.update_layout(
+        height=520,
+        margin=dict(l=70, r=35, t=55, b=65),
+        hovermode='closest',
+        legend=dict(
+            bgcolor='rgba(20,20,23,0.85)',
+            bordercolor='rgba(128,128,128,0.3)',
+            orientation='h',
+            yanchor='bottom',
+            y=1.02,
+            xanchor='right',
+            x=1.0,
+        ),
+    )
+    if tables:
+        table_all = pl.concat(tables, how='vertical')
+        y_all = table_all['LLTD mid-corner avg [%]'].to_numpy()
+        y_pad = max(0.35, (float(np.nanmax(y_all)) - float(np.nanmin(y_all))) * 0.5)
+        fig.update_yaxes(range=[float(np.nanmin(y_all)) - y_pad, float(np.nanmax(y_all)) + y_pad])
+    else:
+        table_all = pl.DataFrame()
+
+    return fig, {
+        'runs': runs,
+        'table': table_all,
+        'kroll_split_pct': float(kroll_split_pct),
+        'warnings': warnings,
     }
 
 
@@ -2173,6 +2595,474 @@ def decel_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     return fig, {'runs': runs, 'warnings': warnings, 'reference_decel_g': reference_g}
 
 
+# ── Braking Stability KPI (Rouelle / RCE Sept 2019) ──────────────────────────
+# Stability KPI = integral(steering smoothness) / integral(yaw-rate smoothness)
+# over each straight-line braking event. Higher = more stable chassis.
+# Steering and yaw rate are converted to degrees so absolute magnitudes match
+# Figs 2-3 of Rouelle, RCE Sept 2019.
+
+from utils import fill_short_false_gaps as _fill_short_false_gaps
+
+_BRAKING_STAB_AY_LIMIT_MPS2 = 0.2 * G_MPS2   # 0.2 g (paper threshold for straight braking)
+_BRAKING_STAB_YAW_SMOOTH_S  = 0.5            # smoothing window for yaw rate
+_BRAKING_STAB_STR_SMOOTH_S  = 1.0            # smoothing window for steering
+_BRAKING_STAB_MIN_EVENT_S   = 0.15           # discard events shorter than this
+_BRAKING_STAB_FILL_GAP_S    = 0.10           # bridge short false gaps
+_BRAKING_STAB_LOCKUP_SR     = -0.07          # partial-lockup slip-ratio threshold
+_BRAKING_STAB_SR_COLS       = ('Est_SRFL', 'Est_SRFR', 'Est_SRRL', 'Est_SRRR')
+
+
+def _segments_from_mask(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Return [(start, end)] inclusive index ranges of contiguous True regions."""
+    m = np.asarray(mask, dtype=bool)
+    if not m.any():
+        return []
+    padded = np.concatenate([[False], m, [False]])
+    d = np.diff(padded.astype(np.int8))
+    starts = np.where(d == 1)[0]
+    ends = np.where(d == -1)[0] - 1
+    return list(zip(starts.tolist(), ends.tolist()))
+
+
+def _yaw_signal_dyn(df: pl.DataFrame) -> tuple[np.ndarray, str] | None:
+    for col in ('VN_gz', 'AS_yaw_rate'):
+        if col in df.columns:
+            return df[col].to_numpy().astype(float), col
+    return None
+
+
+def _steer_signal_dyn(df: pl.DataFrame) -> tuple[np.ndarray, str] | None:
+    # Prefer the canonical Steering channel (rad). Some CSVs have
+    # steering_actualPosRad fully zero, so fall back only when Steering is missing.
+    for col in ('Steering', 'AS_Steering', 'steering_actualPosRad'):
+        if col in df.columns:
+            arr = df[col].to_numpy().astype(float)
+            if np.any(np.abs(arr) > 1e-6):
+                return arr, col
+    return None
+
+
+def _ay_signal_dyn(df: pl.DataFrame) -> tuple[np.ndarray, str] | None:
+    for col in ('Filtering_VN_ay', 'VN_ay'):
+        if col in df.columns:
+            return df[col].to_numpy().astype(float), col
+    return None
+
+
+def _compute_braking_stability_events(df_in: pl.DataFrame) -> tuple[pl.DataFrame, list[str]]:
+    """Per-event Stability KPI table for one run.
+
+    Returns a DataFrame with columns ``lap, event_idx, start_time_s, duration_s,
+    steering_stability, yaw_rate_stability, stability_kpi, lockup_front_s,
+    lockup_rear_s`` and a list of warning strings (empty when OK).
+    """
+    empty = pl.DataFrame(schema={
+        'lap': pl.Int64,
+        'event_idx': pl.Int64,
+        'start_time_s': pl.Float64,
+        'duration_s': pl.Float64,
+        'laptime_s': pl.Float64,
+        'steering_stability': pl.Float64,
+        'yaw_rate_stability': pl.Float64,
+        'stability_kpi': pl.Float64,
+        'lockup_front_s': pl.Float64,
+        'lockup_rear_s': pl.Float64,
+    })
+
+    warnings: list[str] = []
+    try:
+        df = ensure_complete_laps_df(df_in)
+    except Exception as exc:
+        return empty, [f'lap selection unavailable: {exc}']
+
+    yaw = _yaw_signal_dyn(df)
+    steer = _steer_signal_dyn(df)
+    ay = _ay_signal_dyn(df)
+    if yaw is None or steer is None or ay is None:
+        missing = []
+        if yaw is None:   missing.append('VN_gz/AS_yaw_rate')
+        if steer is None: missing.append('steering_actualPosRad')
+        if ay is None:    missing.append('Filtering_VN_ay/VN_ay')
+        return empty, [f'missing columns: {", ".join(missing)}']
+
+    if 'TimeStamp' not in df.columns or 'laps' not in df.columns or 'laptime' not in df.columns:
+        return empty, ['missing TimeStamp/laps/laptime']
+
+    time_s = df['TimeStamp'].to_numpy().astype(float)
+    laps = df['laps'].to_numpy().astype(float)
+    laptime = df['laptime'].to_numpy().astype(float)
+    dt = robust_dt(time_s)
+    if not np.isfinite(dt) or dt <= 0.0:
+        return empty, ['could not infer sample rate']
+
+    yaw_deg_s = np.degrees(yaw[0])
+    steer_deg = np.degrees(steer[0])
+    ay_mps2 = ay[0]
+
+    yaw_smoothed = smooth_signal(yaw_deg_s, max(1, int(round(_BRAKING_STAB_YAW_SMOOTH_S / dt))))
+    yaw_smoothness = np.abs(yaw_deg_s - yaw_smoothed) * 100.0
+    steer_smoothed = smooth_signal(steer_deg, max(1, int(round(_BRAKING_STAB_STR_SMOOTH_S / dt))))
+    steer_smoothness = np.abs(steer_deg - steer_smoothed) * 100.0
+
+    phase = phase_masks_for_map(df)
+    brake_mask = phase.get('BRAKE')
+    if brake_mask is None or not brake_mask.any():
+        return empty, ['no BRAKE samples detected']
+
+    straight = brake_mask & np.isfinite(ay_mps2) & (np.abs(ay_mps2) < _BRAKING_STAB_AY_LIMIT_MPS2)
+    straight = keep_min_duration_segments(straight, _BRAKING_STAB_MIN_EVENT_S, dt)
+    straight = _fill_short_false_gaps(straight, _BRAKING_STAB_FILL_GAP_S, dt)
+    straight = keep_min_duration_segments(straight, _BRAKING_STAB_MIN_EVENT_S, dt)
+
+    if not straight.any():
+        return empty, ['no straight-line braking events (|ay| < 0.2 g during braking)']
+
+    lockup_front = np.zeros(len(df), dtype=bool)
+    lockup_rear = np.zeros(len(df), dtype=bool)
+    for col in _BRAKING_STAB_SR_COLS:
+        if col in df.columns:
+            sr = df[col].to_numpy().astype(float)
+            below = np.isfinite(sr) & (sr < _BRAKING_STAB_LOCKUP_SR)
+            if col.endswith('FL') or col.endswith('FR'):
+                lockup_front |= below
+            else:
+                lockup_rear |= below
+
+    rows: list[dict[str, float | int]] = []
+    eps = 1e-9
+    event_counter_by_lap: dict[int, int] = {}
+    for s_idx, e_idx in _segments_from_mask(straight):
+        # Split the event by lap so cross-boundary braking does not get fully
+        # attributed to a single lap. Each lap-portion becomes its own row.
+        lap_seg = laps[s_idx:e_idx + 1]
+        finite_in_seg = np.isfinite(lap_seg)
+        if not finite_in_seg.any():
+            continue
+        lap_int = np.where(finite_in_seg, lap_seg, np.nan)
+        boundaries = [0]
+        for k in range(1, len(lap_int)):
+            a, b = lap_int[k - 1], lap_int[k]
+            same = (np.isnan(a) and np.isnan(b)) or (a == b)
+            if not same:
+                boundaries.append(k)
+        boundaries.append(len(lap_int))
+
+        for b_start, b_end in zip(boundaries[:-1], boundaries[1:]):
+            piece_lap_vals = lap_int[b_start:b_end]
+            finite_piece = piece_lap_vals[np.isfinite(piece_lap_vals)]
+            if finite_piece.size == 0:
+                continue
+            lap_id = int(finite_piece[0])
+
+            abs_start = s_idx + b_start
+            abs_end_excl = s_idx + b_end       # exclusive
+            piece = slice(abs_start, abs_end_excl)
+            n_samples = abs_end_excl - abs_start
+            if n_samples <= 0:
+                continue
+            # Discard cross-boundary slivers shorter than the min-event threshold
+            # so a 20-ms tail does not pollute the next lap's integral.
+            if n_samples * dt < _BRAKING_STAB_MIN_EVENT_S:
+                continue
+
+            idx_in_lap = event_counter_by_lap.get(lap_id, 0)
+            event_counter_by_lap[lap_id] = idx_in_lap + 1
+
+            steer_int = float(np.nansum(steer_smoothness[piece]) * dt)
+            yaw_int = float(np.nansum(yaw_smoothness[piece]) * dt)
+            kpi = steer_int / max(yaw_int, eps)
+            duration = float(n_samples * dt)
+            lf_s = float(np.sum(lockup_front[piece] & straight[piece]) * dt)
+            lr_s = float(np.sum(lockup_rear[piece] & straight[piece]) * dt)
+            lap_mask = laps == lap_id
+            lap_laptime = (
+                float(np.nanmedian(laptime[lap_mask])) if np.any(lap_mask) else float('nan')
+            )
+            rows.append({
+                'lap': lap_id,
+                'event_idx': idx_in_lap,
+                'start_time_s': float(time_s[abs_start]),
+                'duration_s': duration,
+                'laptime_s': lap_laptime,
+                'steering_stability': steer_int,
+                'yaw_rate_stability': yaw_int,
+                'stability_kpi': kpi,
+                'lockup_front_s': lf_s,
+                'lockup_rear_s': lr_s,
+            })
+
+    if not rows:
+        return empty, ['no straight-line braking events with valid lap mapping']
+    return pl.DataFrame(rows), warnings
+
+
+def _empty_braking_stability_fig(message: str) -> go.Figure:
+    fig = make_dark_figure('Braking Stability KPI', 'Event start time [s]', 'Stability KPI')
+    fig.add_annotation(text=message, x=0.5, y=0.5, xref='paper', yref='paper',
+                       showarrow=False, font=dict(color='#EBEBEB', size=14))
+    fig.update_layout(height=480, margin=dict(l=70, r=35, t=55, b=65))
+    return fig
+
+
+def braking_stability_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Per-event Braking Stability KPI (Rouelle, RCE Sept 2019).
+
+    For each run, integrates steering smoothness and yaw-rate smoothness over
+    straight-line braking events (|ay| < 0.2 g during brake phase). The KPI is
+    the ratio of those integrals; higher = more stable chassis under braking.
+    Steering [deg] and yaw rate [deg/s] are converted from radians so absolute
+    values match the paper.
+    """
+    fig = make_dark_figure(
+        'Braking Stability KPI  ·  Steering vs Yaw-rate smoothness ratio',
+        'Event start time [s]',
+        'Stability KPI  =  ∫|Δsteering|·100 / ∫|Δyaw|·100',
+    )
+    warnings: list[str] = []
+    runs_out: dict[str, dict[str, float]] = {}
+    events_by_run: dict[str, pl.DataFrame] = {}
+
+    if not dfs:
+        return _empty_braking_stability_fig('No runs selected'), {
+            'runs': {}, 'warnings': ['No runs selected.'], 'events_by_run': {},
+        }
+
+    colors = ['#4DB3F2', '#F28C40', '#73D973', '#D973D9', '#F27070']
+    for idx, (run_name, df_in) in enumerate(dfs.items()):
+        evt_df, run_warnings = _compute_braking_stability_events(df_in)
+        for w in run_warnings:
+            warnings.append(f'{run_name}: {w}')
+        events_by_run[run_name] = evt_df
+        if evt_df.is_empty():
+            continue
+
+        color = colors[idx % len(colors)]
+        x_start = evt_df['start_time_s'].to_numpy()
+        y_kpi = evt_df['stability_kpi'].to_numpy()
+        laps = evt_df['lap'].to_numpy()
+        durations = evt_df['duration_s'].to_numpy()
+        lf = evt_df['lockup_front_s'].to_numpy()
+        lr = evt_df['lockup_rear_s'].to_numpy()
+        steer_int = evt_df['steering_stability'].to_numpy()
+        yaw_int = evt_df['yaw_rate_stability'].to_numpy()
+
+        customdata = np.column_stack([laps, durations, steer_int, yaw_int, lf, lr])
+        fig.add_trace(go.Scatter(
+            x=x_start, y=y_kpi, mode='markers',
+            marker=dict(color=color, size=9, opacity=0.85,
+                        line=dict(color='#EBEBEB', width=0.6)),
+            name=f'{run_name}',
+            legendgroup=run_name,
+            customdata=customdata,
+            hovertemplate=(
+                f'{run_name}<br>'
+                'Lap=%{customdata[0]:.0f}<br>'
+                'Start=%{x:.2f} s · Δt=%{customdata[1]:.2f} s<br>'
+                'Steering stability=%{customdata[2]:.1f}<br>'
+                'Yaw-rate stability=%{customdata[3]:.1f}<br>'
+                'Stability KPI=%{y:.2f}<br>'
+                'Lockup F=%{customdata[4]:.2f} s · R=%{customdata[5]:.2f} s<extra></extra>'
+            ),
+        ))
+
+        # Trend line: rolling median over consecutive events (sorted by start time).
+        order = np.argsort(x_start)
+        x_sorted = x_start[order]
+        y_sorted = y_kpi[order]
+        window = max(3, min(9, len(y_sorted) // 3))
+        if len(y_sorted) >= 3:
+            half = window // 2
+            trend = np.array([
+                np.nanmedian(y_sorted[max(0, i - half): min(len(y_sorted), i + half + 1)])
+                for i in range(len(y_sorted))
+            ])
+            fig.add_trace(go.Scatter(
+                x=x_sorted, y=trend, mode='lines',
+                line=dict(color=color, width=2.0, dash='dash'),
+                name=f'{run_name} trend',
+                legendgroup=run_name,
+                showlegend=False,
+                hoverinfo='skip',
+            ))
+
+        runs_out[run_name] = {
+            'events': int(len(evt_df)),
+            'stability_kpi_median': float(np.nanmedian(y_kpi)),
+            'stability_kpi_p25': float(np.nanpercentile(y_kpi, 25)),
+            'stability_kpi_p75': float(np.nanpercentile(y_kpi, 75)),
+            'steering_stability_median': float(np.nanmedian(steer_int)),
+            'yaw_rate_stability_median': float(np.nanmedian(yaw_int)),
+            'lockup_front_total_s': float(np.nansum(lf)),
+            'lockup_rear_total_s': float(np.nansum(lr)),
+        }
+
+    fig.update_layout(
+        height=520, margin=dict(l=70, r=35, t=55, b=65),
+        hovermode='closest',
+        legend=dict(
+            bgcolor='rgba(20,20,23,0.85)',
+            bordercolor='rgba(128,128,128,0.3)',
+            orientation='h',
+            yanchor='bottom', y=1.02, xanchor='right', x=1.0,
+        ),
+    )
+    return fig, {'runs': runs_out, 'warnings': warnings, 'events_by_run': events_by_run}
+
+
+def _aggregate_stability_per_lap(evt_df: pl.DataFrame) -> pl.DataFrame:
+    """Aggregate per-event Stability data to per-lap totals (paper-style ratio)."""
+    if evt_df.is_empty():
+        return pl.DataFrame(schema={
+            'lap': pl.Int64,
+            'laptime_s': pl.Float64,
+            'n_events': pl.Int64,
+            'steering_stability_sum': pl.Float64,
+            'yaw_rate_stability_sum': pl.Float64,
+            'stability_kpi_lap': pl.Float64,
+            'lockup_front_total_s': pl.Float64,
+            'lockup_rear_total_s': pl.Float64,
+        })
+    grouped = evt_df.group_by('lap').agg([
+        pl.col('laptime_s').median().alias('laptime_s'),
+        pl.len().alias('n_events'),
+        pl.col('steering_stability').sum().alias('steering_stability_sum'),
+        pl.col('yaw_rate_stability').sum().alias('yaw_rate_stability_sum'),
+        pl.col('lockup_front_s').sum().alias('lockup_front_total_s'),
+        pl.col('lockup_rear_s').sum().alias('lockup_rear_total_s'),
+    ]).sort('lap')
+    eps = 1e-9
+    return grouped.with_columns(
+        (pl.col('steering_stability_sum') /
+         pl.when(pl.col('yaw_rate_stability_sum') > eps)
+           .then(pl.col('yaw_rate_stability_sum'))
+           .otherwise(eps)
+        ).alias('stability_kpi_lap')
+    )
+
+
+def braking_stability_per_lap_fig(
+    dfs: dict[str, pl.DataFrame],
+    x_mode: str = 'laps',
+) -> tuple[go.Figure, dict]:
+    """Per-lap Stability KPI trend + partial-lockup time (Rouelle Figs 3-4)."""
+    from plotly.subplots import make_subplots
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+        subplot_titles=('Stability KPI per lap', 'Partial lock-up time per lap [s]'),
+    )
+    warnings: list[str] = []
+    runs_out: dict[str, dict[str, float]] = {}
+
+    if not dfs:
+        fig.update_layout(template='plotly_dark', height=620,
+                          margin=dict(l=70, r=35, t=70, b=65))
+        return fig, {'runs': {}, 'warnings': ['No runs selected.']}
+
+    colors = ['#4DB3F2', '#F28C40', '#73D973', '#D973D9', '#F27070']
+    xlabel = 'Lap'
+    any_data = False
+    for idx, (run_name, df_in) in enumerate(dfs.items()):
+        evt_df, run_warnings = _compute_braking_stability_events(df_in)
+        for w in run_warnings:
+            warnings.append(f'{run_name}: {w}')
+        per_lap = _aggregate_stability_per_lap(evt_df)
+        if per_lap.is_empty():
+            continue
+        any_data = True
+
+        lap_ids = per_lap['lap'].to_numpy()
+        lap_times = per_lap['laptime_s'].to_numpy()
+        kpi_lap = per_lap['stability_kpi_lap'].to_numpy()
+        lf = per_lap['lockup_front_total_s'].to_numpy()
+        lr = per_lap['lockup_rear_total_s'].to_numpy()
+
+        try:
+            x_vals, order, axis_label = per_lap_axis(lap_ids, lap_times, x_mode)
+            xlabel = axis_label
+        except Exception:
+            x_vals = lap_ids.astype(float)
+            order = np.argsort(x_vals)
+
+        color = colors[idx % len(colors)]
+        custom_top = np.column_stack([lap_ids[order], lap_times[order]])
+        fig.add_trace(
+            go.Scatter(
+                x=x_vals, y=kpi_lap[order], mode='lines+markers',
+                line=dict(color=color, width=2.4),
+                marker=dict(color=color, size=9, line=dict(color='#EBEBEB', width=0.6)),
+                name=run_name,
+                legendgroup=run_name,
+                customdata=custom_top,
+                hovertemplate=(
+                    f'{run_name}<br>Lap=%{{customdata[0]:.0f}}<br>'
+                    'Lap time=%{customdata[1]:.2f} s<br>'
+                    'Stability KPI=%{y:.2f}<extra></extra>'
+                ),
+            ),
+            row=1, col=1,
+        )
+
+        fig.add_trace(
+            go.Bar(
+                x=x_vals, y=lf[order], name=f'{run_name} front',
+                legendgroup=run_name,
+                marker=dict(color=color, opacity=0.85),
+                customdata=lap_ids[order],
+                hovertemplate=(
+                    f'{run_name} front<br>Lap=%{{customdata:.0f}}<br>'
+                    'Lockup front=%{y:.2f} s<extra></extra>'
+                ),
+            ),
+            row=2, col=1,
+        )
+        fig.add_trace(
+            go.Bar(
+                x=x_vals, y=lr[order], name=f'{run_name} rear',
+                legendgroup=run_name,
+                marker=dict(color=color, opacity=0.45,
+                            pattern=dict(shape='/', size=4)),
+                customdata=lap_ids[order],
+                hovertemplate=(
+                    f'{run_name} rear<br>Lap=%{{customdata:.0f}}<br>'
+                    'Lockup rear=%{y:.2f} s<extra></extra>'
+                ),
+            ),
+            row=2, col=1,
+        )
+
+        runs_out[run_name] = {
+            'laps_with_events': int(len(per_lap)),
+            'stability_kpi_lap_mean': float(np.nanmean(kpi_lap)),
+            'stability_kpi_lap_std': float(np.nanstd(kpi_lap)),
+            'stability_kpi_lap_median': float(np.nanmedian(kpi_lap)),
+            'lockup_front_total_s': float(np.nansum(lf)),
+            'lockup_rear_total_s': float(np.nansum(lr)),
+        }
+
+    fig.update_layout(
+        template='plotly_dark',
+        height=640, margin=dict(l=70, r=35, t=70, b=65),
+        barmode='group', hovermode='x unified',
+        legend=dict(
+            bgcolor='rgba(20,20,23,0.85)',
+            bordercolor='rgba(128,128,128,0.3)',
+            orientation='h',
+            yanchor='bottom', y=1.05, xanchor='right', x=1.0,
+        ),
+    )
+    fig.update_yaxes(title_text='Stability KPI', row=1, col=1)
+    fig.update_yaxes(title_text='Lockup time [s]', row=2, col=1)
+    fig.update_xaxes(title_text=xlabel, row=2, col=1)
+
+    if not any_data:
+        fig.add_annotation(text='No straight-line braking events',
+                           x=0.5, y=0.5, xref='paper', yref='paper',
+                           showarrow=False, font=dict(color='#EBEBEB', size=14))
+
+    return fig, {'runs': runs_out, 'warnings': warnings}
+
+
 def _ideal_traction_forces(
     ax_mps2: np.ndarray,
     vx_mps: np.ndarray | float,
@@ -3057,7 +3947,7 @@ def steering_vs_ay_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
     dt = robust_dt(time_s)
 
     ay   = arr['Filtering_VN_ay']
-    steer = arr['Steering']
+    steer = arr['Steering'] / STEERING_RATIO
     vx   = arr['VN_vx']
 
     # Steady state: Lap-Analysis radius cornering plus low ay/steer jerk.

@@ -14,6 +14,8 @@
 | lf (CoG→front axle) | `Vhcl.lf` | 0.765 | m |
 | lr (CoG→rear axle) | `Vhcl.lr` | 0.765 | m |
 
+Steering ratio = 3.15
+
 ## Mass
 | Parameter | Symbol | Value | Units |
 |-----------|--------|-------|-------|

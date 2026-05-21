@@ -60,15 +60,13 @@ def add_lap_scatter(fig: go.Figure, x: np.ndarray, y: np.ndarray,
                     lap_ids: np.ndarray, name: str = '',
                     color: str = '#4DB3F2', symbol: str = 'circle',
                     size: int = 10) -> None:
-    """Add scatter trace with lap number labels."""
+    """Add per-lap scatter trace with connected points."""
     fig.add_trace(go.Scatter(
         x=x, y=y,
-        mode='markers+text',
+        mode='lines+markers',
         name=name,
+        line=dict(color=color, width=2.0),
         marker=dict(color=color, symbol=symbol, size=size, line=dict(width=0)),
-        text=[f'  {int(l)}' for l in lap_ids],
-        textposition='middle right',
-        textfont=dict(color=_TEXT, size=10),
     ))
 
 
