@@ -1820,17 +1820,17 @@ def _skidpad_fig_cached(
     df: pl.DataFrame,
     run_token: tuple[str, FileSignature, str],
 ) -> tuple[go.Figure, dict]:
-    """Cached wrapper for single-run skidpad event figures."""
+    """Cached wrapper for single-run skidpad KPI plots (aggregated, no time)."""
     _ = run_token
     funcs = {
-        "event_time": skidpad.event_time_summary_fig,
-        "lateral_g": skidpad.lateral_g_fig,
-        "driven_radius": skidpad.driven_radius_fig,
-        "balance": skidpad.balance_fig,
-        "driver_smoothness": skidpad.driver_smoothness_fig,
+        "event_time": skidpad.event_time_bars_fig,
+        "lateral_g_hist": skidpad.lateral_g_histogram_fig,
+        "radius_hist": skidpad.driven_radius_histogram_fig,
+        "understeer": skidpad.understeer_chart_fig,
+        "slip_vs_ay": skidpad.slip_angle_vs_ay_fig,
+        "yaw_vs_ay": skidpad.yaw_rate_vs_ay_fig,
+        "lltd_scatter": skidpad.lltd_scatter_fig,
         "gps_figure8": skidpad.gps_figure8_fig,
-        "tv_intervention": skidpad.tv_intervention_fig,
-        "lateral_load_dist": skidpad.lateral_load_dist_fig,
     }
     if metric not in funcs:
         raise KeyError(f"Unknown skidpad metric: {metric}")
@@ -2853,33 +2853,29 @@ def _render_events_skidpad(dfs: dict[str, pl.DataFrame]) -> None:
 
     run_tokens = {token[0]: token for token in _run_cache_tokens(skidpad_dfs)}
     st.caption(
-        "Skidpad KPIs use only samples tagged `lapcount_mode == 'skidpad'`. "
+        "Skidpad KPIs use only the official timed laps (warm-ups excluded). "
         "Circle side uses the current IMU convention: positive `Filtering_VN_ay` is treated as left."
     )
 
-    _render_skidpad_top_kpis(skidpad_dfs, run_tokens)
-
-    metric_specs = [
-        ("event_time", "Event Time"),
-        ("lateral_g", "Sustained Lateral G"),
-        ("driven_radius", "Driven Radius"),
-        ("balance", "Balance and Understeer"),
-        ("driver_smoothness", "Driver Smoothness"),
-        ("gps_figure8", "GPS Figure-8"),
+    plot_specs = [
+        ("event_time", "Lap Time per Circle"),
+        ("lateral_g_hist", "Sustained |ay| Distribution"),
+        ("radius_hist", "Driven Radius Distribution"),
+        ("understeer", "Understeer Chart"),
+        ("slip_vs_ay", "Slip Angle vs Lateral G"),
+        ("yaw_vs_ay", "Yaw Rate vs Lateral G"),
     ]
-    for metric, title in metric_specs:
+    for metric, title in plot_specs:
         st.divider()
-        _render_skidpad_metric(metric, title, skidpad_dfs, run_tokens)
-
-    tv_dfs = {name: df for name, df in skidpad_dfs.items() if skidpad.has_tv_signals(df)}
-    if tv_dfs:
-        st.divider()
-        _render_skidpad_metric("tv_intervention", "TV Intervention", tv_dfs, run_tokens)
+        _render_skidpad_plot(metric, title, skidpad_dfs, run_tokens)
 
     load_dfs = {name: df for name, df in skidpad_dfs.items() if skidpad.has_load_signals(df)}
     if load_dfs:
         st.divider()
-        _render_skidpad_metric("lateral_load_dist", "Lateral Load Distribution", load_dfs, run_tokens)
+        _render_skidpad_plot("lltd_scatter", "Load Transfer Balance", load_dfs, run_tokens)
+
+    st.divider()
+    _render_skidpad_plot("gps_figure8", "GPS Figure-8", skidpad_dfs, run_tokens)
 
 
 def _filter_skidpad_mode_df(df: pl.DataFrame) -> pl.DataFrame:
@@ -2890,83 +2886,24 @@ def _filter_skidpad_mode_df(df: pl.DataFrame) -> pl.DataFrame:
     return df.filter(pl.Series("__skidpad_mask", mask))
 
 
-def _render_skidpad_top_kpis(
-    skidpad_dfs: dict[str, pl.DataFrame],
-    run_tokens: dict[str, tuple[str, FileSignature, str]],
-) -> None:
-    rows: list[dict[str, object]] = []
-    for run_name, df in skidpad_dfs.items():
-        event_kpis: dict = {}
-        lat_kpis: dict = {}
-        radius_kpis: dict = {}
-        try:
-            _fig, event_kpis = _skidpad_fig_cached("event_time", df, run_tokens[run_name])
-        except Exception as exc:
-            st.error(f"{Path(run_name).stem}: skidpad event time unavailable: {exc}")
-        try:
-            _fig, lat_kpis = _skidpad_fig_cached("lateral_g", df, run_tokens[run_name])
-        except Exception as exc:
-            st.error(f"{Path(run_name).stem}: skidpad lateral G unavailable: {exc}")
-        try:
-            _fig, radius_kpis = _skidpad_fig_cached("driven_radius", df, run_tokens[run_name])
-        except Exception as exc:
-            st.error(f"{Path(run_name).stem}: skidpad radius unavailable: {exc}")
-
-        rows.append({
-            "Run": Path(run_name).stem,
-            "Event time [s]": event_kpis.get("event_time_s", np.nan),
-            "Timed R [s]": event_kpis.get("timed_R_s", np.nan),
-            "Timed L [s]": event_kpis.get("timed_L_s", np.nan),
-            "L/R asymmetry [s]": event_kpis.get("lr_asymmetry_s", np.nan),
-            "ay max [g]": lat_kpis.get("ay_max_g", np.nan),
-            "R error mean [m]": radius_kpis.get("radius_error_mean_m", np.nan),
-        })
-
-    if not rows:
-        return
-    if len(rows) == 1:
-        vals = rows[0]
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Event time", f"{_fmt(vals.get('Event time [s]', np.nan), '.3f')} s")
-        c2.metric("L/R asymmetry", f"{_fmt(vals.get('L/R asymmetry [s]', np.nan), '.3f')} s")
-        c3.metric("ay max", f"{_fmt(vals.get('ay max [g]', np.nan), '.2f')} g")
-        c4.metric("R error mean", f"{_fmt(vals.get('R error mean [m]', np.nan), '+.2f')} m")
-    else:
-        _show_summary_table([_round_numeric_row(row) for row in rows])
-
-
-def _render_skidpad_metric(
+def _render_skidpad_plot(
     metric: str,
     title: str,
     skidpad_dfs: dict[str, pl.DataFrame],
     run_tokens: dict[str, tuple[str, FileSignature, str]],
 ) -> None:
     st.subheader(title)
-    table_rows: list[dict[str, object]] = []
     for run_name, df in skidpad_dfs.items():
         try:
             fig, kpis = _skidpad_fig_cached(metric, df, run_tokens[run_name])
-            for warning in kpis.get("warnings", []):
-                st.warning(f"{Path(run_name).stem}: {warning}")
-            if len(skidpad_dfs) > 1:
-                st.markdown(f"**{Path(run_name).stem}**")
-            _plotly_chart(fig, use_container_width=True, theme=None)
-            for row in kpis.get("rows", []):
-                table_rows.append(_round_numeric_row({"Run": Path(run_name).stem, **row}))
         except Exception as exc:
             st.error(f"{Path(run_name).stem}: {title.lower()} unavailable: {exc}")
-    if table_rows:
-        st.dataframe(pl.DataFrame(table_rows), use_container_width=True, hide_index=True)
-
-
-def _round_numeric_row(row: dict[str, object]) -> dict[str, object]:
-    out: dict[str, object] = {}
-    for key, value in row.items():
-        if isinstance(value, (float, np.floating)):
-            out[key] = round(float(value), 3) if np.isfinite(value) else np.nan
-        else:
-            out[key] = value
-    return out
+            continue
+        for warning in kpis.get("warnings", []):
+            st.warning(f"{Path(run_name).stem}: {warning}")
+        if len(skidpad_dfs) > 1:
+            st.markdown(f"**{Path(run_name).stem}**")
+        _plotly_chart(fig, use_container_width=True, theme=None)
 
 
 def _render_ideal_braking_curve(dfs: dict[str, pl.DataFrame]) -> None:
