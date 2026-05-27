@@ -6,7 +6,7 @@
 
 Built with **Streamlit · Plotly · Polars · NumPy**.
 
-![Lap Analysis](docs/screenshots/01_lap_analysis.png)
+![Lap Analysis](screenshots/01_lap_analysis.png)
 
 ---
 
@@ -35,7 +35,7 @@ and answers **"where is the time?"** broken down by Entry / Apex / Exit /
 Straight. Includes a GPS time-gain map, a per-corner Δt heatmap, GG diagram
 and synchronised channel plots.
 
-![Lap Analysis](docs/screenshots/01_lap_analysis.png)
+![Lap Analysis](screenshots/01_lap_analysis.png)
 
 ### Driver performance — Throttle / Brake / Steering
 Per-driver KPI tables plus distributions, per-lap evolution and per-corner
@@ -43,20 +43,20 @@ breakdowns. Built for direct A/B coaching: Cerpa vs Martinez at FSG below.
 
 | Throttle | Brake | Steering |
 |---|---|---|
-| ![Throttle](docs/screenshots/02_throttle.png) | ![Brake](docs/screenshots/03_brake.png) | ![Steering](docs/screenshots/04_steering.png) |
+| ![Throttle](screenshots/02_throttle.png) | ![Brake](screenshots/03_brake.png) | ![Steering](screenshots/04_steering.png) |
 
 ### Vehicle dynamics
 Longitudinal-decel envelope, ideal-braking curve vs measured regen,
 braking-stability (steering vs yaw-rate) and lap-by-lap stability metrics.
 
-![Dynamics](docs/screenshots/05_dynamics.png)
+![Dynamics](screenshots/05_dynamics.png)
 
 ### Powertrain
 Net energy per lap, per-wheel power split (4 motors), battery SoC / voltage
 sag / current draw, thermal soak and a dedicated **PC — 80 kW battery
 power-cap** check.
 
-![Powertrain](docs/screenshots/06_powertrain.png)
+![Powertrain](screenshots/06_powertrain.png)
 
 ### Vehicle control systems
 Dedicated tabs for each active control loop on the car.
@@ -65,19 +65,19 @@ Dedicated tabs for each active control loop on the car.
 Slip-ratio tracking around the +0.20 acceleration target — histograms,
 per-corner box plots, time-in-band bars and throttle-response curves.
 
-![TC](docs/screenshots/07_tc.png)
+![TC](screenshots/07_tc.png)
 
 #### Torque Vectoring (TV)
 Yaw-rate and Yz tracking + per-curve understeer/oversteer balance —
 catches the corners where TV is helping vs hurting.
 
-![TV](docs/screenshots/08_tv.png)
+![TV](screenshots/08_tv.png)
 
 #### Regenerative Braking (RB)
 Slip-ratio tracking around the −0.20 braking target, throttle-vs-regen
 behaviour, per-corner box plots and energy recovered per lap.
 
-![RB](docs/screenshots/09_rb.png)
+![RB](screenshots/09_rb.png)
 
 ---
 
@@ -123,7 +123,7 @@ side-by-side from the sidebar.
 
 ## Screenshots
 
-All screenshots in [`docs/screenshots/`](docs/screenshots/) are generated
+All screenshots in [`screenshots/`](screenshots/) are generated
 from real telemetry: two FSG laps from drivers Cerpa and Martinez compared
 on the same circuit.
 
