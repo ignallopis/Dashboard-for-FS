@@ -557,6 +557,74 @@ def build_manual_lap_samples(
     return laps_s, laptime_s
 
 
+def _find_acceleration_launch(
+    speed: np.ndarray,
+    t: np.ndarray,
+    params: dict,
+) -> int:
+    """Return the sample index where the 75 m sprint actually launches.
+
+    Acceleration CSVs typically include paddock idling before the real sprint,
+    and raw GPS-derived speed has enough noise during standstill to exceed
+    ``min_vel`` momentarily. The first such crossing would lock the launch
+    onto random GPS jitter and place the finish line in the wrong direction.
+    Instead, find the first *sustained* motion segment: smoothed speed must
+    stay above ``min_vel`` for at least ``launch_sustain_s`` seconds and the
+    segment peak must exceed ``launch_peak_threshold`` so paddock pushes are
+    rejected.
+    """
+    if len(speed) == 0:
+        raise ValueError('No GPS samples available — cannot find launch.')
+
+    if len(t) > 1:
+        dt = float(np.median(np.diff(t)))
+        if dt <= 0.0 or not np.isfinite(dt):
+            dt = 1.0 / AUTO_PARAMS['sample_hz']
+    else:
+        dt = 1.0 / AUTO_PARAMS['sample_hz']
+
+    default_smooth = max(5, int(round(0.5 / dt)))
+    smooth_n = max(5, int(params.get('launch_smooth_samples', default_smooth)))
+    sustain_s = float(params.get('launch_sustain_s', 2.0))
+    peak_thresh = float(params.get('launch_peak_threshold', 10.0))
+    min_samples = max(1, int(round(sustain_s / dt)))
+    min_vel = float(params['min_vel'])
+
+    sp_smooth = uniform_filter1d(speed.astype(float, copy=False), size=smooth_n)
+    moving = sp_smooth > min_vel
+
+    in_run = False
+    seg_start = -1
+    seg_peak = -1.0
+    for i, is_moving in enumerate(moving):
+        if is_moving:
+            v = float(sp_smooth[i])
+            if not in_run:
+                in_run = True
+                seg_start = i
+                seg_peak = v
+            elif v > seg_peak:
+                seg_peak = v
+            continue
+        if in_run:
+            seg_end = i - 1
+            if (seg_end - seg_start) >= min_samples and seg_peak >= peak_thresh:
+                return seg_start
+            in_run = False
+            seg_start = -1
+            seg_peak = -1.0
+    if in_run:
+        seg_end = len(moving) - 1
+        if (seg_end - seg_start) >= min_samples and seg_peak >= peak_thresh:
+            return seg_start
+
+    raise ValueError(
+        'No sustained sprint found — smoothed GPS speed never stayed above '
+        f'{min_vel:.2f} m/s for {sustain_s:.1f}s with a peak above '
+        f'{peak_thresh:.1f} m/s.'
+    )
+
+
 def detect_acceleration_run(
     xg: np.ndarray,
     yg: np.ndarray,
@@ -566,39 +634,44 @@ def detect_acceleration_run(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int, float, float, np.ndarray]:
     """Detect the 75 m Formula Student acceleration run.
 
-    This mirrors the ROS mission 0 logic: once the car reaches ``min_vel``, the
-    finish line is placed ``accel_distance`` metres ahead in the current heading
-    direction and the run ends when the trace crosses that line within
-    ``dist_max`` metres of its centre.
+    Launch is the start of the first sustained sprint (see
+    ``_find_acceleration_launch``). The finish is the sample where the
+    integrated path length from launch first reaches ``accel_distance``;
+    path-length is used instead of a fixed straight-line finish so that minor
+    steering corrections do not displace the gate. The finish gate geometry
+    returned is centred on the car position at the 75 m mark with its tangent
+    perpendicular to the local heading there — useful for map overlays.
     """
-    moving = np.where(speed > params['min_vel'])[0]
-    if len(moving) == 0:
-        raise ValueError('No movement found — check GPS or min_vel.')
-    start_idx = int(moving[0])
+    start_idx = _find_acceleration_launch(speed, t, params)
 
-    heading_hat = _trajectory_tangent_at_index(
-        xg, yg, start_idx, int(params['dir_window']),
-    )
-    finish_x = float(xg[start_idx] + float(params['accel_distance']) * heading_hat[0])
-    finish_y = float(yg[start_idx] + float(params['accel_distance']) * heading_hat[1])
+    seg_lengths = np.hypot(np.diff(xg[start_idx:]), np.diff(yg[start_idx:]))
+    cumpath = np.concatenate([[0.0], np.cumsum(seg_lengths)])
+    accel_distance = float(params['accel_distance'])
+    if cumpath[-1] < accel_distance:
+        raise ValueError(
+            f'Run too short — path length from launch only reaches '
+            f'{cumpath[-1]:.1f} m, need {accel_distance:.1f} m.'
+        )
+    rel_idx = int(np.searchsorted(cumpath, accel_distance))
+    rel_idx = int(np.clip(rel_idx, 1, len(cumpath) - 1))
+    finish_idx = start_idx + rel_idx
+
+    finish_x = float(xg[finish_idx])
+    finish_y = float(yg[finish_idx])
+    win = int(params['dir_window'])
+    i1 = max(start_idx, finish_idx - win)
+    i2 = min(len(xg) - 1, finish_idx + win)
+    h_dx = float(xg[i2] - xg[i1])
+    h_dy = float(yg[i2] - yg[i1])
+    h_norm = float(np.hypot(h_dx, h_dy))
+    if h_norm < 1e-3:
+        h_dx = finish_x - float(xg[start_idx])
+        h_dy = finish_y - float(yg[start_idx])
+        h_norm = float(np.hypot(h_dx, h_dy))
+        if h_norm < 1e-3:
+            raise ValueError('Cannot determine heading at acceleration finish.')
+    heading_hat = np.array([h_dx, h_dy], dtype=float) / h_norm
     t_hat = np.array([-heading_hat[1], heading_hat[0]], dtype=float)
-
-    signed_dist = (xg - finish_x) * heading_hat[0] + (yg - finish_y) * heading_hat[1]
-    dist_to_finish = np.hypot(xg - finish_x, yg - finish_y)
-    finish_idx: int | None = None
-    for k in range(start_idx + 1, len(xg)):
-        crossed = (signed_dist[k - 1] <= 0.0) and (signed_dist[k] > 0.0)
-        in_window = float(dist_to_finish[k]) <= float(params['dist_max'])
-        if crossed and in_window:
-            finish_idx = k
-            break
-
-    if finish_idx is None:
-        after_finish = np.where(signed_dist[start_idx + 1:] > 0.0)[0]
-        if len(after_finish) == 0:
-            raise ValueError('Acceleration finish line was not reached.')
-        candidates = after_finish + start_idx + 1
-        finish_idx = int(candidates[int(np.argmin(dist_to_finish[candidates]))])
 
     duration_s = float(t[finish_idx] - t[start_idx])
     if duration_s <= 0.0 or not np.isfinite(duration_s):
