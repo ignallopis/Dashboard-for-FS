@@ -1,0 +1,32 @@
+Copyright (c) 2026 Ignacio Llopis. All Rights Reserved.
+
+This source code and all accompanying materials (the "Software") are the
+exclusive intellectual property of Ignacio Llopis.
+
+The Software is published on this public repository for portfolio, evaluation
+and demonstration purposes only. No license — express or implied — is granted
+to any person obtaining a copy of the Software.
+
+Without prior written permission from the copyright holder, you may NOT:
+
+  1. Use the Software, in whole or in part, for any commercial purpose.
+  2. Copy, reproduce, redistribute, publish or sublicense the Software.
+  3. Modify, adapt, translate or create derivative works based on the Software.
+  4. Reverse engineer the Software beyond what is strictly required to evaluate
+     it as a portfolio piece.
+  5. Remove or alter any copyright, trademark or attribution notices.
+  6. Use the name "CAT17x Telemetry Dashboard", the author's name or any
+     associated branding to endorse or promote derived products.
+
+Viewing the source code on this repository is permitted. Cloning the
+repository for the sole purpose of local, private evaluation is permitted.
+Any other use requires a separate written agreement with the copyright
+holder.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM THE
+USE OF THE SOFTWARE.
+
+For licensing enquiries, contact: ignalloba@gmail.com

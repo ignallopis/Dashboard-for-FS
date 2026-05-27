@@ -10,3 +10,4 @@ data/
 .streamlit/
 videos/
 AGENTS.md
+.playwright-mcp/
