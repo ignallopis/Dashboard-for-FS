@@ -42,10 +42,12 @@ from utils import (
     add_lap_scatter,
     add_trend_line,
     cols_to_numpy,
+    driver_color,
     ensure_complete_laps_df,
     exclude_lap0_and_last_lap,
     lap_dist_from_gps,
     per_lap_axis,
+    series_or_nan,
     unique_laps,
     WHEEL_COLORS,
 )
@@ -65,6 +67,14 @@ WHEELS = ("FL", "FR", "RL", "RR")
 # calibration candidates, not measured CAT17x constants.
 CRR_TIRE = 0.015
 CALPHA_AXLE_TOTAL = 120_000.0  # [N/rad], front + rear axle cornering stiffness assumption
+
+# Endurance strategy inputs. The pack capacity is NOT in Parameters.m — this is
+# a placeholder the team must set to the accumulator's usable energy. The OT
+# limits come from Parameters.m (Motor/Inverter "OT error"); real derating
+# usually begins a few °C below these, so headroom-to-limit is conservative.
+ACCUMULATOR_USABLE_KWH_DEFAULT = 6.0   # [kWh] PLACEHOLDER — confirm per car
+MOTOR_OT_LIMIT_C = 120.0               # [°C] Parameters.m: Motor OT error
+INVERTER_OT_LIMIT_C = 75.0             # [°C] Parameters.m: Inverter OT error
 
 # Dark theme (mirrors utils.py for subplot figures)
 _BG = "#141417"
@@ -982,9 +992,8 @@ def energy_budget_per_lap_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, 
         for lap, run in zip(laps, run_names)
     ]
 
-    palette = ["#4DB3F2", "#F28C40", "#73D973", "#D973D9", "#FFD84D", "#66E0C2"]
     unique_runs = list(dict.fromkeys(run_names))
-    run_color = {name: palette[i % len(palette)] for i, name in enumerate(unique_runs)}
+    run_color = {name: driver_color(name) for name in unique_runs}
     border_colors = [run_color[name] for name in run_names]
 
     fig = make_dark_figure(
@@ -1560,6 +1569,135 @@ def thermal_evolution_fig(
     return fig, kpis
 
 
+# ── Endurance strategy (pure projections — reuse energy/battery/thermal KPIs) ─
+
+def _finish_level(soc_proj_end: float, energy_margin_pct: float) -> str:
+    """Most-conservative finish verdict from SoC reserve and energy margin.
+
+    SHORT  = projected to run out before the flag.
+    TIGHT  = finishes with < 5 % reserve (SoC points or pack %).
+    OK     = comfortable margin.
+    """
+    levels: list[str] = []
+    if np.isfinite(soc_proj_end):
+        levels.append("SHORT" if soc_proj_end < 0 else "TIGHT" if soc_proj_end < 5.0 else "OK")
+    if np.isfinite(energy_margin_pct):
+        levels.append("SHORT" if energy_margin_pct < 0 else "TIGHT" if energy_margin_pct < 5.0 else "OK")
+    for level in ("SHORT", "TIGHT", "OK"):
+        if level in levels:
+            return level
+    return "UNKNOWN"
+
+
+def endurance_projection(
+    runs: dict[str, dict],
+    target_laps: int,
+    usable_pack_kwh: float,
+) -> dict[str, dict]:
+    """Per-run finish-the-endurance projection from logged energy + SoC.
+
+    `runs[name]` must provide scalars already computed elsewhere (no recompute):
+    ``e_mean`` (net kWh/lap), ``soc_start``/``soc_end`` (%), ``soc_drop_per_lap``
+    (%/lap), ``laps_done`` (int). Two complementary framings:
+      • SoC:    soc_proj_end = soc_end − soc_drop_per_lap · remaining_laps
+      • Energy: margin = usable_pack_kwh − e_mean · target_laps, plus the
+                lift&coast (% energy cut/lap) needed to fit the budget.
+    Returns a per-run dict including a conservative ``verdict``.
+    """
+    out: dict[str, dict] = {}
+    target_laps = int(target_laps)
+    for name, k in runs.items():
+        e_mean = float(k.get("e_mean", float("nan")))
+        soc_start = float(k.get("soc_start", float("nan")))
+        soc_end = float(k.get("soc_end", float("nan")))
+        soc_drop = float(k.get("soc_drop_per_lap", float("nan")))
+        laps_done = int(k.get("laps_done", 0) or 0)
+        remaining = max(target_laps - laps_done, 0)
+
+        # SoC framing
+        soc_needed = soc_drop * remaining if np.isfinite(soc_drop) else float("nan")
+        soc_proj_end = (
+            soc_end - soc_needed
+            if np.isfinite(soc_needed) and np.isfinite(soc_end)
+            else float("nan")
+        )
+
+        # Energy-budget framing
+        energy_total = e_mean * target_laps if np.isfinite(e_mean) else float("nan")
+        energy_margin = (
+            usable_pack_kwh - energy_total if np.isfinite(energy_total) else float("nan")
+        )
+        energy_margin_pct = (
+            energy_margin / usable_pack_kwh * 100.0
+            if np.isfinite(energy_margin) and usable_pack_kwh > 0
+            else float("nan")
+        )
+        liftcoast = float("nan")
+        if np.isfinite(e_mean) and e_mean > 0 and target_laps > 0:
+            allowed_per_lap = usable_pack_kwh / target_laps
+            liftcoast = max(0.0, (1.0 - allowed_per_lap / e_mean) * 100.0)
+
+        out[name] = {
+            "laps_done": laps_done,
+            "remaining_laps": remaining,
+            "e_mean_kwh": e_mean,
+            "soc_start": soc_start,
+            "soc_end": soc_end,
+            "soc_drop_per_lap": soc_drop,
+            "soc_needed_to_finish": soc_needed,
+            "soc_projected_end": soc_proj_end,
+            "finish_on_soc": bool(np.isfinite(soc_proj_end) and soc_proj_end >= 0.0),
+            "energy_total_projected_kwh": energy_total,
+            "energy_margin_kwh": energy_margin,
+            "finish_on_energy": bool(np.isfinite(energy_margin) and energy_margin >= 0.0),
+            "liftcoast_required_pct": liftcoast,
+            "verdict": _finish_level(soc_proj_end, energy_margin_pct),
+        }
+    return out
+
+
+def thermal_headroom(
+    peak_motor_c: float,
+    peak_inverter_c: float,
+    motor_slope_c_per_lap: float,
+    remaining_laps: int,
+) -> dict:
+    """Headroom-to-OT-limit and end-of-stint projection for motor/inverter.
+
+    `peak_*` are the observed P95 peaks (from thermal_evolution_fig kpis),
+    `motor_slope_c_per_lap` is its per-lap thermal slope. Projects the motor peak
+    forward by the slope and flags derate risk if it would cross MOTOR_OT_LIMIT_C.
+    """
+    motor_headroom = (
+        MOTOR_OT_LIMIT_C - peak_motor_c if np.isfinite(peak_motor_c) else float("nan")
+    )
+    inv_headroom = (
+        INVERTER_OT_LIMIT_C - peak_inverter_c
+        if np.isfinite(peak_inverter_c)
+        else float("nan")
+    )
+    motor_proj = (
+        peak_motor_c + motor_slope_c_per_lap * max(int(remaining_laps), 0)
+        if np.isfinite(peak_motor_c) and np.isfinite(motor_slope_c_per_lap)
+        else float("nan")
+    )
+    if np.isfinite(motor_proj):
+        derate_risk = "SHORT" if motor_proj >= MOTOR_OT_LIMIT_C else (
+            "TIGHT" if motor_proj >= MOTOR_OT_LIMIT_C - 10.0 else "OK"
+        )
+    else:
+        derate_risk = "UNKNOWN"
+    return {
+        "motor_peak_c": peak_motor_c,
+        "inverter_peak_c": peak_inverter_c,
+        "motor_headroom_c": motor_headroom,
+        "inverter_headroom_c": inv_headroom,
+        "motor_slope_c_per_lap": motor_slope_c_per_lap,
+        "motor_projected_end_c": motor_proj,
+        "derate_risk": derate_risk,
+    }
+
+
 # ── Entry point (standalone CLI) ────────────────────────────────────────────
 
 
@@ -1750,20 +1888,9 @@ CTRL_TORQUE_ALIASES = {
 }
 
 
-def _first_existing_col(df: pl.DataFrame, aliases: tuple[str, ...]) -> str | None:
-    return next((col for col in aliases if col in df.columns), None)
-
-
-def _series_or_nan(df: pl.DataFrame, aliases: tuple[str, ...]) -> np.ndarray:
-    col = _first_existing_col(df, aliases)
-    if col is None:
-        return np.full(len(df), np.nan, dtype=float)
-    return df[col].to_numpy().astype(float)
-
-
 def _torque_matrix(df: pl.DataFrame, group: str) -> np.ndarray:
     return np.stack([
-        _series_or_nan(df, CTRL_TORQUE_ALIASES[group][w]) for w in WHEELS
+        series_or_nan(df, CTRL_TORQUE_ALIASES[group][w]) for w in WHEELS
     ], axis=1)
 
 
@@ -1779,10 +1906,10 @@ def pc_master_attribution_figs_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], 
     ax = df[ax_col].to_numpy().astype(float) if ax_col in df.columns else np.full(len(df), np.nan)
     vx_col = "Est_vxCOG" if "Est_vxCOG" in df.columns else "VN_vx"
     vx = df[vx_col].to_numpy().astype(float) if vx_col in df.columns else np.full(len(df), np.nan)
-    command = _series_or_nan(df, ("LLC_Command", "llc_command"))
-    throttle = _series_or_nan(df, ("Throttle", "throttle"))
-    vbat = _series_or_nan(df, ("Vbat", "v_bat", "V_bat"))
-    current = _series_or_nan(df, ("Current", "current"))
+    command = series_or_nan(df, ("LLC_Command", "llc_command"))
+    throttle = series_or_nan(df, ("Throttle", "throttle"))
+    vbat = series_or_nan(df, ("Vbat", "v_bat", "V_bat"))
+    current = series_or_nan(df, ("Current", "current"))
     p_bat_kw = vbat * current / 1000.0
 
     pc = _torque_matrix(df, "pc")

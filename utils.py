@@ -1,8 +1,9 @@
 """Shared utilities for CAT17x data analysis (Formula Student 4WD Electric)."""
 from __future__ import annotations
+import hashlib
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Iterable, Literal
 import numpy as np
 import polars as pl
 import plotly.graph_objects as go
@@ -12,10 +13,88 @@ _BG   = '#141417'
 _TEXT = '#EBEBEB'
 _GRID = 'rgba(128,128,128,0.2)'
 _AXIS = '#E5E5E5'
+# Shared font family so Plotly charts match the Streamlit UI typography.
+FONT_FAMILY = '"Source Sans Pro", system-ui, -apple-system, "Segoe UI", sans-serif'
 
 # Per-wheel colours: FL=blue, FR=orange, RL=green, RR=purple
 WHEEL_COLORS  = {'FL': '#4DB3F2', 'FR': '#F28C40', 'RL': '#73D973', 'RR': '#D973D9'}
 WHEEL_SYMBOLS = {'FL': 'circle',  'FR': 'square',  'RL': 'triangle-up', 'RR': 'diamond'}
+
+# ── Driver / run identity colours ──────────────────────────────────────────────
+# Single source of truth for "which colour is this driver/run". Used by every
+# module so a given driver keeps the same colour across all tabs. Colours are
+# assigned by name (not by load order), so e.g. Martinez is the same colour
+# whether loaded alone or next to Cerpa.
+DRIVER_PALETTE: tuple[str, ...] = (
+    "#4DB3F2",  # blue
+    "#F28C40",  # orange
+    "#73D973",  # green
+    "#D973D9",  # magenta
+    "#F2C94C",  # yellow
+    "#9B51E0",  # purple
+    "#56CCF2",  # cyan
+    "#EB5757",  # red
+)
+# Synthetic / non-driver series get a neutral colour instead of a palette slot.
+NEUTRAL_REF_COLOR = "#F2F2F2"
+_SPECIAL_RUN_COLORS: dict[str, str] = {"__potential_lap__": NEUTRAL_REF_COLOR}
+# Process-global registry, re-seeded each render by set_run_colors().
+_RUN_COLOR_REGISTRY: dict[str, str] = {}
+
+
+def driver_key(name: object) -> str:
+    """Normalise a run/driver identifier (strip path and .csv) for colour lookup."""
+    text = str(name)
+    return Path(text).stem if text else text
+
+
+def _palette_index(key: str) -> int:
+    digest = hashlib.md5(key.encode("utf-8")).hexdigest()
+    return int(digest, 16) % len(DRIVER_PALETTE)
+
+
+def set_run_colors(names: Iterable[object]) -> None:
+    """Seed stable, collision-free colours for the currently loaded runs.
+
+    Each driver keeps a colour derived from its name (deterministic across
+    sessions); when two loaded drivers hash to the same slot, the later one is
+    nudged to the next free slot so on-screen runs are always distinguishable.
+    """
+    keys: list[str] = []
+    for name in names:
+        key = driver_key(name)
+        if key in _SPECIAL_RUN_COLORS or key in keys:
+            continue
+        keys.append(key)
+
+    used: set[str] = set()
+    mapping: dict[str, str] = {}
+    for key in keys:
+        idx = _palette_index(key)
+        start = idx
+        while DRIVER_PALETTE[idx] in used:
+            idx = (idx + 1) % len(DRIVER_PALETTE)
+            if idx == start:
+                break
+        used.add(DRIVER_PALETTE[idx])
+        mapping[key] = DRIVER_PALETTE[idx]
+
+    _RUN_COLOR_REGISTRY.clear()
+    _RUN_COLOR_REGISTRY.update(mapping)
+
+
+def driver_color(name: object) -> str:
+    """Return the stable identity colour for a run/driver name.
+
+    Falls back to a deterministic hash when the name was not seeded (e.g. a
+    single-run figure built before set_run_colors ran).
+    """
+    key = driver_key(name)
+    if key in _SPECIAL_RUN_COLORS:
+        return _SPECIAL_RUN_COLORS[key]
+    if key in _RUN_COLOR_REGISTRY:
+        return _RUN_COLOR_REGISTRY[key]
+    return DRIVER_PALETTE[_palette_index(key)]
 PerLapAxisMode = Literal['laps', 'laptime']
 COMPLETE_LAPS_MARKER = '__complete_laps_only'
 PHASE_MASK_COLUMNS = {
@@ -41,10 +120,10 @@ def make_dark_figure(title: str = '', xlabel: str = '', ylabel: str = '') -> go.
     """Return a Plotly Figure with dark motorsport styling."""
     fig = go.Figure()
     fig.update_layout(
-        title=dict(text=title, font=dict(size=14, color=_TEXT)),
+        title=dict(text=title, font=dict(size=14, color=_TEXT, family=FONT_FAMILY)),
         paper_bgcolor=_BG,
         plot_bgcolor=_BG,
-        font=dict(color=_TEXT, size=11),
+        font=dict(color=_TEXT, size=11, family=FONT_FAMILY),
         xaxis=dict(title=xlabel, color=_AXIS, gridcolor=_GRID,
                    linecolor=_AXIS, tickcolor=_AXIS, showgrid=True),
         yaxis=dict(title=ylabel, color=_AXIS, gridcolor=_GRID,
@@ -111,6 +190,18 @@ def per_lap_axis(
 
     order = np.argsort(x, kind='mergesort')
     return x[order], order, xlabel
+
+
+def per_lap_axis_or_empty(
+    lap_ids: np.ndarray,
+    lap_times_s: np.ndarray,
+    mode: PerLapAxisMode,
+    mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """Like :func:`per_lap_axis` but return empty arrays when *mask* selects nothing."""
+    if not mask.any():
+        return np.array([]), np.array([], dtype=int), 'Lap'
+    return per_lap_axis(lap_ids[mask], lap_times_s[mask], mode)
 
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
@@ -213,6 +304,19 @@ def cols_to_numpy(
     if missing:
         raise KeyError(f"Missing columns: {missing}")
     return {c: df[c].to_numpy().astype(dtype) for c in cols}
+
+
+def first_existing_col(df: pl.DataFrame, aliases: tuple[str, ...]) -> str | None:
+    """Return the first column name in *aliases* present in *df*, else None."""
+    return next((col for col in aliases if col in df.columns), None)
+
+
+def series_or_nan(df: pl.DataFrame, aliases: tuple[str, ...]) -> np.ndarray:
+    """Return the first available aliased column as float, else an all-NaN array."""
+    col = first_existing_col(df, aliases)
+    if col is None:
+        return np.full(len(df), np.nan, dtype=float)
+    return df[col].to_numpy().astype(float)
 
 
 def ensure_detected_laps_df(df: pl.DataFrame) -> pl.DataFrame:

@@ -17,8 +17,10 @@ import plotly.graph_objects as go
 
 from utils import (
     COMPLETE_LAPS_MARKER,
+    FONT_FAMILY,
     make_dark_figure, add_lap_scatter, add_trend_line, add_zero_line,
     cols_to_numpy,
+    driver_color,
     ensure_complete_laps_df,
     lap_dist_from_gps,
     keep_min_duration_segments, exclude_lap0_and_last_lap,
@@ -36,7 +38,11 @@ MIN_CORNER_DURATION = 0.20   # [s]    min cornering event length
 MIN_CORNER_SAMPLES  = 50     # per lap
 
 WHEELBASE_EQ        = 1.53   # [m]  equivalent wheelbase for bicycle model
-STEERING_RATIO      = 3.15   # [-]  Steering channel to road-wheel angle
+STEERING_RATIO      = 3.15   # [-]  mechanical column steering-wheel:road-wheel
+                             # ratio (Parameters.m, reference only). The `Steering`
+                             # channel is the steering-potentiometer value [rad]
+                             # (Variables_CSV.pdf); the team's understeer/yaw
+                             # formulas use it DIRECTLY, so do NOT divide by this.
 MIN_SA_MEAN_DEG     = 1.0    # [deg] slip angles below this are ignored
 MAX_SA_MEAN_DEG     = 15.0   # [deg]
 MAX_SA_EFF          = 5.0    # [m/s²/deg] sanity cap on efficiency
@@ -425,7 +431,7 @@ def _compute_understeer(
     d = exclude_lap0_and_last_lap(d)
 
     dt       = robust_dt(d['time'])
-    steering = d['Steering'] / STEERING_RATIO
+    steering = d['Steering']
     ay_filt  = d['Filtering_VN_ay']
     vx       = d['vx']
     laps     = d['laps']
@@ -443,8 +449,8 @@ def _compute_understeer(
             min_duration_s=MIN_CORNER_DURATION,
         )
 
-    # Bicycle model: δ_ideal = L·ay / vx².  `Steering` is converted to
-    # road-wheel angle with the CAT17x steering ratio before comparison.
+    # Team understeer formula: |Steering| - |L·ay/vx²|. `Steering` is the
+    # steering-potentiometer value [rad], used directly (no STEERING_RATIO).
     ideal_steer = WHEELBASE_EQ * ay_filt / (vx ** 2)
     und_rad     = np.abs(steering) - np.abs(ideal_steer)
     und_deg     = np.rad2deg(und_rad)
@@ -606,7 +612,7 @@ def _understeer_lltd_table_for_run(df: pl.DataFrame, run_name: str) -> tuple[pl.
         min_duration_s=MIN_CORNER_DURATION,
     )
 
-    steering = arr['Steering'] / STEERING_RATIO
+    steering = arr['Steering']
     ideal_steer = WHEELBASE_EQ * ay / (vx ** 2)
     understeer_deg = np.rad2deg(np.abs(steering) - np.abs(ideal_steer))
 
@@ -667,7 +673,6 @@ def understeer_vs_lltd_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dic
     run_summaries: dict[str, dict[str, float | int]] = {}
     all_x: list[float] = []
     all_y: list[float] = []
-    colors = ['#4DB3F2', '#F28C40', '#73D973', '#F27070', '#D973D9', '#F2C94C']
 
     for run_idx, (run_name, df) in enumerate(dfs.items()):
         table, run_warnings = _understeer_lltd_table_for_run(df, run_name)
@@ -680,7 +685,7 @@ def understeer_vs_lltd_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dic
         laps = table['Lap'].to_numpy()
         laptimes = table['LapTime [s]'].to_numpy()
         samples = table['Corner samples'].to_numpy()
-        color = colors[run_idx % len(colors)]
+        color = driver_color(run_name)
         customdata = np.column_stack([laps, laptimes, samples])
         fig.add_trace(go.Scatter(
             x=x,
@@ -882,7 +887,6 @@ def lltd_mid_corner_per_lap_fig(
     tables: list[pl.DataFrame] = []
     warnings: list[str] = []
     runs: dict[str, dict[str, float | int]] = {}
-    colors = ['#4DB3F2', '#F28C40', '#73D973', '#F27070', '#D973D9', '#F2C94C']
 
     for idx, (run_name, df) in enumerate(dfs.items()):
         table, run_warnings = _lltd_mid_corner_table_for_run(df, run_name)
@@ -896,7 +900,7 @@ def lltd_mid_corner_per_lap_fig(
         spans = table['LLTD mid-corner span [pp]'].to_numpy()
         samples = table['Mid-corner samples'].to_numpy()
         x, order, xlabel = per_lap_axis(laps, laptimes, x_mode)
-        color = colors[idx % len(colors)]
+        color = driver_color(run_name)
         customdata = np.column_stack([laps[order], laptimes[order], spans[order], samples[order]])
         fig.add_trace(go.Scatter(
             x=x,
@@ -2344,28 +2348,22 @@ def ideal_braking_curve_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, di
         hoverinfo='skip',
     ))
 
-    run_colors = ['#F28C40', '#73D973', '#D973D9', '#F27070', '#B6E880', '#FF97FF']
-    for idx, payload in enumerate(run_payloads):
+    for payload in run_payloads:
         run_name = str(payload['run_name'])
-        showscale = idx == 0
         fig.add_trace(go.Scattergl(
             x=payload['front_kN'],
             y=payload['rear_kN'],
             mode='markers',
             marker=dict(
-                color=payload['ax_abs'],
-                colorscale='Plasma',
-                cmin=0.0,
-                cmax=color_max,
+                color=driver_color(run_name),
                 size=4,
-                opacity=0.48,
-                colorbar=dict(title='|ax| [m/s²]') if showscale else None,
-                showscale=showscale,
+                opacity=0.45,
             ),
             name=f'{run_name} regen',
+            customdata=payload['ax_abs'],
             hovertemplate=(
                 f'{run_name}<br>Ff=%{{x:.2f}} kN<br>Fr=%{{y:.2f}} kN'
-                '<br>|ax|=%{marker.color:.2f} m/s²<extra></extra>'
+                '<br>|ax|=%{customdata:.2f} m/s²<extra></extra>'
             ),
         ))
         hyd = payload.get('hyd')
@@ -2376,7 +2374,7 @@ def ideal_braking_curve_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, di
                 mode='markers',
                 marker=dict(
                     color='rgba(235,235,235,0.0)',
-                    line=dict(color=run_colors[idx % len(run_colors)], width=1.2),
+                    line=dict(color=driver_color(run_name), width=1.2),
                     size=6,
                     symbol='circle-open',
                     opacity=0.55,
@@ -2482,7 +2480,6 @@ def decel_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     fig = make_dark_figure('Longitudinal Decel Envelope', 'Vehicle speed [m/s]', 'Deceleration |ax| [g]')
     warnings: list[str] = []
     runs: dict[str, dict[str, float]] = {}
-    colors = ['#4DB3F2', '#F28C40', '#73D973', '#D973D9', '#F27070']
     for idx, (run_name, df_in) in enumerate(dfs.items()):
         df = ensure_complete_laps_df(df_in)
         missing = [c for c in required if c not in df.columns]
@@ -2508,7 +2505,7 @@ def decel_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
             percentile=95.0,
         )
         valid = np.isfinite(p95_g)
-        color = colors[idx % len(colors)]
+        color = driver_color(run_name)
         stride = max(1, int(np.ceil(vx_b.size / 6000)))
         fig.add_trace(go.Scattergl(
             x=vx_b[::stride],
@@ -2827,7 +2824,6 @@ def braking_stability_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict
             'runs': {}, 'warnings': ['No runs selected.'], 'events_by_run': {},
         }
 
-    colors = ['#4DB3F2', '#F28C40', '#73D973', '#D973D9', '#F27070']
     for idx, (run_name, df_in) in enumerate(dfs.items()):
         evt_df, run_warnings = _compute_braking_stability_events(df_in)
         for w in run_warnings:
@@ -2836,7 +2832,7 @@ def braking_stability_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict
         if evt_df.is_empty():
             continue
 
-        color = colors[idx % len(colors)]
+        color = driver_color(run_name)
         x_start = evt_df['start_time_s'].to_numpy()
         y_kpi = evt_df['stability_kpi'].to_numpy()
         laps = evt_df['lap'].to_numpy()
@@ -2956,10 +2952,10 @@ def braking_stability_per_lap_fig(
 
     if not dfs:
         fig.update_layout(template='plotly_dark', height=620,
+                          font=dict(family=FONT_FAMILY),
                           margin=dict(l=70, r=35, t=70, b=65))
         return fig, {'runs': {}, 'warnings': ['No runs selected.']}
 
-    colors = ['#4DB3F2', '#F28C40', '#73D973', '#D973D9', '#F27070']
     xlabel = 'Lap'
     any_data = False
     for idx, (run_name, df_in) in enumerate(dfs.items()):
@@ -2984,7 +2980,7 @@ def braking_stability_per_lap_fig(
             x_vals = lap_ids.astype(float)
             order = np.argsort(x_vals)
 
-        color = colors[idx % len(colors)]
+        color = driver_color(run_name)
         custom_top = np.column_stack([lap_ids[order], lap_times[order]])
         fig.add_trace(
             go.Scatter(
@@ -3042,6 +3038,7 @@ def braking_stability_per_lap_fig(
 
     fig.update_layout(
         template='plotly_dark',
+        font=dict(family=FONT_FAMILY),
         height=640, margin=dict(l=70, r=35, t=70, b=65),
         barmode='group', hovermode='x unified',
         legend=dict(
@@ -3160,28 +3157,27 @@ def ideal_traction_curve_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, d
             'samples': int(m.sum()),
         }
 
-    run_colors = ['#32A6F0', '#54F0FF', '#A0D0FF', '#7BC8F8']
     for idx, payload in enumerate(payloads):
         mean_vx = payload['mean_vx']
         f_curve, r_curve, _ = _ideal_traction_forces(ax_grid, mean_vx)
-        color = run_colors[idx % len(run_colors)]
+        color = driver_color(str(payload['run_name']))
         fig.add_trace(go.Scatter(
             x=f_curve / 1000.0, y=r_curve / 1000.0,
             mode='lines', line=dict(color=color, width=2.2),
             name=f"Ideal {payload['run_name']} ({mean_vx:.0f} m/s)",
         ))
-    for idx, payload in enumerate(payloads):
+    for payload in payloads:
+        run_name = str(payload['run_name'])
         fig.add_trace(go.Scattergl(
             x=payload['front_kN'], y=payload['rear_kN'],
             mode='markers',
-            marker=dict(
-                color=payload['ax'], colorscale='Plasma', cmin=0.0, cmax=color_max,
-                size=4, opacity=0.46,
-                colorbar=dict(title='ax [m/s²]') if idx == 0 else None,
-                showscale=idx == 0,
+            marker=dict(color=driver_color(run_name), size=4, opacity=0.46),
+            name=f"{run_name} drive",
+            customdata=payload['ax'],
+            hovertemplate=(
+                f'{run_name}<br>Ff=%{{x:.2f}} kN<br>Fr=%{{y:.2f}} kN'
+                '<br>ax=%{customdata:.2f} m/s²<extra></extra>'
             ),
-            name=f"{payload['run_name']} drive",
-            hovertemplate='Ff=%{x:.2f} kN<br>Fr=%{y:.2f} kN<br>ax=%{marker.color:.2f} m/s²<extra></extra>',
         ))
     force_limit_kN = MU_TIRE * MASS_KG * G_MPS2 / 1000.0
     fig.add_trace(go.Scatter(
@@ -3203,7 +3199,6 @@ def accel_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     fig = make_dark_figure('Longitudinal Accel Envelope', 'Vehicle speed [m/s]', 'ax [g]')
     warnings: list[str] = []
     runs: dict[str, dict[str, float]] = {}
-    colors = ['#4DB3F2', '#F28C40', '#A67CF5', '#D973D9', '#F27070']
     all_ax_g: list[float] = []
     for idx, (run_name, df_in) in enumerate(dfs.items()):
         df = ensure_complete_laps_df(df_in)
@@ -3223,7 +3218,7 @@ def accel_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
         ax_g_m = ax[m] / G_MPS2
         all_ax_g.append(float(np.nanmax(ax_g_m)))
         stride = max(1, int(np.ceil(vx_m.size / 8000)))
-        color = colors[idx % len(colors)]
+        color = driver_color(run_name)
         fig.add_trace(go.Scattergl(
             x=vx_m[::stride], y=ax_g_m[::stride],
             mode='markers',
@@ -3947,7 +3942,10 @@ def steering_vs_ay_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
     dt = robust_dt(time_s)
 
     ay   = arr['Filtering_VN_ay']
-    steer = arr['Steering'] / STEERING_RATIO
+    # `Steering` = steering-potentiometer value [rad], used directly per the
+    # team's understeer formula — consistent with understeer_angle_fig and the
+    # Ackermann ideal below. (Do NOT divide by STEERING_RATIO.)
+    steer = arr['Steering']
     vx   = arr['VN_vx']
 
     # Steady state: Lap-Analysis radius cornering plus low ay/steer jerk.
@@ -3976,7 +3974,7 @@ def steering_vs_ay_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
     fig = make_dark_figure(
         title='Steering vs Lateral Acceleration  ·  US/OS handling curve',
         xlabel='Lateral acceleration ay [m/s²]',
-        ylabel='Steering (road-wheel) [deg]',
+        ylabel='Steering [deg]',
     )
     fig.add_trace(go.Scattergl(
         x=ay_c, y=steer_c, mode='markers',

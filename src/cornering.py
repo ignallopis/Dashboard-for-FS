@@ -12,6 +12,7 @@ from scipy.signal import savgol_filter
 
 import src.dynamics as dyn
 from utils import (
+    driver_color,
     ensure_complete_laps_df,
     keep_min_duration_segments,
     lap_dist_from_gps,
@@ -62,18 +63,6 @@ _TURN_PALETTE = (
     "#2D9CDB",
     "#F2C94C",
 )
-_COMPARISON_TRACE_PALETTE = (
-    "#4DB3F2",
-    "#F28C40",
-    "#73D973",
-    "#D973D9",
-    "#F2C94C",
-    "#56CCF2",
-    "#EB5757",
-    "#9B51E0",
-)
-
-
 @dataclass(frozen=True)
 class TurnDef:
     turn_id: int
@@ -616,16 +605,9 @@ def _fastest_lap_for_run(metrics: pl.DataFrame, run_name: str) -> int | None:
     return int(laps.get_column("lap")[0]) if laps.height > 0 else None
 
 
-def _comparison_trace_color(index: int) -> str:
-    return _COMPARISON_TRACE_PALETTE[index % len(_COMPARISON_TRACE_PALETTE)]
-
-
 def _run_split_positions(metrics: pl.DataFrame) -> tuple[dict[str, float], float]:
     """Return x positions that split each turn subplot by run."""
-    run_names = [
-        str(run)
-        for run in metrics.select("run").unique().sort("run").get_column("run").to_list()
-    ]
+    run_names = _run_names(metrics)
     if not run_names:
         return {}, 0.12
     if len(run_names) == 1:
@@ -1271,7 +1253,7 @@ def turn_speed_story_fig(metrics: pl.DataFrame, turn_id: int) -> go.Figure:
         sub = metrics.filter((pl.col("run") == run_name) & (pl.col("turn_id") == int(turn_id)))
         if sub.is_empty():
             continue
-        color = _comparison_trace_color(idx)
+        color = driver_color(run_name)
         mean_values = [
             float(sub.get_column("v_entry_mps").mean()),
             float(sub.get_column("v_apex_mps").mean()),
@@ -1498,12 +1480,10 @@ def corner_metric_bars_fig(
         return fig
 
     x = [f"T{turn_id}" for turn_id in turn_ids]
-    color_idx = 0
     for run_name in run_names:
         run_label = Path(run_name).stem
         mean_values = _mean_series_by_turn(metrics, run_name, value_col, turn_ids)
-        mean_color = _comparison_trace_color(color_idx)
-        color_idx += 1
+        mean_color = driver_color(run_name)
         fig.add_trace(
             go.Bar(
                 x=x,
@@ -1518,8 +1498,7 @@ def corner_metric_bars_fig(
         if fastest_lap is None:
             continue
         fast_values = _series_by_turn(metrics, run_name, fastest_lap, value_col, turn_ids)
-        fast_color = _comparison_trace_color(color_idx)
-        color_idx += 1
+        fast_color = driver_color(run_name)
         fig.add_trace(
             go.Scatter(
                 x=x,

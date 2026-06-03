@@ -33,8 +33,9 @@ from utils import (
     keep_min_duration_segments,
     lap_dist_from_gps,
     make_dark_figure,
-    per_lap_axis,
+    per_lap_axis_or_empty,
     robust_dt,
+    series_or_nan,
     unique_laps,
 )
 
@@ -314,6 +315,10 @@ def _compute_tc(d: dict[str, np.ndarray]) -> dict:
     }
 
 
+def _vs_axis(x_mode: str) -> str:
+    return "Lap Time" if x_mode == "laptime" else "Lap"
+
+
 def _build_tc_figures(res: dict, x_mode: str = "laps") -> list[go.Figure]:
     lap_list = res["lap_list"]
     lt_val = res["lt_val"]
@@ -321,18 +326,19 @@ def _build_tc_figures(res: dict, x_mode: str = "laps") -> list[go.Figure]:
     wheel_ok = res["wheel_ok"]
     base_ok = res["base_ok"]
     eff_ok = res["eff_ok"]
+    vs = _vs_axis(x_mode)
 
     figs: list[go.Figure] = []
 
-    x_glob, order_glob, xlabel = per_lap_axis(lap_list[glob_ok], lt_val[glob_ok], x_mode) if glob_ok.any() else (np.array([]), np.array([], dtype=int), "Lap")
-    fig = make_dark_figure(f"Global SR MAE vs {'Lap Time' if x_mode == 'laptime' else 'Lap'}", xlabel, "MAE SR global")
+    x_glob, order_glob, xlabel = per_lap_axis_or_empty(lap_list, lt_val, x_mode, glob_ok)
+    fig = make_dark_figure(f"Global SR MAE vs {vs}", xlabel, "MAE SR global")
     if glob_ok.any():
         add_lap_scatter(fig, x_glob, res["mae_global"][glob_ok][order_glob], lap_list[glob_ok][order_glob])
         if x_mode == "laps":
             fig.update_xaxes(tickvals=np.sort(lap_list[glob_ok].astype(int)))
     figs.append(fig)
 
-    fig = make_dark_figure(f"Global SR Bias vs {'Lap Time' if x_mode == 'laptime' else 'Lap'}", xlabel, "Bias SR global")
+    fig = make_dark_figure(f"Global SR Bias vs {vs}", xlabel, "Bias SR global")
     if glob_ok.any():
         add_lap_scatter(
             fig,
@@ -346,8 +352,8 @@ def _build_tc_figures(res: dict, x_mode: str = "laps") -> list[go.Figure]:
             fig.update_xaxes(tickvals=np.sort(lap_list[glob_ok].astype(int)))
     figs.append(fig)
 
-    x_wheel, order_wheel, xlabel_wheel = per_lap_axis(lap_list[wheel_ok], lt_val[wheel_ok], x_mode) if wheel_ok.any() else (np.array([]), np.array([], dtype=int), "Lap")
-    fig = make_dark_figure(f"Per-Wheel SR MAE vs {'Lap Time' if x_mode == 'laptime' else 'Lap'}", xlabel_wheel, "MAE SR per wheel")
+    x_wheel, order_wheel, xlabel_wheel = per_lap_axis_or_empty(lap_list, lt_val, x_mode, wheel_ok)
+    fig = make_dark_figure(f"Per-Wheel SR MAE vs {vs}", xlabel_wheel, "MAE SR per wheel")
     if wheel_ok.any():
         for w in WHEELS:
             add_lap_scatter(
@@ -363,7 +369,7 @@ def _build_tc_figures(res: dict, x_mode: str = "laps") -> list[go.Figure]:
             fig.update_xaxes(tickvals=np.sort(lap_list[wheel_ok].astype(int)))
     figs.append(fig)
 
-    fig = make_dark_figure(f"Per-Wheel SR Bias vs {'Lap Time' if x_mode == 'laptime' else 'Lap'}", xlabel_wheel, "Bias SR per wheel")
+    fig = make_dark_figure(f"Per-Wheel SR Bias vs {vs}", xlabel_wheel, "Bias SR per wheel")
     if wheel_ok.any():
         for w in WHEELS:
             add_lap_scatter(
@@ -381,8 +387,8 @@ def _build_tc_figures(res: dict, x_mode: str = "laps") -> list[go.Figure]:
     figs.append(fig)
 
     ok_pct = base_ok & np.isfinite(res["in_tgt_pct_glob"])
-    x_pct, order_pct, xlabel_pct = per_lap_axis(lap_list[ok_pct], lt_val[ok_pct], x_mode) if ok_pct.any() else (np.array([]), np.array([], dtype=int), "Lap")
-    fig = make_dark_figure(f"Time in SR Target vs {'Lap Time' if x_mode == 'laptime' else 'Lap'}", xlabel_pct, "% of traction time")
+    x_pct, order_pct, xlabel_pct = per_lap_axis_or_empty(lap_list, lt_val, x_mode, ok_pct)
+    fig = make_dark_figure(f"Time in SR Target vs {vs}", xlabel_pct, "% of traction time")
     if ok_pct.any():
         add_lap_scatter(
             fig, x_pct, res["in_tgt_pct_glob"][ok_pct][order_pct], lap_list[ok_pct][order_pct],
@@ -400,9 +406,9 @@ def _build_tc_figures(res: dict, x_mode: str = "laps") -> list[go.Figure]:
             fig.update_xaxes(tickvals=np.sort(lap_list[ok_pct].astype(int)))
     figs.append(fig)
 
-    x_eff, order_eff, xlabel_eff = per_lap_axis(lap_list[eff_ok], lt_val[eff_ok], x_mode) if eff_ok.any() else (np.array([]), np.array([], dtype=int), "Lap")
+    x_eff, order_eff, xlabel_eff = per_lap_axis_or_empty(lap_list, lt_val, x_mode, eff_ok)
     fig = make_dark_figure(
-        f"Traction Efficiency vs {'Lap Time' if x_mode == 'laptime' else 'Lap'}", xlabel_eff, "Mean ax when SR in target [m/s²]",
+        f"Traction Efficiency vs {vs}", xlabel_eff, "Mean ax when SR in target [m/s²]",
     )
     if eff_ok.any():
         add_lap_scatter(
@@ -1173,7 +1179,12 @@ def tc_function_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
         notes.append("TCenable not found; using throttle/ax/vx heuristic as TC armed mask.")
     if not eval_mask.any():
         notes.append("No samples with full-throttle acceleration and TC armed after excluding lap 0 and the last lap.")
-    if present_torque_cols and eval_mask.any() and np.nanmax(np.abs(torque_mat[eval_mask])) <= 1.0e-6:
+    command_active = bool(
+        present_torque_cols
+        and eval_mask.any()
+        and np.nanmax(np.abs(torque_mat[eval_mask])) > 1.0e-6
+    )
+    if present_torque_cols and eval_mask.any() and not command_active:
         notes.append("TC torque command columns are zero during the evaluated samples.")
 
     figs = _tc_visual_figures(
@@ -1221,6 +1232,7 @@ def tc_function_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
         "overshoot_med_by_wheel": overshoot_med_w,
         "eval_samples": int(eval_mask.sum()),
         "full_throttle_accel_samples": int(full_throttle.sum()),
+        "command_active": command_active,
         "notes": notes,
     }
     return figs, kpis
@@ -1244,17 +1256,6 @@ ACTUAL_TORQUE_ALIASES = {
     "RL": ("RL_actualTorque", "rl_actual_torque"),
     "RR": ("RR_actualTorque", "rr_actual_torque"),
 }
-
-
-def _first_existing_col(df: pl.DataFrame, aliases: tuple[str, ...]) -> str | None:
-    return next((col for col in aliases if col in df.columns), None)
-
-
-def _series_or_nan(df: pl.DataFrame, aliases: tuple[str, ...]) -> np.ndarray:
-    col = _first_existing_col(df, aliases)
-    if col is None:
-        return np.full(len(df), np.nan, dtype=float)
-    return df[col].to_numpy().astype(float)
 
 
 def _median_first_after(
@@ -1312,13 +1313,13 @@ def tc_control_impact_figs_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict
     )
 
     tc_torque = np.stack([
-        _series_or_nan(df_eff, TC_TORQUE_ALIASES[w]) for w in WHEELS
+        series_or_nan(df_eff, TC_TORQUE_ALIASES[w]) for w in WHEELS
     ], axis=1)
     master_torque = np.stack([
-        _series_or_nan(df_eff, MASTER_TORQUE_ALIASES[w]) for w in WHEELS
+        series_or_nan(df_eff, MASTER_TORQUE_ALIASES[w]) for w in WHEELS
     ], axis=1)
     actual_torque = np.stack([
-        _series_or_nan(df_eff, ACTUAL_TORQUE_ALIASES[w]) for w in WHEELS
+        series_or_nan(df_eff, ACTUAL_TORQUE_ALIASES[w]) for w in WHEELS
     ], axis=1)
     tc_cut = np.minimum(tc_torque, 0.0)
     cut_active = np.any(tc_cut < -1.0e-6, axis=1)

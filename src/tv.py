@@ -15,7 +15,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from src import cornering
-from src.dynamics import IZ_KGM2, STEERING_RATIO
+from src.dynamics import IZ_KGM2
 
 from utils import (
     COMPLETE_LAPS_MARKER,
@@ -28,8 +28,9 @@ from utils import (
     keep_min_duration_segments,
     lap_dist_from_gps,
     make_dark_figure,
-    per_lap_axis,
+    per_lap_axis_or_empty,
     robust_dt,
+    series_or_nan,
     smooth_signal,
     unique_laps,
 )
@@ -246,13 +247,29 @@ def _compute_tv(d: dict[str, np.ndarray]) -> dict:
     }
 
 
+def _add_turn_direction_annotation(fig: go.Figure, ay_samples: np.ndarray) -> None:
+    """Annotate a corner-sample scatter with the left/right turn counts."""
+    fig.add_annotation(
+        x=0.02,
+        y=0.98,
+        xref="paper",
+        yref="paper",
+        text=f"Left turns: {int((ay_samples > 0).sum())}<br>Right turns: {int((ay_samples < 0).sum())}",
+        showarrow=False,
+        align="left",
+        font=dict(color="#EBEBEB", size=10),
+        bgcolor="rgba(20,20,23,0.8)",
+    )
+
+
 def _build_tv_figures(res: dict, x_mode: str = "laps") -> list[go.Figure]:
     lap_list = res["lap_list"]
     lt = res["lt"]
     figs: list[go.Figure] = []
 
-    x_yaw, order_yaw, xlabel_yaw = per_lap_axis(lap_list[res["yaw_ok"]], lt[res["yaw_ok"]], x_mode) if res["yaw_ok"].any() else (np.array([]), np.array([], dtype=int), "Lap")
-    fig = make_dark_figure(f"Yaw Rate Tracking Error vs {'Lap Time' if x_mode == 'laptime' else 'Lap'}", xlabel_yaw, "Yaw rate error RMSE")
+    vs = "Lap Time" if x_mode == "laptime" else "Lap"
+    x_yaw, order_yaw, xlabel_yaw = per_lap_axis_or_empty(lap_list, lt, x_mode, res["yaw_ok"])
+    fig = make_dark_figure(f"Yaw Rate Tracking Error vs {vs}", xlabel_yaw, "Yaw rate error RMSE")
     if res["yaw_ok"].any():
         add_lap_scatter(fig, x_yaw, res["yaw_rmse"][res["yaw_ok"]][order_yaw], lap_list[res["yaw_ok"]][order_yaw])
         if x_mode == "laps":
@@ -271,23 +288,13 @@ def _build_tv_figures(res: dict, x_mode: str = "laps") -> list[go.Figure]:
         marker=dict(color="#4DB3F2", size=3, opacity=0.5),
         name="Samples",
     ))
-    fig.add_annotation(
-        x=0.02,
-        y=0.98,
-        xref="paper",
-        yref="paper",
-        text=f"Left turns: {int((ay_s > 0).sum())}<br>Right turns: {int((ay_s < 0).sum())}",
-        showarrow=False,
-        align="left",
-        font=dict(color="#EBEBEB", size=10),
-        bgcolor="rgba(20,20,23,0.8)",
-    )
+    _add_turn_direction_annotation(fig, ay_s)
     if ay_s.size > 0:
         add_zero_line(fig, ay_s)
     figs.append(fig)
 
-    x_mz, order_mz, xlabel_mz = per_lap_axis(lap_list[res["mz_ok"]], lt[res["mz_ok"]], x_mode) if res["mz_ok"].any() else (np.array([]), np.array([], dtype=int), "Lap")
-    fig = make_dark_figure(f"Mz Tracking Error vs {'Lap Time' if x_mode == 'laptime' else 'Lap'}", xlabel_mz, "Mz error RMSE [Nm]")
+    x_mz, order_mz, xlabel_mz = per_lap_axis_or_empty(lap_list, lt, x_mode, res["mz_ok"])
+    fig = make_dark_figure(f"Mz Tracking Error vs {vs}", xlabel_mz, "Mz error RMSE [Nm]")
     if res["mz_ok"].any():
         add_lap_scatter(fig, x_mz, res["mz_rmse"][res["mz_ok"]][order_mz], lap_list[res["mz_ok"]][order_mz])
         if x_mode == "laps":
@@ -305,23 +312,13 @@ def _build_tv_figures(res: dict, x_mode: str = "laps") -> list[go.Figure]:
         marker=dict(color="#4DB3F2", size=3, opacity=0.5),
         name="Samples",
     ))
-    fig.add_annotation(
-        x=0.02,
-        y=0.98,
-        xref="paper",
-        yref="paper",
-        text=f"Left turns: {int((ay_s > 0).sum())}<br>Right turns: {int((ay_s < 0).sum())}",
-        showarrow=False,
-        align="left",
-        font=dict(color="#EBEBEB", size=10),
-        bgcolor="rgba(20,20,23,0.8)",
-    )
+    _add_turn_direction_annotation(fig, ay_s)
     if ay_s.size > 0:
         add_zero_line(fig, ay_s)
     figs.append(fig)
 
-    x_ratio, order_ratio, xlabel_ratio = per_lap_axis(lap_list[res["ratio_ok"]], lt[res["ratio_ok"]], x_mode) if res["ratio_ok"].any() else (np.array([]), np.array([], dtype=int), "Lap")
-    fig = make_dark_figure(f"Feedback to Feedforward Ratio vs {'Lap Time' if x_mode == 'laptime' else 'Lap'}", xlabel_ratio, "FB / FF ratio")
+    x_ratio, order_ratio, xlabel_ratio = per_lap_axis_or_empty(lap_list, lt, x_mode, res["ratio_ok"])
+    fig = make_dark_figure(f"Feedback to Feedforward Ratio vs {vs}", xlabel_ratio, "FB / FF ratio")
     if res["ratio_ok"].any():
         add_lap_scatter(
             fig,
@@ -687,7 +684,7 @@ def yaw_rate_triple_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
         real = desired - arr['TV_errorYawRate']
 
     vx = arr[vx_col]
-    steer = arr['Steering'] / STEERING_RATIO
+    steer = arr['Steering']  # steering-pot value [rad], used directly (no STEERING_RATIO)
     with np.errstate(divide='ignore', invalid='ignore'):
         implied = steer * vx / WHEELBASE_M
     implied = np.where(np.abs(vx) >= MIN_SPEED, implied, np.nan)
@@ -759,17 +756,6 @@ YAW_BALANCE_MIN_EXPECTED_RADPS = 0.15
 YAW_BALANCE_NEUTRAL_BAND_PCT = 5.0
 
 
-def _first_existing_col(df: pl.DataFrame, aliases: tuple[str, ...]) -> str | None:
-    return next((col for col in aliases if col in df.columns), None)
-
-
-def _col_or_nan(df: pl.DataFrame, aliases: tuple[str, ...]) -> np.ndarray:
-    col = _first_existing_col(df, aliases)
-    if col is None:
-        return np.full(len(df), np.nan, dtype=float)
-    return df[col].to_numpy().astype(float)
-
-
 def tv_control_attribution_figs_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
     """Observable TV behaviour: yaw gain, balance and rotation response."""
     df = ensure_complete_laps_df(df)
@@ -778,7 +764,7 @@ def tv_control_attribution_figs_kpis(df: pl.DataFrame) -> tuple[list[go.Figure],
 
     time_s = df["TimeStamp"].to_numpy().astype(float) - float(df["TimeStamp"][0])
     dist_m = lap_dist_from_gps(df)
-    steering = df["Steering"].to_numpy().astype(float) / STEERING_RATIO
+    steering = df["Steering"].to_numpy().astype(float)  # steering-pot value [rad]; no STEERING_RATIO
     ay_col = _ay_signal(df.columns)
     vx_col = _vx_signal(df.columns)
     ay = df[ay_col].to_numpy().astype(float)
@@ -786,15 +772,17 @@ def tv_control_attribution_figs_kpis(df: pl.DataFrame) -> tuple[list[go.Figure],
     dt = robust_dt(time_s)
     corner_mask = _corner_mask(ay, steering, vx, dt)
 
-    desired_yaw = _col_or_nan(df, TV_SIGNAL_ALIASES["desired_yaw"])
-    yaw_error = _col_or_nan(df, TV_SIGNAL_ALIASES["error_yaw"])
+    desired_yaw = series_or_nan(df, TV_SIGNAL_ALIASES["desired_yaw"])
+    yaw_error = series_or_nan(df, TV_SIGNAL_ALIASES["error_yaw"])
     if "VN_gz" in df.columns:
         yaw_real = df["VN_gz"].to_numpy().astype(float)
     else:
         yaw_real = desired_yaw - yaw_error
-    actual_mz = _col_or_nan(df, TV_SIGNAL_ALIASES["actual_mz"])
-    torques = {w: _col_or_nan(df, TV_TORQUE_COL_ALIASES[w]) for w in ("FL", "FR", "RL", "RR")}
-    torque_mat = np.stack([torques[w] for w in ("FL", "FR", "RL", "RR")], axis=1)
+    actual_mz = series_or_nan(df, TV_SIGNAL_ALIASES["actual_mz"])
+    torque_mat = np.stack(
+        [series_or_nan(df, TV_TORQUE_COL_ALIASES[w]) for w in ("FL", "FR", "RL", "RR")],
+        axis=1,
+    )
     lr_delta_nm = (torque_mat[:, 1] + torque_mat[:, 3]) - (torque_mat[:, 0] + torque_mat[:, 2])
 
     yaw_implied = steering * vx / WHEELBASE_M
@@ -1018,10 +1006,10 @@ def tv_corner_under_oversteer_figs_kpis(
     if "VN_gz" in df.columns:
         yaw_real = df["VN_gz"].to_numpy().astype(float)
     else:
-        desired_yaw = _col_or_nan(df, TV_SIGNAL_ALIASES["desired_yaw"])
-        yaw_error = _col_or_nan(df, TV_SIGNAL_ALIASES["error_yaw"])
+        desired_yaw = series_or_nan(df, TV_SIGNAL_ALIASES["desired_yaw"])
+        yaw_error = series_or_nan(df, TV_SIGNAL_ALIASES["error_yaw"])
         yaw_real = desired_yaw - yaw_error
-    actual_mz = _col_or_nan(df, TV_SIGNAL_ALIASES["actual_mz"])
+    actual_mz = series_or_nan(df, TV_SIGNAL_ALIASES["actual_mz"])
 
     vx = radius["vx_mps"]
     path_yaw = vx * radius["signed_curvature_smooth_inv_m"]

@@ -6,6 +6,7 @@ figure plus a KPI dictionary. Rendering belongs in ``src/dashboard.py``.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -16,13 +17,18 @@ from plotly.subplots import make_subplots
 from src.dynamics import (
     G_MPS2,
     GEAR_RATIO,
-    MASS_KG,
-    STEERING_RATIO,
     WHEEL_RADIUS_M,
     WHEELBASE_EQ,
 )
 from src.lapcount import gps_to_local_xy
-from utils import cols_to_numpy, make_dark_figure, robust_dt, smooth_signal
+from utils import (
+    cols_to_numpy,
+    driver_color,
+    first_existing_col,
+    make_dark_figure,
+    robust_dt,
+    smooth_signal,
+)
 
 SKIDPAD_INNER_RADIUS_M = 7.625
 SKIDPAD_OUTER_RADIUS_M = 10.625
@@ -33,7 +39,6 @@ SKIDPAD_TIMED_LAPS = (2, 4)
 
 TRACK_F_M = 1.225
 TRACK_R_M = 1.175
-COG_HEIGHT_M = 0.278
 KROLL_F_NM_RAD = 36929.4
 KROLL_R_NM_RAD = 40833.7
 LLTD_THEORY = KROLL_F_NM_RAD / (KROLL_F_NM_RAD + KROLL_R_NM_RAD)
@@ -43,16 +48,12 @@ MIN_SKIDPAD_SPEED_MPS = 2.0
 MIN_SKIDPAD_AY_MPS2 = 1.0
 MIN_BALANCE_SPEED_MPS = 3.0
 MIN_BALANCE_AY_MPS2 = 2.0
-MIN_FIT_SAMPLES = 20
 
 WHEELS = ("FL", "FR", "RL", "RR")
 _TV_TORQUE_COLS = ("TV_FL_Trq", "TV_FR_Trq", "TV_RL_Trq", "TV_RR_Trq")
 _TV_OPTIONAL_COLS = ("TV_desiredYawRate", "TV_errorYawRate", "TV_actualMz")
-_ROLL_QUAT_COLS = ("VN_ox", "VN_oy", "VN_oz", "VN_ow")
 _FZ_COLS = ("Est_FZFL", "Est_FZFR", "Est_FZRL", "Est_FZRR")
 _SA_COLS = ("Est_SAFL", "Est_SAFR", "Est_SARL", "Est_SARR")
-_THROTTLE_ALIASES = ("APPS", "pedals_throttle", "Throttle", "APPS1")
-_BRAKE_ALIASES = ("BSE", "Brake", "BSEFront", "BSERear")
 _YAW_ALIASES = ("VN_gz", "AS_yaw_rate")
 
 _BG = "#141417"
@@ -60,8 +61,17 @@ _TEXT = "#EBEBEB"
 _GRID = "rgba(128,128,128,0.2)"
 _AXIS = "#E5E5E5"
 _REFERENCE = "#F2D44D"
-_RUN_COLORS = ("#4DB3F2", "#F28C40", "#73D973", "#D973D9", "#F27070", "#F2C94C")
 _SIDE_COLORS = {"R": "#4DB3F2", "L": "#F28C40"}
+
+
+def _run_label(run_name: str) -> str:
+    """Short, human-readable run name for legends and tables."""
+    return Path(run_name).stem
+
+
+def _run_color(run_name: str) -> str:
+    """Stable per-run colour — shared driver-identity palette used everywhere."""
+    return driver_color(run_name)
 
 
 def is_skidpad_run(df: pl.DataFrame) -> bool:
@@ -80,11 +90,6 @@ def has_tv_signals(df: pl.DataFrame) -> bool:
 def has_load_signals(df: pl.DataFrame) -> bool:
     """Return True when all estimated vertical-load signals are available."""
     return all(col in df.columns for col in _FZ_COLS)
-
-
-def has_roll_signals(df: pl.DataFrame) -> bool:
-    """Return True when the VectorNav quaternion columns are available."""
-    return all(col in df.columns for col in _ROLL_QUAT_COLS)
 
 
 def classify_circles(df: pl.DataFrame) -> dict[int, dict[str, Any]]:
@@ -142,10 +147,8 @@ def classify_circles(df: pl.DataFrame) -> dict[int, dict[str, Any]]:
     return dict(sorted(timed_rows.items(), key=lambda item: item[1]["first_time_s"]))
 
 
-def event_time_summary_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
-    """Return table and bar chart for skidpad circle times."""
-    circles = classify_circles(df)
-    rows = _circle_summary_rows(circles)
+def event_time_summary_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[str, Any]]:
+    """Overlay official right/left timed circle times for every run."""
     fig = make_subplots(
         rows=2,
         cols=1,
@@ -153,95 +156,97 @@ def event_time_summary_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]
         row_heights=[0.42, 0.58],
         vertical_spacing=0.10,
     )
-    _add_table_trace(fig, rows, row=1, col=1)
-
-    labels = [_circle_label(lap_id, info) for lap_id, info in circles.items()]
-    times = [float(info["laptime_s"]) for info in circles.values()]
-    colors = [
-        "#73D973" if info.get("official_timed", False) else "#F28C40"
-        for info in circles.values()
-    ]
-    fig.add_trace(
-        go.Bar(
-            x=labels,
-            y=times,
-            marker=dict(color=colors, line=dict(color="#22252B", width=1)),
-            text=[_fmt_num(t, ".3f") for t in times],
-            textposition="outside",
-            hovertemplate="%{x}<br>%{y:.3f} s<extra></extra>",
-            name="Circle time",
-        ),
-        row=2,
-        col=1,
-    )
-
-    official = _official_timed_times(circles)
-    event_time_s = _mean_if_finite((official.get("R", np.nan), official.get("L", np.nan)))
-    lr_asymmetry_s = _abs_diff(official.get("L", np.nan), official.get("R", np.nan))
-    if np.isfinite(event_time_s):
+    table_rows: list[dict[str, object]] = []
+    runs: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
+    for idx, (run_name, df) in enumerate(dfs.items()):
+        label = _run_label(run_name)
+        color = _run_color(run_name)
+        circles = classify_circles(df)
+        for warning in _classification_warnings(circles):
+            warnings.append(f"{label}: {warning}")
+        official = _official_timed_times(circles)
+        event_time_s = _mean_if_finite((official.get("R", np.nan), official.get("L", np.nan)))
+        lr_asymmetry_s = _abs_diff(official.get("L", np.nan), official.get("R", np.nan))
+        y = [official.get("R", np.nan), official.get("L", np.nan)]
         fig.add_trace(
-            go.Scatter(
-                x=labels,
-                y=[event_time_s] * len(labels),
-                mode="lines",
-                name=f"Event time {event_time_s:.3f} s",
-                line=dict(color=_REFERENCE, dash="dash", width=1.2),
-                hoverinfo="skip",
+            go.Bar(
+                x=["R timed", "L timed"],
+                y=y,
+                name=label,
+                marker=dict(color=color, line=dict(color="#22252B", width=1)),
+                text=[_fmt_num(t, ".3f") for t in y],
+                textposition="outside",
+                hovertemplate=f"{label}<br>%{{x}}<br>%{{y:.3f}} s<extra></extra>",
             ),
             row=2,
             col=1,
         )
+        for row in _circle_summary_rows(circles):
+            table_rows.append({"Run": label, **row})
+        runs[run_name] = {
+            "event_time_s": event_time_s,
+            "LR_asymmetry_s": lr_asymmetry_s,
+            "timed_R_s": official.get("R", np.nan),
+            "timed_L_s": official.get("L", np.nan),
+        }
 
+    _add_table_trace(fig, table_rows, row=1, col=1)
     _apply_dark_layout(fig, "Skidpad event time summary", height=650)
+    fig.update_layout(barmode="group")
     fig.update_xaxes(title_text="Circle", row=2, col=1)
     fig.update_yaxes(title_text="Lap time [s]", row=2, col=1)
 
     return fig, {
-        "event_time_s": event_time_s,
-        "LR_asymmetry_s": lr_asymmetry_s,
-        "timed_R_s": official.get("R", np.nan),
-        "timed_L_s": official.get("L", np.nan),
-        "circles": circles,
-        "table": pl.DataFrame(rows),
-        "warnings": _classification_warnings(circles),
+        "runs": runs,
+        "table": pl.DataFrame(table_rows),
+        "warnings": warnings,
     }
 
 
-def lateral_g_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
-    """|ay| distribution per timed circle (OptimumG-style histogram)."""
-    circles = classify_circles(df)
-    required = ["laps", "Filtering_VN_ay"]
-    _require_columns(df, required)
-    arr = cols_to_numpy(df, required)
-
+def lateral_g_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[str, Any]]:
+    """|ay| distribution overlaid with one colour per run."""
     fig = make_dark_figure("Skidpad |ay| distribution", "|ay| [g]", "Time share [%]")
 
     rows: list[dict[str, object]] = []
-    ay_max_global_g = np.nan
-    any_data = False
-    for idx, (lap_id, info) in enumerate(circles.items()):
-        mask = arr["laps"] == float(lap_id)
+    runs: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
+    for idx, (run_name, df) in enumerate(dfs.items()):
+        label = _run_label(run_name)
+        color = _run_color(run_name)
+        circles = classify_circles(df)
+        for warning in _classification_warnings(circles):
+            warnings.append(f"{label}: {warning}")
+        required = ["laps", "Filtering_VN_ay"]
+        _require_columns(df, required)
+        arr = cols_to_numpy(df, required)
+        mask = _lap_mask(arr["laps"], circles)
         ay_g = np.abs(arr["Filtering_VN_ay"][mask]) / G_MPS2
         ay_g = ay_g[np.isfinite(ay_g)]
         if ay_g.size == 0:
+            warnings.append(f"{label}: No |ay| samples available for the histogram.")
+            runs[run_name] = {"ay_sustained_mean_g": np.nan, "ay_max_global_g": np.nan}
             continue
-        any_data = True
-        color = _RUN_COLORS[idx % len(_RUN_COLORS)]
         fig.add_trace(
             go.Histogram(
                 x=ay_g,
-                name=_circle_label(lap_id, info),
+                name=label,
                 marker_color=color,
                 opacity=0.55,
                 xbins=dict(start=0.0, end=2.4, size=0.05),
                 histnorm="percent",
-                hovertemplate="%{x:.2f} g<br>%{y:.1f} %<extra></extra>",
+                hovertemplate=f"{label}<br>%{{x:.2f}} g<br>%{{y:.1f}} %<extra></extra>",
             )
         )
-        ay_max_global_g = np.nanmax([ay_max_global_g, np.nanmax(ay_g)])
+        runs[run_name] = {
+            "ay_sustained_mean_g": _safe_mean(ay_g),
+            "ay_max_global_g": _safe_max(ay_g),
+            "ay_mean_g": _safe_mean(ay_g),
+            "ay_p95_g": _safe_percentile(ay_g, 95),
+            "ay_std_g": _safe_std(ay_g),
+        }
         rows.append({
-            "Lap": int(lap_id),
-            "Side": info["side"],
+            "Run": label,
             "ay_mean_g": _round(_safe_mean(ay_g), 3),
             "ay_max_g": _round(_safe_max(ay_g), 3),
             "ay_p95_g": _round(_safe_percentile(ay_g, 95), 3),
@@ -251,26 +256,15 @@ def lateral_g_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
 
     fig.update_layout(barmode="overlay", height=440)
     fig.update_xaxes(range=[0.0, 2.4])
-    warnings = _classification_warnings(circles)
-    if not any_data:
-        warnings.append("No |ay| samples available for the histogram.")
     return fig, {
-        "ay_max_global_g": ay_max_global_g,
+        "runs": runs,
         "table": pl.DataFrame(rows),
-        "per_circle": rows,
         "warnings": warnings,
     }
 
 
-def driven_radius_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
-    """Driven-radius distribution per timed circle (OptimumG-style histogram)."""
-    circles = classify_circles(df)
-    required = ["TimeStamp", "laps", "Filtering_VN_ay", "VN_vx"]
-    _require_columns(df, required)
-    arr = cols_to_numpy(df, required)
-    radius_m = _driven_radius_m(arr["TimeStamp"], arr["VN_vx"], arr["Filtering_VN_ay"])
-    sustained = _sustained_radius_mask(arr["VN_vx"], arr["Filtering_VN_ay"], radius_m)
-
+def driven_radius_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[str, Any]]:
+    """Driven-radius distribution overlaid with one colour per run."""
     fig = make_dark_figure("Driven radius distribution", "R [m]", "Time share [%]")
     fig.add_vrect(
         x0=SKIDPAD_INNER_RADIUS_M,
@@ -287,36 +281,50 @@ def driven_radius_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
     )
 
     rows: list[dict[str, object]] = []
-    all_radius: list[np.ndarray] = []
-    any_data = False
-    for idx, (lap_id, info) in enumerate(circles.items()):
-        mask = (arr["laps"] == float(lap_id)) & sustained
+    runs: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
+    for idx, (run_name, df) in enumerate(dfs.items()):
+        label = _run_label(run_name)
+        color = _run_color(run_name)
+        circles = classify_circles(df)
+        for warning in _classification_warnings(circles):
+            warnings.append(f"{label}: {warning}")
+        required = ["TimeStamp", "laps", "Filtering_VN_ay", "VN_vx"]
+        _require_columns(df, required)
+        arr = cols_to_numpy(df, required)
+        radius_m = _driven_radius_m(arr["TimeStamp"], arr["VN_vx"], arr["Filtering_VN_ay"])
+        sustained = _sustained_radius_mask(arr["VN_vx"], arr["Filtering_VN_ay"], radius_m)
+        mask = _lap_mask(arr["laps"], circles) & sustained
         values = radius_m[mask]
         values = values[np.isfinite(values)]
         values = values[(values >= 2.0) & (values <= 20.0)]
         if values.size == 0:
+            warnings.append(f"{label}: No sustained-cornering samples for the radius histogram.")
+            runs[run_name] = {"radius_error_m": np.nan}
             continue
-        any_data = True
-        color = _RUN_COLORS[idx % len(_RUN_COLORS)]
         fig.add_trace(
             go.Histogram(
                 x=values,
-                name=_circle_label(lap_id, info),
+                name=label,
                 marker_color=color,
                 opacity=0.55,
                 xbins=dict(start=2.0, end=20.0, size=0.25),
                 histnorm="percent",
-                hovertemplate="%{x:.2f} m<br>%{y:.1f} %<extra></extra>",
+                hovertemplate=f"{label}<br>%{{x:.2f}} m<br>%{{y:.1f}} %<extra></extra>",
             )
         )
-        all_radius.append(values)
         pct_band = 100.0 * np.nanmean(
             (values >= SKIDPAD_INNER_RADIUS_M) & (values <= SKIDPAD_OUTER_RADIUS_M)
         )
         r_mean = _safe_mean(values)
+        runs[run_name] = {
+            "R_mean_m": r_mean,
+            "R_std_m": _safe_std(values),
+            "pct_time_in_band_pct": pct_band,
+            "radius_error_m": r_mean - SKIDPAD_IDEAL_RADIUS_M if np.isfinite(r_mean) else np.nan,
+        }
         rows.append({
-            "Lap": int(lap_id),
-            "Side": info["side"],
+            "Run": label,
             "R_mean_m": _round(r_mean, 3),
             "R_std_m": _round(_safe_std(values), 3),
             "pct_time_in_band_pct": _round(pct_band, 1),
@@ -324,72 +332,76 @@ def driven_radius_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
             "Samples": int(values.size),
         })
 
-    radius_all = np.concatenate(all_radius) if all_radius else np.array([], dtype=float)
-    r_mean_all = _safe_mean(radius_all)
-    pct_band_all = (
-        100.0 * np.nanmean(
-            (radius_all >= SKIDPAD_INNER_RADIUS_M) & (radius_all <= SKIDPAD_OUTER_RADIUS_M)
-        )
-        if radius_all.size else np.nan
-    )
     fig.update_layout(barmode="overlay", height=460)
     fig.update_xaxes(range=[2.0, 20.0])
-    warnings = _classification_warnings(circles)
-    if not any_data:
-        warnings.append("No sustained-cornering samples for the radius histogram.")
     return fig, {
-        "R_mean_m": r_mean_all,
-        "R_std_m": _safe_std(radius_all),
-        "pct_time_in_band_pct": pct_band_all,
-        "radius_error_m": r_mean_all - SKIDPAD_IDEAL_RADIUS_M if np.isfinite(r_mean_all) else np.nan,
+        "runs": runs,
         "table": pl.DataFrame(rows),
-        "per_circle": rows,
         "warnings": warnings,
     }
 
 
-def balance_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
-    """Summarise front/rear slip-angle balance and understeer angle by circle."""
-    circles = classify_circles(df)
-    yaw_col = _first_existing_col(df, _YAW_ALIASES)
-    if yaw_col is None:
-        raise KeyError("Missing yaw-rate column: VN_gz/AS_yaw_rate")
-    required = ["laps", "Filtering_VN_ay", "VN_vx", "Steering", yaw_col, *_SA_COLS]
-    _require_columns(df, required)
-    arr = cols_to_numpy(df, required)
-    front_sa_deg, rear_sa_deg = _front_rear_sa_deg(arr)
-    understeer_deg = _understeer_angle_deg(arr["Steering"], arr[yaw_col], arr["VN_vx"])
-    sustained = _sustained_balance_mask(arr["VN_vx"], arr["Filtering_VN_ay"])
-
+def balance_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[str, Any]]:
+    """Front/rear slip-angle balance and understeer angle, one colour per run."""
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=False,
+        vertical_spacing=0.12,
+        subplot_titles=("Slip angle by axle", "Balance & understeer angle (+ = understeer)"),
+    )
     rows: list[dict[str, object]] = []
-    labels: list[str] = []
-    front_means: list[float] = []
-    rear_means: list[float] = []
-    balance_idx: list[float] = []
-    understeer_means: list[float] = []
-    for lap_id, info in circles.items():
-        mask = (arr["laps"] == float(lap_id)) & sustained
+    runs: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
+    for idx, (run_name, df) in enumerate(dfs.items()):
+        label = _run_label(run_name)
+        color = _run_color(run_name)
+        circles = classify_circles(df)
+        for warning in _classification_warnings(circles):
+            warnings.append(f"{label}: {warning}")
+        required = ["laps", *_SA_COLS]
+        _require_columns(df, required)
+        arr = cols_to_numpy(df, required)
+        front_sa_deg, rear_sa_deg = _front_rear_sa_deg(arr)
+        # Skidpad: a whole timed circle is steady-state, so average slip angles
+        # over the full timed lap (only dropping non-finite samples).
         good = (
-            mask
+            _lap_mask(arr["laps"], circles)
             & np.isfinite(front_sa_deg)
             & np.isfinite(rear_sa_deg)
-            & np.isfinite(understeer_deg)
         )
+        try:
+            us_mean = _steady_state_understeer(df, circles)["mean_deg"]
+        except KeyError as exc:
+            warnings.append(f"{label}: {exc}")
+            us_mean = np.nan
         if not good.any():
+            runs[run_name] = {"balance_index_deg": np.nan, "understeer_angle_mean_deg": us_mean}
             continue
-        sign = _turn_sign_from_side(info["side"])
         front_mean = _safe_mean(front_sa_deg[good])
         rear_mean = _safe_mean(rear_sa_deg[good])
-        us_mean = _safe_mean(understeer_deg[good] * sign)
-        bal = rear_mean - front_mean
-        labels.append(_circle_label(lap_id, info))
-        front_means.append(front_mean)
-        rear_means.append(rear_mean)
-        balance_idx.append(bal)
-        understeer_means.append(us_mean)
+        # Positive = understeer: the front axle works at a higher slip angle.
+        bal = front_mean - rear_mean
+        fig.add_trace(
+            go.Bar(x=["Front SA", "Rear SA"], y=[front_mean, rear_mean], name=label, marker_color=color),
+            row=1, col=1,
+        )
+        fig.add_trace(
+            go.Bar(
+                x=["Balance (SA_F-SA_R)", "Understeer angle"],
+                y=[bal, us_mean],
+                name=label,
+                marker_color=color,
+                showlegend=False,
+            ),
+            row=2, col=1,
+        )
+        runs[run_name] = {
+            "balance_index_deg": bal,
+            "understeer_angle_mean_deg": us_mean,
+        }
         rows.append({
-            "Lap": int(lap_id),
-            "Side": info["side"],
+            "Run": label,
             "SA_F_mean_deg": _round(front_mean, 3),
             "SA_R_mean_deg": _round(rear_mean, 3),
             "SA_F_p95_deg": _round(_safe_percentile(front_sa_deg[good], 95), 3),
@@ -399,17 +411,6 @@ def balance_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
             "Samples": int(good.sum()),
         })
 
-    fig = make_subplots(
-        rows=2,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.12,
-        subplot_titles=("Slip angle by axle", "Balance index and understeer angle"),
-    )
-    fig.add_trace(go.Bar(x=labels, y=front_means, name="Front SA mean", marker_color="#4DB3F2"), row=1, col=1)
-    fig.add_trace(go.Bar(x=labels, y=rear_means, name="Rear SA mean", marker_color="#F28C40"), row=1, col=1)
-    fig.add_trace(go.Bar(x=labels, y=balance_idx, name="SA_R - SA_F", marker_color="#73D973"), row=2, col=1)
-    fig.add_trace(go.Bar(x=labels, y=understeer_means, name="Understeer angle", marker_color="#D973D9"), row=2, col=1)
     fig.add_hline(y=0.0, line=dict(color="rgba(235,235,235,0.45)", dash="dash", width=1), row=2, col=1)
     _apply_dark_layout(fig, "Skidpad balance", height=620)
     fig.update_yaxes(title_text="Slip angle [deg]", row=1, col=1)
@@ -417,213 +418,85 @@ def balance_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
     fig.update_layout(barmode="group")
 
     return fig, {
-        "balance_index_deg": _safe_mean(np.asarray(balance_idx, dtype=float)),
-        "understeer_angle_mean_deg": _safe_mean(np.asarray(understeer_means, dtype=float)),
+        "runs": runs,
         "table": pl.DataFrame(rows),
-        "per_circle": rows,
-        "warnings": _classification_warnings(circles),
+        "warnings": warnings,
     }
 
 
-def understeer_gradient_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
-    """Fit dynamic steering error versus lateral acceleration."""
-    circles = classify_circles(df)
-    payload = _understeer_fit_payload(df, circles)
-    x = payload["ay_g"]
-    y = payload["delta_dyn_deg"]
-    side_by_sample = payload["side"]
-    fit = _linear_fit(x, y)
+def understeer_gradient_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[str, Any]]:
+    """Steady-state understeer angle per circle side, one colour per run.
 
+    On skidpad each timed circle is steady-state cornering, so a deg/g gradient
+    is not meaningful (ay is ~constant per circle). Instead we report the
+    steady-state understeer angle ``delta_real - delta_ackermann`` averaged over
+    each timed circle, per side (positive = understeer).
+    """
     fig = make_dark_figure(
-        "Understeer gradient",
-        "Lateral acceleration ay [g]",
+        "Understeer angle (steady-state, + = understeer)",
+        "Circle",
         "delta_real - delta_ackermann [deg]",
     )
-    fig.add_hline(y=0.0, line=dict(color="rgba(235,235,235,0.35)", dash="dash", width=1))
-    fig.add_vline(x=0.0, line=dict(color="rgba(235,235,235,0.35)", dash="dash", width=1))
-
-    per_side: dict[str, dict[str, float]] = {}
-    for side in ("R", "L"):
-        mask = side_by_sample == side
-        if not mask.any():
-            continue
-        fig.add_trace(
-            go.Scattergl(
-                x=x[mask],
-                y=y[mask],
-                mode="markers",
-                name=f"{side} samples",
-                marker=dict(color=_SIDE_COLORS[side], size=4, opacity=0.45),
-                hovertemplate="ay=%{x:+.2f} g<br>delta_dyn=%{y:+.2f} deg<extra></extra>",
-            )
-        )
-        side_fit = _linear_fit(x[mask], y[mask])
-        per_side[side] = side_fit
-        if np.isfinite(side_fit["slope"]):
-            _add_fit_line(fig, x[mask], side_fit, _SIDE_COLORS[side], f"{side} fit")
-
-    if np.isfinite(fit["slope"]):
-        _add_fit_line(fig, x, fit, _REFERENCE, "Global fit", dash="dash")
-
-    fig.update_layout(height=520)
-    warnings = _classification_warnings(circles)
-    if not np.isfinite(fit["slope"]):
-        warnings.append("Not enough sustained skidpad samples for understeer-gradient fit.")
-    return fig, {
-        "K_us_deg_per_g": fit["slope"],
-        "R2_fit": fit["r2"],
-        "delta_dyn_at_1g_deg": fit["slope"] + fit["intercept"] if np.isfinite(fit["slope"]) else np.nan,
-        "fit": fit,
-        "per_side": per_side,
-        "samples": int(len(x)),
-        "warnings": warnings,
-    }
-
-
-def roll_gradient_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
-    """Fit VectorNav roll angle versus lateral acceleration."""
-    circles = classify_circles(df)
-    required = ["laps", "Filtering_VN_ay", "VN_vx", *_ROLL_QUAT_COLS]
-    _require_columns(df, required)
-    arr = cols_to_numpy(df, required)
-    roll_deg = _roll_from_quaternion_deg(arr["VN_ox"], arr["VN_oy"], arr["VN_oz"], arr["VN_ow"])
-    ay_g = arr["Filtering_VN_ay"] / G_MPS2
-    sustained = _sustained_balance_mask(arr["VN_vx"], arr["Filtering_VN_ay"]) & _lap_mask(arr["laps"], circles)
-    good = sustained & np.isfinite(roll_deg) & np.isfinite(ay_g)
-    x = ay_g[good]
-    y = roll_deg[good]
-    fit = _linear_fit(x, y)
-    theory_deg_per_g = np.rad2deg(MASS_KG * G_MPS2 * COG_HEIGHT_M / (KROLL_F_NM_RAD + KROLL_R_NM_RAD))
-    measured_abs = abs(fit["slope"]) if np.isfinite(fit["slope"]) else np.nan
-    deviation_pct = (
-        100.0 * (measured_abs - theory_deg_per_g) / theory_deg_per_g
-        if np.isfinite(measured_abs) and theory_deg_per_g > 0.0 else np.nan
-    )
-
-    fig = make_dark_figure("Roll gradient from VectorNav quaternion", "Lateral acceleration ay [g]", "Roll angle [deg]")
-    for side in ("R", "L"):
-        side_laps = _circle_laps_for_side(circles, side)
-        mask = good & np.isin(arr["laps"], np.asarray(side_laps, dtype=float))
-        if not mask.any():
-            continue
-        fig.add_trace(
-            go.Scattergl(
-                x=ay_g[mask],
-                y=roll_deg[mask],
-                mode="markers",
-                name=f"{side} samples",
-                marker=dict(color=_SIDE_COLORS[side], size=4, opacity=0.45),
-                hovertemplate="ay=%{x:+.2f} g<br>roll=%{y:+.2f} deg<extra></extra>",
-            )
-        )
-    if np.isfinite(fit["slope"]):
-        _add_fit_line(fig, x, fit, _REFERENCE, "Measured fit", dash="dash")
-    fig.update_layout(height=520)
-    warnings = _classification_warnings(circles)
-    if not np.isfinite(fit["slope"]):
-        warnings.append("Not enough sustained skidpad samples for roll-gradient fit.")
-    elif np.isfinite(deviation_pct) and abs(deviation_pct) > 20.0:
-        warnings.append(
-            "Measured roll gradient deviates by more than 20% from the CAT17x roll-stiffness model; "
-            "check quaternion convention, setup changes, or roll-stiffness assumptions."
-        )
-    return fig, {
-        "K_roll_deg_per_g": measured_abs,
-        "K_roll_signed_deg_per_g": fit["slope"],
-        "K_roll_theory_deg_per_g": theory_deg_per_g,
-        "K_roll_delta_pct": deviation_pct,
-        "R2_fit": fit["r2"],
-        "fit": fit,
-        "samples": int(len(x)),
-        "warnings": warnings,
-    }
-
-
-def driver_smoothness_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
-    """Compute steering, pedal and speed smoothness metrics by circle."""
-    circles = classify_circles(df)
-    throttle_col = _first_existing_col(df, _THROTTLE_ALIASES)
-    brake_col = _first_existing_col(df, _BRAKE_ALIASES)
-    required = ["TimeStamp", "laps", "Steering", "VN_vx"]
-    optional = [col for col in (throttle_col, brake_col) if col is not None]
-    _require_columns(df, [*required, *optional])
-    arr = cols_to_numpy(df, [*required, *optional])
+    fig.add_hline(y=0.0, line=dict(color="rgba(235,235,235,0.45)", dash="dash", width=1))
 
     rows: list[dict[str, object]] = []
-    labels: list[str] = []
-    steer_rms: list[float] = []
-    throttle_var: list[float] = []
-    brake_var: list[float] = []
-    vx_var: list[float] = []
-    for lap_id, info in circles.items():
-        mask = arr["laps"] == float(lap_id)
-        if int(mask.sum()) < 3:
+    runs: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
+    for idx, (run_name, df) in enumerate(dfs.items()):
+        label = _run_label(run_name)
+        color = _run_color(run_name)
+        circles = classify_circles(df)
+        for warning in _classification_warnings(circles):
+            warnings.append(f"{label}: {warning}")
+        try:
+            us = _steady_state_understeer(df, circles)
+        except KeyError as exc:
+            warnings.append(f"{label}: {exc}")
+            runs[run_name] = {
+                "understeer_angle_deg": np.nan,
+                "understeer_angle_R_deg": np.nan,
+                "understeer_angle_L_deg": np.nan,
+                "samples": 0,
+            }
             continue
-        t = arr["TimeStamp"][mask]
-        steering_deg = np.rad2deg(arr["Steering"][mask] / STEERING_RATIO)
-        good_time = np.isfinite(t) & np.isfinite(steering_deg)
-        if int(good_time.sum()) < 3:
-            continue
-        steer_rate = np.gradient(steering_deg[good_time], t[good_time], edge_order=1)
-        steer_rate_rms = float(np.sqrt(np.nanmean(steer_rate ** 2)))
-        thr_var = _safe_var(arr[throttle_col][mask]) if throttle_col is not None else np.nan
-        brk_var = _safe_var(arr[brake_col][mask]) if brake_col is not None else np.nan
-        speed_var = _safe_var(arr["VN_vx"][mask])
-        label = _circle_label(lap_id, info)
-        labels.append(label)
-        steer_rms.append(steer_rate_rms)
-        throttle_var.append(thr_var)
-        brake_var.append(brk_var)
-        vx_var.append(speed_var)
+        y = [us["R_deg"], us["L_deg"]]
+        fig.add_trace(
+            go.Bar(
+                x=["R circle", "L circle"],
+                y=y,
+                name=label,
+                marker=dict(color=color, line=dict(color="#22252B", width=1)),
+                text=[_fmt_num(v, "+.2f") for v in y],
+                textposition="outside",
+                hovertemplate=f"{label}<br>%{{x}}<br>%{{y:+.2f}} deg<extra></extra>",
+            )
+        )
+        if not np.isfinite(us["mean_deg"]):
+            warnings.append(f"{label}: Not enough timed skidpad samples for the understeer angle.")
+        runs[run_name] = {
+            "understeer_angle_deg": us["mean_deg"],
+            "understeer_angle_R_deg": us["R_deg"],
+            "understeer_angle_L_deg": us["L_deg"],
+            "samples": int(us["n"]),
+        }
         rows.append({
-            "Lap": int(lap_id),
-            "Side": info["side"],
-            "steer_rate_rms_deg_s": _round(steer_rate_rms, 2),
-            "throttle_var": _round(thr_var, 3),
-            "brake_var": _round(brk_var, 3),
-            "vx_var_m2_s2": _round(speed_var, 3),
-            "Throttle source": throttle_col or "missing",
-            "Brake source": brake_col or "missing",
+            "Run": label,
+            "understeer_R_deg": _round(us["R_deg"], 3),
+            "understeer_L_deg": _round(us["L_deg"], 3),
+            "understeer_mean_deg": _round(us["mean_deg"], 3),
+            "Samples": int(us["n"]),
         })
 
-    fig = make_subplots(
-        rows=2,
-        cols=2,
-        vertical_spacing=0.16,
-        horizontal_spacing=0.11,
-        subplot_titles=("Steering-rate RMS", "Throttle variance", "Brake variance", "Speed variance"),
-    )
-    fig.add_trace(go.Bar(x=labels, y=steer_rms, marker_color="#4DB3F2", name="Steer RMS"), row=1, col=1)
-    fig.add_trace(go.Bar(x=labels, y=throttle_var, marker_color="#73D973", name="Throttle var"), row=1, col=2)
-    fig.add_trace(go.Bar(x=labels, y=brake_var, marker_color="#F28C40", name="Brake var"), row=2, col=1)
-    fig.add_trace(go.Bar(x=labels, y=vx_var, marker_color="#D973D9", name="vx var"), row=2, col=2)
-    _apply_dark_layout(fig, "Driver smoothness in skidpad", height=720, showlegend=False)
-    fig.update_yaxes(title_text="deg/s", row=1, col=1)
-    fig.update_yaxes(title_text="signal^2", row=1, col=2)
-    fig.update_yaxes(title_text="signal^2", row=2, col=1)
-    fig.update_yaxes(title_text="(m/s)^2", row=2, col=2)
-
+    fig.update_layout(height=460, barmode="group")
     return fig, {
+        "runs": runs,
         "table": pl.DataFrame(rows),
-        "per_circle": rows,
-        "throttle_source": throttle_col,
-        "brake_source": brake_col,
-        "warnings": _classification_warnings(circles),
+        "warnings": warnings,
     }
 
 
-def tv_intervention_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
-    """TV yaw moment versus lateral grip (OptimumG-style control cross-plot)."""
-    circles = classify_circles(df)
-    required = ["laps", "Filtering_VN_ay", "VN_vx", *_TV_TORQUE_COLS, "TV_errorYawRate"]
-    optional = [col for col in ("TV_desiredYawRate", "TV_actualMz") if col in df.columns]
-    _require_columns(df, [*required, *optional])
-    arr = cols_to_numpy(df, [*required, *optional])
-    mz_applied = _tv_yaw_moment_from_torque(arr)
-    yaw_err = arr["TV_errorYawRate"]
-    ay_g = arr["Filtering_VN_ay"] / G_MPS2
-    sustained = _sustained_balance_mask(arr["VN_vx"], arr["Filtering_VN_ay"])
-
+def tv_intervention_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[str, Any]]:
+    """TV yaw moment versus lateral grip, one colour per run."""
     fig = make_dark_figure(
         "TV intervention versus lateral grip",
         "|ay| [g]",
@@ -631,105 +504,130 @@ def tv_intervention_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
     )
 
     rows: list[dict[str, object]] = []
-    side_mz: dict[str, list[float]] = {"R": [], "L": []}
-    any_data = False
-    for idx, (lap_id, info) in enumerate(circles.items()):
-        mask = (arr["laps"] == float(lap_id)) & sustained
-        mz_lap = mz_applied[mask]
-        err_lap = yaw_err[mask]
-        ay_lap = np.abs(ay_g[mask])
-        good_mz = np.isfinite(mz_lap) & np.isfinite(ay_lap)
-        good_err = np.isfinite(err_lap)
+    runs: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
+    for idx, (run_name, df) in enumerate(dfs.items()):
+        label = _run_label(run_name)
+        color = _run_color(run_name)
+        circles = classify_circles(df)
+        for warning in _classification_warnings(circles):
+            warnings.append(f"{label}: {warning}")
+        required = ["laps", "Filtering_VN_ay", "VN_vx", *_TV_TORQUE_COLS, "TV_errorYawRate"]
+        optional = [col for col in ("TV_desiredYawRate", "TV_actualMz") if col in df.columns]
+        _require_columns(df, [*required, *optional])
+        arr = cols_to_numpy(df, [*required, *optional])
+        mz_applied = _tv_yaw_moment_from_torque(arr)
+        yaw_err = arr["TV_errorYawRate"]
+        ay_g = arr["Filtering_VN_ay"] / G_MPS2
+        sustained = _sustained_balance_mask(arr["VN_vx"], arr["Filtering_VN_ay"]) & _lap_mask(arr["laps"], circles)
+
+        good_mz = sustained & np.isfinite(mz_applied) & np.isfinite(ay_g)
         if good_mz.any():
-            any_data = True
-            color = _RUN_COLORS[idx % len(_RUN_COLORS)]
             fig.add_trace(
                 go.Scattergl(
-                    x=ay_lap[good_mz],
-                    y=np.abs(mz_lap[good_mz]),
+                    x=np.abs(ay_g[good_mz]),
+                    y=np.abs(mz_applied[good_mz]),
                     mode="markers",
-                    name=_circle_label(lap_id, info),
+                    name=label,
                     marker=dict(color=color, size=4, opacity=0.55),
-                    hovertemplate="|ay|=%{x:.2f} g<br>|Mz|=%{y:.1f} Nm<extra></extra>",
+                    hovertemplate=f"{label}<br>|ay|=%{{x:.2f}} g<br>|Mz|=%{{y:.1f}} Nm<extra></extra>",
                 )
             )
-            side_mz[info["side"]].append(_safe_mean(mz_lap[good_mz]))
+        else:
+            warnings.append(f"{label}: No sustained-cornering TV samples to plot.")
+        yaw_good = sustained & np.isfinite(yaw_err)
+        side_mz: dict[str, float] = {}
+        for side in ("R", "L"):
+            side_mask = good_mz & np.isin(arr["laps"], np.asarray(_circle_laps_for_side(circles, side), dtype=float))
+            side_mz[side] = _safe_mean(mz_applied[side_mask])
+        runs[run_name] = {
+            "Mz_mean_Nm": _safe_mean(mz_applied[good_mz]),
+            "yaw_err_rms_rad_s": _rms(yaw_err[yaw_good]),
+            "Mz_R_mean_Nm": side_mz["R"],
+            "Mz_L_mean_Nm": side_mz["L"],
+        }
         rows.append({
-            "Lap": int(lap_id),
-            "Side": info["side"],
-            "Mz_mean_Nm": _round(_safe_mean(mz_lap[good_mz]), 2),
-            "Mz_abs_mean_Nm": _round(_safe_mean(np.abs(mz_lap[good_mz])), 2),
-            "yaw_err_rms_rad_s": _round(_rms(err_lap[good_err]), 4),
+            "Run": label,
+            "Mz_mean_Nm": _round(_safe_mean(mz_applied[good_mz]), 2),
+            "Mz_abs_mean_Nm": _round(_safe_mean(np.abs(mz_applied[good_mz])), 2),
+            "yaw_err_rms_rad_s": _round(_rms(yaw_err[yaw_good]), 4),
             "Samples": int(good_mz.sum()),
         })
 
     fig.update_layout(height=480)
-    warnings = _classification_warnings(circles)
-    if not any_data:
-        warnings.append("No sustained-cornering TV samples to plot.")
-    all_good = np.isfinite(mz_applied) & sustained
-    yaw_good = np.isfinite(yaw_err) & sustained
     return fig, {
-        "Mz_mean_Nm": _safe_mean(mz_applied[all_good]),
-        "yaw_err_rms_rad_s": _rms(yaw_err[yaw_good]),
-        "Mz_R_mean_Nm": _safe_mean(np.asarray(side_mz["R"], dtype=float)),
-        "Mz_L_mean_Nm": _safe_mean(np.asarray(side_mz["L"], dtype=float)),
+        "runs": runs,
         "table": pl.DataFrame(rows),
-        "per_circle": rows,
         "warnings": warnings,
     }
 
 
-def lateral_load_dist_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
-    """Compute measured lateral load-transfer distribution in skidpad."""
-    circles = classify_circles(df)
-    required = ["laps", "Filtering_VN_ay", *_FZ_COLS]
-    _require_columns(df, required)
-    arr = cols_to_numpy(df, required)
+def lateral_load_dist_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[str, Any]]:
+    """Measured lateral load-transfer distribution, one bar per run."""
+    fig = make_dark_figure("Lateral load-transfer distribution", "Run", "Front LLTD [%]")
 
     labels: list[str] = []
+    colors: list[str] = []
     lltd_values: list[float] = []
     rows: list[dict[str, object]] = []
-    all_lltd: list[np.ndarray] = []
-    for lap_id, info in circles.items():
-        mask = arr["laps"] == float(lap_id)
-        front_transfer, rear_transfer = _axle_load_transfer(info["side"], arr, mask)
-        denom = front_transfer + rear_transfer
-        good = (
-            np.isfinite(front_transfer)
-            & np.isfinite(rear_transfer)
-            & np.isfinite(denom)
-            & (denom > 50.0)
-        )
-        if not good.any():
-            continue
-        lltd = 100.0 * front_transfer[good] / denom[good]
-        lltd = lltd[np.isfinite(lltd) & (lltd >= 0.0) & (lltd <= 100.0)]
-        if lltd.size == 0:
-            continue
-        all_lltd.append(lltd)
-        mean_lltd = _safe_mean(lltd)
-        labels.append(_circle_label(lap_id, info))
+    runs: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
+    for idx, (run_name, df) in enumerate(dfs.items()):
+        label = _run_label(run_name)
+        color = _run_color(run_name)
+        circles = classify_circles(df)
+        for warning in _classification_warnings(circles):
+            warnings.append(f"{label}: {warning}")
+        required = ["laps", "Filtering_VN_ay", *_FZ_COLS]
+        _require_columns(df, required)
+        arr = cols_to_numpy(df, required)
+
+        run_lltd: list[np.ndarray] = []
+        for side in ("R", "L"):
+            side_mask = np.isin(arr["laps"], np.asarray(_circle_laps_for_side(circles, side), dtype=float))
+            front_transfer, rear_transfer = _axle_load_transfer(side, arr, side_mask)
+            denom = front_transfer + rear_transfer
+            good = (
+                np.isfinite(front_transfer)
+                & np.isfinite(rear_transfer)
+                & np.isfinite(denom)
+                & (denom > 50.0)
+            )
+            if not good.any():
+                continue
+            lltd = 100.0 * front_transfer[good] / denom[good]
+            lltd = lltd[np.isfinite(lltd) & (lltd >= 0.0) & (lltd <= 100.0)]
+            if lltd.size:
+                run_lltd.append(lltd)
+
+        lltd_all = np.concatenate(run_lltd) if run_lltd else np.array([], dtype=float)
+        mean_lltd = _safe_mean(lltd_all)
+        labels.append(label)
+        colors.append(color)
         lltd_values.append(mean_lltd)
+        runs[run_name] = {
+            "LLTD_meas_pct": mean_lltd,
+            "LLTD_theory_pct": 100.0 * LLTD_THEORY,
+            "delta_pct": mean_lltd - 100.0 * LLTD_THEORY if np.isfinite(mean_lltd) else np.nan,
+        }
         rows.append({
-            "Lap": int(lap_id),
-            "Side": info["side"],
+            "Run": label,
             "LLTD_meas_pct": _round(mean_lltd, 2),
             "LLTD_theory_pct": _round(100.0 * LLTD_THEORY, 2),
             "delta_pct": _round(mean_lltd - 100.0 * LLTD_THEORY, 2),
-            "Samples": int(lltd.size),
+            "Samples": int(lltd_all.size),
         })
 
-    fig = make_dark_figure("Lateral load-transfer distribution", "Circle", "Front LLTD [%]")
     fig.add_trace(
         go.Bar(
             x=labels,
             y=lltd_values,
-            marker=dict(color="#4DB3F2", line=dict(color="#22252B", width=1)),
+            marker=dict(color=colors, line=dict(color="#22252B", width=1)),
             text=[_fmt_num(v, ".1f") for v in lltd_values],
             textposition="outside",
             hovertemplate="%{x}<br>LLTD=%{y:.1f}%<extra></extra>",
             name="Measured",
+            showlegend=False,
         )
     )
     fig.add_hline(
@@ -740,22 +638,16 @@ def lateral_load_dist_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
     )
     fig.update_yaxes(range=[0.0, 100.0])
     fig.update_layout(height=470)
-    lltd_all = np.concatenate(all_lltd) if all_lltd else np.array([], dtype=float)
-    lltd_mean = _safe_mean(lltd_all)
     return fig, {
-        "LLTD_meas_pct": lltd_mean,
-        "LLTD_theory_pct": 100.0 * LLTD_THEORY,
-        "delta_pct": lltd_mean - 100.0 * LLTD_THEORY if np.isfinite(lltd_mean) else np.nan,
+        "runs": runs,
         "table": pl.DataFrame(rows),
-        "per_circle": rows,
-        "warnings": _classification_warnings(circles),
+        "warnings": warnings,
     }
 
 
-def lr_asymmetry_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
-    """Aggregate right-minus-left skidpad asymmetry metrics."""
-    circles = classify_circles(df)
-    warnings = _classification_warnings(circles)
+def _lr_asymmetry_rows(df: pl.DataFrame, circles: dict[int, dict[str, Any]]) -> tuple[list[dict[str, object]], list[str]]:
+    """Right-minus-left asymmetry metric rows for a single run."""
+    warnings: list[str] = []
     rows: list[dict[str, object]] = []
 
     def add_metric(name: str, right: float, left: float, unit: str, decimals: int = 3) -> None:
@@ -779,7 +671,7 @@ def lr_asymmetry_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
             for side, laps in side_laps.items()
         }
         steer_side = {
-            side: _side_mean_abs(np.rad2deg(arr_core["Steering"] / STEERING_RATIO), arr_core["laps"], laps)
+            side: _side_mean_abs(np.rad2deg(arr_core["Steering"]), arr_core["laps"], laps)  # Steering-pot [rad]→deg; no STEERING_RATIO
             for side, laps in side_laps.items()
         }
         radius = _driven_radius_m(
@@ -796,15 +688,10 @@ def lr_asymmetry_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
         add_metric("driven_radius", radius_side["R"], radius_side["L"], "m", 3)
 
     try:
-        us_payload = _understeer_fit_payload(df, circles, side_laps=side_laps)
-        us_side: dict[str, float] = {}
-        for side in ("R", "L"):
-            mask = us_payload["side"] == side
-            fit = _linear_fit(us_payload["ay_g"][mask], us_payload["delta_dyn_deg"][mask])
-            us_side[side] = fit["slope"]
-        add_metric("K_us", us_side.get("R", np.nan), us_side.get("L", np.nan), "deg/g", 3)
+        us = _steady_state_understeer(df, circles, side_laps=side_laps)
+        add_metric("understeer_angle", us["R_deg"], us["L_deg"], "deg", 3)
     except Exception as exc:
-        warnings.append(f"Understeer-gradient asymmetry unavailable: {exc}")
+        warnings.append(f"Understeer-angle asymmetry unavailable: {exc}")
 
     if all(col in df.columns for col in _TV_TORQUE_COLS) and "Filtering_VN_ay" in df.columns:
         arr_tv = cols_to_numpy(df, ["laps", "Filtering_VN_ay", *_TV_TORQUE_COLS])
@@ -827,155 +714,154 @@ def lr_asymmetry_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
             lltd_side[side] = _safe_mean(lltd[(lltd >= 0.0) & (lltd <= 100.0)])
         add_metric("LLTD", lltd_side.get("R", np.nan), lltd_side.get("L", np.nan), "pct", 2)
 
-    plot_rows = [row for row in rows if np.isfinite(float(row["R-L"]))]
+    return rows, warnings
+
+
+def lr_asymmetry_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[str, Any]]:
+    """Right-minus-left skidpad asymmetry, grouped horizontal bars per run."""
     fig = make_dark_figure("Right-left skidpad asymmetry", "R - L difference", "Metric")
     fig.add_vline(x=0.0, line=dict(color="rgba(235,235,235,0.45)", dash="dash", width=1))
-    if plot_rows:
-        deltas = [float(row["R-L"]) for row in plot_rows]
-        labels = [f"{row['Metric']} [{row['Unit']}]" for row in plot_rows]
-        fig.add_trace(
-            go.Bar(
-                x=deltas,
-                y=labels,
-                orientation="h",
-                marker_color=["#73D973" if abs(v) < 1e-9 else "#F28C40" for v in deltas],
-                text=[_fmt_num(v, "+.3f") for v in deltas],
-                textposition="outside",
-                hovertemplate="%{y}<br>R-L=%{x:+.3f}<extra></extra>",
-                name="R-L",
-            )
-        )
-    fig.update_layout(height=max(430, 70 * max(1, len(plot_rows))), showlegend=False)
-    return fig, {
-        "table": pl.DataFrame(rows),
-        "metrics": rows,
-        "warnings": warnings,
-    }
 
-
-def gps_figure8_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
-    """Plot local GPS trajectory with theoretical skidpad circles."""
-    circles = classify_circles(df)
-    required = ["laps", "VN_latitude", "VN_longitude", "Filtering_VN_ay"]
-    _require_columns(df, required)
-    arr = cols_to_numpy(df, required)
-    lap_mask = _lap_mask(arr["laps"], circles)
-    gps_valid = (
-        lap_mask
-        & np.isfinite(arr["VN_latitude"])
-        & np.isfinite(arr["VN_longitude"])
-        & ((np.abs(arr["VN_latitude"]) > 1e-9) | (np.abs(arr["VN_longitude"]) > 1e-9))
-    )
-    if int(gps_valid.sum()) < 3:
-        raise ValueError("Not enough valid GPS samples for skidpad map.")
-
-    x_valid, y_valid = gps_to_local_xy(arr["VN_latitude"][gps_valid], arr["VN_longitude"][gps_valid])
-    x = np.full(len(df), np.nan, dtype=float)
-    y = np.full(len(df), np.nan, dtype=float)
-    x[gps_valid] = x_valid
-    y[gps_valid] = y_valid
-
-    fig = make_dark_figure("Skidpad GPS figure-8", "Local X [m]", "Local Y [m]")
-    fig.add_trace(
-        go.Scattergl(
-            x=x[gps_valid],
-            y=y[gps_valid],
-            mode="markers",
-            name="Trajectory",
-            marker=dict(
-                color=np.abs(arr["Filtering_VN_ay"][gps_valid]) / G_MPS2,
-                colorscale="Turbo",
-                size=4,
-                opacity=0.82,
-                colorbar=dict(title="|ay| [g]"),
-            ),
-            hovertemplate="x=%{x:.1f} m<br>y=%{y:.1f} m<br>|ay|=%{marker.color:.2f} g<extra></extra>",
-        )
-    )
-
-    centers = _skidpad_centers_from_laps(circles, arr["laps"], x, y)
-    theta = np.linspace(0.0, 2.0 * np.pi, 240)
-    for side, center in centers.items():
-        cx, cy = center
-        for radius, dash, name in (
-            (SKIDPAD_INNER_RADIUS_M, "dash", "inner"),
-            (SKIDPAD_OUTER_RADIUS_M, "dash", "outer"),
-            (SKIDPAD_IDEAL_RADIUS_M, "dot", "ideal"),
-        ):
+    table_rows: list[dict[str, object]] = []
+    warnings: list[str] = []
+    max_metrics = 1
+    for idx, (run_name, df) in enumerate(dfs.items()):
+        label = _run_label(run_name)
+        color = _run_color(run_name)
+        circles = classify_circles(df)
+        for warning in _classification_warnings(circles):
+            warnings.append(f"{label}: {warning}")
+        rows, run_warnings = _lr_asymmetry_rows(df, circles)
+        for warning in run_warnings:
+            warnings.append(f"{label}: {warning}")
+        for row in rows:
+            table_rows.append({"Run": label, **row})
+        plot_rows = [row for row in rows if np.isfinite(float(row["R-L"]))]
+        max_metrics = max(max_metrics, len(plot_rows))
+        if plot_rows:
+            deltas = [float(row["R-L"]) for row in plot_rows]
+            labels = [f"{row['Metric']} [{row['Unit']}]" for row in plot_rows]
             fig.add_trace(
-                go.Scatter(
-                    x=cx + radius * np.cos(theta),
-                    y=cy + radius * np.sin(theta),
-                    mode="lines",
-                    name=f"{side} {name}",
-                    line=dict(color=_REFERENCE, dash=dash, width=1.0),
-                    opacity=0.78,
-                    hoverinfo="skip",
+                go.Bar(
+                    x=deltas,
+                    y=labels,
+                    orientation="h",
+                    name=label,
+                    marker_color=color,
+                    text=[_fmt_num(v, "+.3f") for v in deltas],
+                    textposition="outside",
+                    hovertemplate=f"{label}<br>%{{y}}<br>R-L=%{{x:+.3f}}<extra></extra>",
                 )
             )
-        fig.add_trace(
-            go.Scatter(
-                x=[cx],
-                y=[cy],
-                mode="markers",
-                name=f"{side} fitted center",
-                marker=dict(color=_SIDE_COLORS[side], size=9, symbol="x"),
-                hovertemplate=f"{side} center<br>x=%{{x:.1f}} m<br>y=%{{y:.1f}} m<extra></extra>",
-            )
-        )
 
-    fig.update_yaxes(scaleanchor="x", scaleratio=1.0)
-    fig.update_layout(height=650)
-    warnings = _classification_warnings(circles)
-    if len(centers) < 2:
-        warnings.append("Only one skidpad circle center could be estimated from GPS.")
+    fig.update_layout(height=max(430, 70 * max_metrics), barmode="group")
     return fig, {
-        "gps_samples": int(gps_valid.sum()),
-        "centers": {side: (float(center[0]), float(center[1])) for side, center in centers.items()},
+        "table": pl.DataFrame(table_rows),
         "warnings": warnings,
     }
 
 
-def event_time_bars_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
-    """Backward-compatible alias for older dashboard cache keys."""
-    return event_time_summary_fig(df)
+def gps_figure8_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[str, Any]]:
+    """Local GPS trajectory with theoretical skidpad circles, one colour per run."""
+    fig = make_dark_figure("Skidpad GPS figure-8", "Local X [m]", "Local Y [m]")
+    theta = np.linspace(0.0, 2.0 * np.pi, 240)
+    runs: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
+    any_traj = False
+    for idx, (run_name, df) in enumerate(dfs.items()):
+        label = _run_label(run_name)
+        color = _run_color(run_name)
+        circles = classify_circles(df)
+        for warning in _classification_warnings(circles):
+            warnings.append(f"{label}: {warning}")
+        required = ["laps", "VN_latitude", "VN_longitude", "Filtering_VN_ay"]
+        _require_columns(df, required)
+        arr = cols_to_numpy(df, required)
+        lap_mask = _lap_mask(arr["laps"], circles)
+        gps_valid = (
+            lap_mask
+            & np.isfinite(arr["VN_latitude"])
+            & np.isfinite(arr["VN_longitude"])
+            & ((np.abs(arr["VN_latitude"]) > 1e-9) | (np.abs(arr["VN_longitude"]) > 1e-9))
+        )
+        if int(gps_valid.sum()) < 3:
+            warnings.append(f"{label}: Not enough valid GPS samples for skidpad map.")
+            runs[run_name] = {"gps_samples": int(gps_valid.sum()), "centers": {}}
+            continue
+
+        x_valid, y_valid = gps_to_local_xy(arr["VN_latitude"][gps_valid], arr["VN_longitude"][gps_valid])
+        x = np.full(len(df), np.nan, dtype=float)
+        y = np.full(len(df), np.nan, dtype=float)
+        x[gps_valid] = x_valid
+        y[gps_valid] = y_valid
+        any_traj = True
+        fig.add_trace(
+            go.Scattergl(
+                x=x[gps_valid],
+                y=y[gps_valid],
+                mode="markers",
+                name=label,
+                marker=dict(color=color, size=4, opacity=0.7),
+                hovertemplate=f"{label}<br>x=%{{x:.1f}} m<br>y=%{{y:.1f}} m<extra></extra>",
+            )
+        )
+
+        centers = _skidpad_centers_from_laps(circles, arr["laps"], x, y)
+        for side, center in centers.items():
+            cx, cy = center
+            for radius, dash in (
+                (SKIDPAD_INNER_RADIUS_M, "dash"),
+                (SKIDPAD_OUTER_RADIUS_M, "dash"),
+                (SKIDPAD_IDEAL_RADIUS_M, "dot"),
+            ):
+                fig.add_trace(
+                    go.Scatter(
+                        x=cx + radius * np.cos(theta),
+                        y=cy + radius * np.sin(theta),
+                        mode="lines",
+                        name=f"{label} {side}",
+                        line=dict(color=color, dash=dash, width=1.0),
+                        opacity=0.5,
+                        showlegend=False,
+                        hoverinfo="skip",
+                    )
+                )
+        if len(centers) < 2:
+            warnings.append(f"{label}: Only one skidpad circle center could be estimated from GPS.")
+        runs[run_name] = {
+            "gps_samples": int(gps_valid.sum()),
+            "centers": {side: (float(c[0]), float(c[1])) for side, c in centers.items()},
+        }
+
+    if not any_traj:
+        raise ValueError("Not enough valid GPS samples for skidpad map.")
+    fig.update_yaxes(scaleanchor="x", scaleratio=1.0)
+    fig.update_layout(height=650)
+    return fig, {
+        "runs": runs,
+        "warnings": warnings,
+    }
 
 
-def lateral_g_histogram_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
-    """Backward-compatible alias; now returns the lateral-G time figure."""
-    return lateral_g_fig(df)
-
-
-def driven_radius_histogram_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
-    """Backward-compatible alias; now returns the driven-radius time figure."""
-    return driven_radius_fig(df)
-
-
-def understeer_chart_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
-    """Backward-compatible alias for understeer-gradient diagnostics."""
-    return understeer_gradient_fig(df)
-
-
-def slip_angle_vs_ay_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
-    """Backward-compatible alias for the balance summary."""
-    return balance_fig(df)
-
-
-def yaw_rate_vs_ay_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
-    """Compatibility diagnostic for yaw rate versus lateral acceleration."""
-    circles = classify_circles(df)
-    yaw_col = _first_existing_col(df, _YAW_ALIASES)
-    if yaw_col is None:
-        raise KeyError("Missing yaw-rate column: VN_gz/AS_yaw_rate")
-    required = ["laps", "Filtering_VN_ay", "VN_vx", yaw_col]
-    _require_columns(df, required)
-    arr = cols_to_numpy(df, required)
-    sustained = _sustained_balance_mask(arr["VN_vx"], arr["Filtering_VN_ay"]) & _lap_mask(arr["laps"], circles)
+def yaw_rate_vs_ay_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[str, Any]]:
+    """Yaw rate versus lateral acceleration, one colour per run."""
     fig = make_dark_figure("Yaw rate versus lateral acceleration", "ay [g]", "Yaw rate [rad/s]")
     fig.add_hline(y=0.0, line=dict(color="rgba(235,235,235,0.35)", dash="dash", width=1))
     fig.add_vline(x=0.0, line=dict(color="rgba(235,235,235,0.35)", dash="dash", width=1))
-    for side in ("R", "L"):
-        mask = sustained & np.isin(arr["laps"], np.asarray(_circle_laps_for_side(circles, side), dtype=float))
+    warnings: list[str] = []
+    for idx, (run_name, df) in enumerate(dfs.items()):
+        label = _run_label(run_name)
+        color = _run_color(run_name)
+        circles = classify_circles(df)
+        for warning in _classification_warnings(circles):
+            warnings.append(f"{label}: {warning}")
+        yaw_col = first_existing_col(df, _YAW_ALIASES)
+        if yaw_col is None:
+            raise KeyError("Missing yaw-rate column: VN_gz/AS_yaw_rate")
+        required = ["laps", "Filtering_VN_ay", "VN_vx", yaw_col]
+        _require_columns(df, required)
+        arr = cols_to_numpy(df, required)
+        mask = _sustained_balance_mask(arr["VN_vx"], arr["Filtering_VN_ay"]) & _lap_mask(arr["laps"], circles)
         if not mask.any():
             continue
         fig.add_trace(
@@ -983,17 +869,12 @@ def yaw_rate_vs_ay_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
                 x=arr["Filtering_VN_ay"][mask] / G_MPS2,
                 y=arr[yaw_col][mask],
                 mode="markers",
-                name=f"{side} samples",
-                marker=dict(color=_SIDE_COLORS[side], size=4, opacity=0.45),
-                hovertemplate="ay=%{x:+.2f} g<br>yaw=%{y:+.3f} rad/s<extra></extra>",
+                name=label,
+                marker=dict(color=color, size=4, opacity=0.45),
+                hovertemplate=f"{label}<br>ay=%{{x:+.2f}} g<br>yaw=%{{y:+.3f}} rad/s<extra></extra>",
             )
         )
-    return fig, {"warnings": _classification_warnings(circles), "yaw_source": yaw_col}
-
-
-def lltd_scatter_fig(df: pl.DataFrame) -> tuple[go.Figure, dict[str, Any]]:
-    """Backward-compatible alias for the LLTD bar chart."""
-    return lateral_load_dist_fig(df)
+    return fig, {"warnings": warnings}
 
 
 def _require_columns(df: pl.DataFrame, columns: list[str] | tuple[str, ...]) -> None:
@@ -1130,10 +1011,6 @@ def _opposite_side(side: str) -> str:
     return "R" if side == "L" else "L"
 
 
-def _turn_sign_from_side(side: str) -> float:
-    return 1.0 if side == AY_POSITIVE_SIDE else -1.0
-
-
 def _driven_radius_m(time_s: np.ndarray, vx_mps: np.ndarray, ay_mps2: np.ndarray) -> np.ndarray:
     vx = np.asarray(vx_mps, dtype=float)
     ay_abs = np.abs(np.asarray(ay_mps2, dtype=float))
@@ -1183,95 +1060,61 @@ def _front_rear_sa_deg(arr: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarr
     return front_sa_deg, rear_sa_deg
 
 
-def _understeer_angle_deg(steering: np.ndarray, yaw_rate: np.ndarray, vx_mps: np.ndarray) -> np.ndarray:
-    steering_rad = np.asarray(steering, dtype=float) / STEERING_RATIO
-    yaw = np.asarray(yaw_rate, dtype=float)
+def _understeer_angle_deg(steering_rad: np.ndarray, ay_mps2: np.ndarray, vx_mps: np.ndarray) -> np.ndarray:
+    """Steady-state understeer angle [deg]: ``|Steering| - |delta_ackermann|``.
+
+    ``Steering`` is the steering-potentiometer value in radians; the team's
+    formula uses it directly (no STEERING_RATIO division). The Ackermann
+    reference is acceleration-based, ``delta_ackermann = L * ay / vx^2``.
+    Positive = understeer.
+    """
+    steering = np.abs(np.asarray(steering_rad, dtype=float))
     vx = np.asarray(vx_mps, dtype=float)
-    ackermann_rad = np.divide(
-        WHEELBASE_EQ * yaw,
-        vx,
+    ideal_rad = np.divide(
+        WHEELBASE_EQ * np.asarray(ay_mps2, dtype=float),
+        vx ** 2,
         out=np.full_like(vx, np.nan, dtype=float),
-        where=np.isfinite(yaw) & np.isfinite(vx) & (np.abs(vx) > 0.5),
+        where=np.isfinite(vx) & (np.abs(vx) > 0.5),
     )
-    return np.rad2deg(steering_rad - ackermann_rad)
+    return np.rad2deg(steering - np.abs(ideal_rad))
 
 
-def _understeer_fit_payload(
+def _steady_state_understeer(
     df: pl.DataFrame,
     circles: dict[int, dict[str, Any]],
     *,
     side_laps: dict[str, list[int]] | None = None,
-) -> dict[str, np.ndarray]:
-    yaw_col = _first_existing_col(df, _YAW_ALIASES)
-    if yaw_col is None:
-        raise KeyError("Missing yaw-rate column: VN_gz/AS_yaw_rate")
-    required = ["laps", "Filtering_VN_ay", "VN_vx", "Steering", yaw_col]
+) -> dict[str, float]:
+    """Steady-state understeer angle over the timed skidpad circles.
+
+    Uses ``|Steering| - |L * ay / vx^2|`` (``Steering`` = steering-potentiometer
+    value [rad], used directly; ``ay = Filtering_VN_ay``, ``vx = Est_vxCOG``);
+    positive = understeer. A whole timed circle is steady-state cornering, so the angle is
+    averaged over the full timed lap, only dropping non-finite samples.
+    """
+    vx_col = first_existing_col(df, ("Est_vxCOG", "VN_vx"))
+    if vx_col is None:
+        raise KeyError("Missing speed column: Est_vxCOG/VN_vx")
+    required = ["laps", "Steering", "Filtering_VN_ay", vx_col]
     _require_columns(df, required)
     arr = cols_to_numpy(df, required)
-    delta_dyn_deg = _understeer_angle_deg(arr["Steering"], arr[yaw_col], arr["VN_vx"])
-    ay_g = arr["Filtering_VN_ay"] / G_MPS2
-    sustained = _sustained_balance_mask(arr["VN_vx"], arr["Filtering_VN_ay"])
+    understeer_deg = _understeer_angle_deg(arr["Steering"], arr["Filtering_VN_ay"], arr[vx_col])
 
-    side_arr = np.full(len(arr["laps"]), "", dtype=object)
     source = side_laps if side_laps is not None else {
         side: _circle_laps_for_side(circles, side) for side in ("R", "L")
     }
-    for side, laps in source.items():
-        side_arr[np.isin(arr["laps"], np.asarray(laps, dtype=float))] = side
-
-    good = sustained & (side_arr != "") & np.isfinite(ay_g) & np.isfinite(delta_dyn_deg)
-    return {
-        "ay_g": ay_g[good],
-        "delta_dyn_deg": delta_dyn_deg[good],
-        "side": side_arr[good],
-    }
-
-
-def _linear_fit(x: np.ndarray, y: np.ndarray) -> dict[str, float]:
-    good = np.isfinite(x) & np.isfinite(y)
-    x_fit = np.asarray(x[good], dtype=float)
-    y_fit = np.asarray(y[good], dtype=float)
-    if x_fit.size < MIN_FIT_SAMPLES or float(np.nanmax(x_fit) - np.nanmin(x_fit)) <= 1e-6:
-        return {"slope": np.nan, "intercept": np.nan, "r2": np.nan, "n": int(x_fit.size)}
-    slope, intercept = np.polyfit(x_fit, y_fit, 1)
-    pred = slope * x_fit + intercept
-    ss_res = float(np.nansum((y_fit - pred) ** 2))
-    ss_tot = float(np.nansum((y_fit - np.nanmean(y_fit)) ** 2))
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0.0 else np.nan
-    return {"slope": float(slope), "intercept": float(intercept), "r2": float(r2), "n": int(x_fit.size)}
-
-
-def _add_fit_line(
-    fig: go.Figure,
-    x: np.ndarray,
-    fit: dict[str, float],
-    color: str,
-    name: str,
-    *,
-    dash: str = "solid",
-) -> None:
-    good = np.isfinite(x)
-    if not good.any() or not np.isfinite(fit["slope"]):
-        return
-    x_fit = np.linspace(float(np.nanmin(x[good])), float(np.nanmax(x[good])), 80)
-    fig.add_trace(
-        go.Scatter(
-            x=x_fit,
-            y=fit["slope"] * x_fit + fit["intercept"],
-            mode="lines",
-            name=name,
-            line=dict(color=color, width=2.0, dash=dash),
-            hovertemplate=f"slope={fit['slope']:+.3f}<extra></extra>",
-        )
-    )
-
-
-def _roll_from_quaternion_deg(qx: np.ndarray, qy: np.ndarray, qz: np.ndarray, qw: np.ndarray) -> np.ndarray:
-    roll_rad = np.arctan2(
-        2.0 * (qw * qx + qy * qz),
-        1.0 - 2.0 * (qx ** 2 + qy ** 2),
-    )
-    return np.rad2deg(roll_rad)
+    out: dict[str, float] = {"mean_deg": np.nan, "R_deg": np.nan, "L_deg": np.nan, "n": 0}
+    total = 0
+    for side in ("R", "L"):
+        laps = np.asarray(source.get(side, []), dtype=float)
+        mask = np.isin(arr["laps"], laps) & np.isfinite(understeer_deg)
+        if not mask.any():
+            continue
+        out[f"{side}_deg"] = _safe_mean(understeer_deg[mask])
+        total += int(mask.sum())
+    out["mean_deg"] = _safe_mean([v for v in (out["R_deg"], out["L_deg"]) if np.isfinite(v)])
+    out["n"] = total
+    return out
 
 
 def _tv_yaw_moment_from_torque(arr: dict[str, np.ndarray]) -> np.ndarray:
@@ -1357,10 +1200,6 @@ def _side_mean_abs(
     vals = values[mask]
     vals = np.abs(vals) if absolute else vals
     return _safe_mean(vals)
-
-
-def _first_existing_col(df: pl.DataFrame, aliases: tuple[str, ...]) -> str | None:
-    return next((col for col in aliases if col in df.columns), None)
 
 
 def _safe_mean(values: np.ndarray | list[float] | tuple[float, ...]) -> float:

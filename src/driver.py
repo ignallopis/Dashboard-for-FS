@@ -37,6 +37,7 @@ from utils import (
     add_trend_line,
     available_laps,
     cols_to_numpy,
+    driver_color,
     ensure_complete_laps_df,
     exclude_lap0_and_last_lap,
     fill_short_false_gaps,
@@ -90,15 +91,12 @@ _LONG_ACCEL_CANDIDATES  = ("Filtering_VN_ax", "VN_ax")
 _LAT_ACCEL_CANDIDATES   = ("Filtering_VN_ay",)
 _SPEED_CANDIDATES       = ("VN_vx",)
 
-# Per-driver/run colours — extend if needed
-DRIVER_COLORS = ("#4DB3F2", "#F27070", "#F2C94C", "#73D973")
 POTENTIAL_LAP_RUN = "__potential_lap__"
 
 _REQUIRED_COLS = ("TimeStamp", "laps", "laptime", "Throttle", "Brake")
 
 # ── Circuit map constants ─────────────────────────────────────────────────────
 
-_MAP_COLS = ("laps", "laptime", "VN_latitude", "VN_longitude", "Throttle", "Brake")
 
 THROTTLE_MAP_THRESHOLD = 5.0   # [%]  Coasting: Throttle < 5 %
 BRAKE_MAP_THRESHOLD    = 5.0   # [%]  Coasting: Brake    < 5 %
@@ -168,9 +166,9 @@ _MAP_MAX_COLS = 4
 
 
 def _driver_color(run_name: str, idx: int) -> str:
-    """Stable run colour."""
-    _ = run_name
-    return DRIVER_COLORS[idx % len(DRIVER_COLORS)]
+    """Stable run colour — shared identity palette used across the whole dashboard."""
+    _ = idx
+    return driver_color(run_name)
 
 
 # ── Circuit map helpers ───────────────────────────────────────────────────────
@@ -192,207 +190,6 @@ def _classify_phases(thr: np.ndarray, brk: np.ndarray) -> np.ndarray:
     phase[both & (brk >= thr)] = "BRAKING"       # brake dominant → braking with residual throttle
     phase[both & (thr >  brk)] = "PLAUSIBILITY"  # throttle dominant → real plausibility fault
     return phase
-
-
-def circuit_map_stats(
-    dfs: dict[str, pl.DataFrame],
-    selected: list[tuple[str, int]],
-) -> pl.DataFrame:
-    """Per-lap phase statistics [%] for the selected (run_name, lap_id) pairs."""
-    selected_set = set(selected)
-    multi_run    = len(dfs) > 1
-    rows: list[dict] = []
-
-    for run_name, df in dfs.items():
-        if any(c not in df.columns for c in _MAP_COLS):
-            continue
-        cols = cols_to_numpy(df, ["laps", "laptime", "Throttle", "Brake"])
-        laps_col = cols["laps"]
-        lt_col = cols["laptime"]
-        thr_col = cols["Throttle"]
-        brk_col = cols["Brake"]
-
-        for lap_id in np.unique(laps_col[np.isfinite(laps_col)]).astype(int).tolist():
-            if (run_name, lap_id) not in selected_set:
-                continue
-            lm = laps_col == float(lap_id)
-            if not lm.any():
-                continue
-            valid = lm & np.isfinite(thr_col) & np.isfinite(brk_col)
-            if not valid.any():
-                continue
-            phase = _classify_phases(thr_col[valid], brk_col[valid])
-            n     = int(valid.sum())
-            lt_val = float(np.nanmax(lt_col[lm]))
-
-            row: dict = {}
-            if multi_run:
-                row["Run"] = run_name
-            row["Lap"]              = lap_id
-            row["LapTime [s]"]      = round(lt_val, 2)
-            row["Throttle [%]"]     = round(100.0 * float((phase == "ACCELERATING").sum()) / n, 1)
-            row["Braking [%]"]      = round(100.0 * float((phase == "BRAKING").sum()) / n, 1)
-            row["Coasting [%]"]     = round(100.0 * float((phase == "COASTING").sum()) / n, 1)
-            row["Plausability [%]"] = round(100.0 * float((phase == "PLAUSIBILITY").sum()) / n, 1)
-            rows.append(row)
-
-    if not rows:
-        return pl.DataFrame()
-
-    pct_cols = ["Throttle [%]", "Braking [%]", "Coasting [%]", "Plausability [%]"]
-
-    def _with_avg(tbl: pl.DataFrame, run_name: str | None = None) -> pl.DataFrame:
-        """Sort by lap time and prepend one AVG row for this group."""
-        tbl = tbl.sort("LapTime [s]").with_columns(pl.col("Lap").cast(pl.Utf8))
-        avg: dict = {}
-        if run_name is not None:
-            avg["Run"] = run_name
-        avg["Lap"]          = "AVG"
-        avg["LapTime [s]"]  = round(float(tbl["LapTime [s]"].mean()), 2)
-        for c in pct_cols:
-            avg[c] = round(float(tbl[c].mean()), 1)
-        avg_tbl = pl.DataFrame([avg]).with_columns(
-            pl.col("Lap").cast(pl.Utf8),
-            pl.col("LapTime [s]").cast(pl.Float64),
-            *[pl.col(c).cast(pl.Float64) for c in pct_cols],
-        )
-        return pl.concat([avg_tbl, tbl])
-
-    table = pl.DataFrame(rows)
-
-    if multi_run:
-        # Preserve the original run order
-        run_order: list[str] = []
-        seen: set[str] = set()
-        for r in rows:
-            rn = r["Run"]
-            if rn not in seen:
-                run_order.append(rn)
-                seen.add(rn)
-        pieces = [_with_avg(table.filter(pl.col("Run") == rn), rn) for rn in run_order]
-        return pl.concat(pieces)
-    else:
-        return _with_avg(table)
-
-
-def circuit_map_fig(
-    dfs: dict[str, pl.DataFrame],
-    selected: list[tuple[str, int]],
-) -> go.Figure:
-    """Side-by-side GPS track maps coloured by driving phase — ONE panel per run.
-
-    All selected laps for a run are merged into its panel so different runs
-    (drivers) can be compared side by side without overlapping.
-    Phases — green: accelerating | red: braking | grey: coasting | white: plausibility.
-    """
-    if not selected:
-        fig = go.Figure()
-        fig.update_layout(paper_bgcolor="#141417", plot_bgcolor="#141417",
-                          font=dict(color="#EBEBEB"))
-        return fig
-
-    # Group selected laps by run, preserving dfs insertion order
-    run_to_laps: dict[str, list[int]] = {}
-    for run_name, lap_id in selected:
-        run_to_laps.setdefault(run_name, []).append(lap_id)
-    active_runs = [r for r in dfs if r in run_to_laps]
-
-    n_panels = len(active_runs)
-    if n_panels == 0:
-        return go.Figure()
-
-    # Panel titles: run name + lap list
-    titles: list[str] = []
-    for run_name in active_runs:
-        lap_ids = sorted(run_to_laps[run_name])
-        lap_str = ", ".join(f"L{l}" for l in lap_ids)
-        titles.append(f"{run_name}  [{lap_str}]")
-
-    fig = make_subplots(
-        rows=1,
-        cols=n_panels,
-        subplot_titles=titles,
-        horizontal_spacing=0.06,
-    )
-
-    fig.update_layout(
-        paper_bgcolor="#141417",
-        plot_bgcolor="#141417",
-        font=dict(color="#EBEBEB", size=11),
-        legend=dict(
-            bgcolor="rgba(20,20,23,0.85)",
-            bordercolor="rgba(128,128,128,0.3)",
-            borderwidth=1,
-            font=dict(color="#EBEBEB"),
-            orientation="h",
-            x=0.0,
-            y=-0.10,
-        ),
-        margin=dict(l=10, r=10, t=55, b=80),
-        height=400,
-    )
-
-    shown_phases: set[str] = set()
-
-    for panel_idx, run_name in enumerate(active_runs):
-        col = panel_idx + 1
-        df  = dfs[run_name]
-        if any(c not in df.columns for c in _MAP_COLS):
-            continue
-
-        cols = cols_to_numpy(df, ["laps", "Throttle", "Brake", "VN_latitude", "VN_longitude"])
-        laps = cols["laps"]
-        thr = cols["Throttle"]
-        brk = cols["Brake"]
-        lat = cols["VN_latitude"]
-        lng = cols["VN_longitude"]
-
-        # Union of all selected laps for this run
-        lap_mask = np.zeros(len(laps), dtype=bool)
-        for lap_id in run_to_laps[run_name]:
-            lap_mask |= laps == float(lap_id)
-
-        valid = lap_mask & np.isfinite(lat) & np.isfinite(lng) & np.isfinite(thr) & np.isfinite(brk)
-        if not valid.any():
-            continue
-
-        phase_arr = _classify_phases(thr[valid], brk[valid])
-
-        for ph in _PHASE_ORDER:
-            mask = phase_arr == ph
-            if not mask.any():
-                continue
-            show_leg = ph not in shown_phases
-            if show_leg:
-                shown_phases.add(ph)
-            fig.add_trace(
-                go.Scatter(
-                    x=lng[valid][mask],
-                    y=lat[valid][mask],
-                    mode="markers",
-                    marker=dict(color=MAP_PHASE_COLORS[ph], size=3, opacity=0.9),
-                    name=_PHASE_LABELS[ph],
-                    legendgroup=ph,
-                    showlegend=show_leg,
-                    hoverinfo="skip",
-                ),
-                row=1, col=col,
-            )
-
-    # Hide axes and grid for all panels
-    for i in range(1, n_panels + 1):
-        sfx = "" if i == 1 else str(i)
-        axis_style = dict(showgrid=False, zeroline=False,
-                          showticklabels=False, showline=False)
-        fig.update_layout(**{
-            f"xaxis{sfx}": axis_style,
-            f"yaxis{sfx}": axis_style,
-        })
-
-    for ann in fig.layout.annotations:
-        ann.font.color = "#EBEBEB"
-
-    return fig
 
 
 # ── Data preparation ──────────────────────────────────────────────────────────
@@ -1884,6 +1681,247 @@ def lap_consistency_stats(dfs: dict[str, pl.DataFrame]) -> pl.DataFrame:
         rows.append(row)
 
     return pl.DataFrame(rows) if rows else pl.DataFrame()
+
+
+def _run_display_name(run_name: str) -> str:
+    """File-stem style label for a run key (mirrors the dashboard display)."""
+    stem = run_name.rsplit("/", 1)[-1]
+    return stem[:-4] if stem.lower().endswith(".csv") else stem
+
+
+# A/B scorecard spec: (display, source, key, lower_is_better).
+#   source: "consistency" (lap_consistency_stats row) | "summary" (driver_summary)
+#   lower_is_better None  => descriptive style row (no winner / no colour)
+_SCORECARD_SPEC: tuple[tuple[str, str, str, bool | None], ...] = (
+    ("Best lap [s]",               "consistency", "Best [s]",                 True),
+    ("Mean lap [s]",               "consistency", "Mean [s]",                 True),
+    ("Consistency CV [%]",         "consistency", "CV [%]",                   True),
+    ("Gap to best [s]",            "consistency", "Gap to best [s]",          True),
+    ("Full throttle [%]",          "summary",     "mean_full_pct",            False),
+    ("Off throttle [%]",           "summary",     "mean_off_pct",             True),
+    ("Brake aggressiveness [%/s]", "summary",     "mean_brake_aggr",          None),
+    ("Brake release [%/s]",        "summary",     "mean_brake_release",       None),
+    ("Steering smoothness [deg]",  "summary",     "mean_steering_smoothness", None),
+)
+
+
+def _scorecard_verdict(
+    a: str, b: str, a_name: str, b_name: str, cons_by_run: dict[str, dict]
+) -> str:
+    """One-line A/B verdict from best-lap pace and consistency (CV)."""
+    def _num(run_name: str, key: str) -> float:
+        v = cons_by_run.get(run_name, {}).get(key)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return float("nan")
+
+    parts: list[str] = []
+    best_a, best_b = _num(a, "Best [s]"), _num(b, "Best [s]")
+    if np.isfinite(best_a) and np.isfinite(best_b):
+        if abs(best_a - best_b) < 1.0e-3:
+            parts.append("Matched best-lap pace")
+        else:
+            faster = a_name if best_a < best_b else b_name
+            parts.append(
+                f"**{faster}** is faster (best {min(best_a, best_b):.3f} s, "
+                f"by {abs(best_a - best_b):.3f} s)"
+            )
+    cv_a, cv_b = _num(a, "CV [%]"), _num(b, "CV [%]")
+    if np.isfinite(cv_a) and np.isfinite(cv_b):
+        if abs(cv_a - cv_b) < 1.0e-2:
+            parts.append("equal consistency")
+        else:
+            steadier = a_name if cv_a < cv_b else b_name
+            parts.append(
+                f"**{steadier}** is more consistent "
+                f"(CV {min(cv_a, cv_b):.2f}% vs {max(cv_a, cv_b):.2f}%)"
+            )
+    return ("; ".join(parts) + ".") if parts else ""
+
+
+def driver_scorecard(
+    consistency_df: pl.DataFrame,
+    summaries: dict[str, dict],
+) -> tuple[pl.DataFrame, dict[str, bool], str]:
+    """A/B driver verdict from precomputed consistency stats + driver summaries.
+
+    Reuses already-computed inputs (no recomputation): `consistency_df` is
+    `lap_consistency_stats(dfs)` and `summaries` maps run_name -> driver_summary.
+    Compares the first two runs present in both. Returns
+    (metrics_df, lower_better, verdict): `metrics_df` has a 'Metric' column plus
+    one numeric column per driver (file-stem labels); style rows are left out of
+    `lower_better` so `style_metrics_table` renders them uncoloured.
+    """
+    cons_by_run: dict[str, dict] = {}
+    if not consistency_df.is_empty() and "Run" in consistency_df.columns:
+        for row in consistency_df.iter_rows(named=True):
+            cons_by_run[str(row["Run"])] = row
+
+    runs = [
+        rn for rn in summaries
+        if summaries[rn].get("valid_laps", 0) > 0 and rn in cons_by_run
+    ][:2]
+    if len(runs) < 2:
+        return pl.DataFrame(), {}, ""
+
+    a, b = runs[0], runs[1]
+    a_name, b_name = _run_display_name(a), _run_display_name(b)
+
+    def _value(run_name: str, source: str, key: str) -> float:
+        src = cons_by_run if source == "consistency" else summaries
+        try:
+            return float(src.get(run_name, {}).get(key))
+        except (TypeError, ValueError):
+            return float("nan")
+
+    rows: list[dict] = []
+    lower_better: dict[str, bool] = {}
+    for display, source, key, lb in _SCORECARD_SPEC:
+        av, bv = _value(a, source, key), _value(b, source, key)
+        if not (np.isfinite(av) or np.isfinite(bv)):
+            continue
+        rows.append({"Metric": display, a_name: round(av, 3), b_name: round(bv, 3)})
+        if lb is not None:
+            lower_better[display] = lb
+
+    metrics_df = pl.DataFrame(rows) if rows else pl.DataFrame()
+    verdict = _scorecard_verdict(a, b, a_name, b_name, cons_by_run)
+    return metrics_df, lower_better, verdict
+
+
+_TRAIL_BRAKE_THR_PCT = 5.0
+_TRAIL_STEER_THR_DEG = 2.0
+_TRAIL_THROTTLE_THR_PCT = 5.0
+
+_COMBINED_BRAKE_THR_PCT = 5.0   # [%]   Brake/regen demand above this = braking
+_COMBINED_STEER_THR_DEG = 5.0   # [deg] |Steering| above this = steering (turning in)
+
+
+def trail_braking_kpis(
+    df: pl.DataFrame,
+    brake_thr_pct: float = _TRAIL_BRAKE_THR_PCT,
+    steer_thr_deg: float = _TRAIL_STEER_THR_DEG,
+    throttle_thr_pct: float = _TRAIL_THROTTLE_THR_PCT,
+) -> dict:
+    """Trail-braking overlap and coasting share from Brake / Steering / Throttle.
+
+      • trail_overlap_pct : % of braking samples with simultaneous steering input
+                            (brake carried into the corner = trail-braking).
+      • coasting_pct      : % of samples with neither throttle nor brake applied.
+    Valid laps only (lap 0 and the incomplete final lap excluded). `Steering` is
+    the road-wheel angle (rad) → converted to deg for the threshold.
+    """
+    needed = ["laps", "laptime", "Brake", "Steering", "Throttle"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        return {"warnings": [f"Missing columns: {missing}"]}
+    try:
+        df = ensure_complete_laps_df(df)
+    except Exception as exc:  # noqa: BLE001 - surface as a soft warning
+        return {"warnings": [str(exc)]}
+
+    col_list = list(needed)
+    if COMPLETE_LAPS_MARKER in df.columns:
+        col_list.append(COMPLETE_LAPS_MARKER)
+    try:
+        d = exclude_lap0_and_last_lap(cols_to_numpy(df, col_list))
+    except (KeyError, ValueError) as exc:
+        return {"warnings": [str(exc)]}
+
+    brake = d["Brake"]
+    steer_deg = np.rad2deg(np.abs(d["Steering"]))
+    throttle = d["Throttle"]
+    finite = np.isfinite(brake) & np.isfinite(steer_deg) & np.isfinite(throttle)
+    brake = brake[finite]
+    steer_deg = steer_deg[finite]
+    throttle = throttle[finite]
+    if brake.size < 50:
+        return {"warnings": ["Not enough samples for trail-braking."]}
+
+    braking = brake > brake_thr_pct
+    steering = steer_deg > steer_thr_deg
+    throttle_on = throttle > throttle_thr_pct
+    n_brake = int(braking.sum())
+    trail_overlap = float(np.mean(steering[braking]) * 100.0) if n_brake else float("nan")
+    coasting_pct = float(np.mean((~braking) & (~throttle_on)) * 100.0)
+
+    return {
+        "trail_overlap_pct": round(trail_overlap, 1) if np.isfinite(trail_overlap) else float("nan"),
+        "coasting_pct": round(coasting_pct, 1),
+        "braking_samples": n_brake,
+        "samples": int(brake.size),
+        "warnings": [],
+    }
+
+
+def _combined_brake_steer_per_lap(
+    df: pl.DataFrame,
+    brake_thr_pct: float = _COMBINED_BRAKE_THR_PCT,
+    steer_thr_deg: float = _COMBINED_STEER_THR_DEG,
+) -> dict[str, np.ndarray]:
+    """Per-lap share of time braking AND steering (OptimumG 'Combined Braking & Steering').
+
+    For each valid lap, the percentage of samples where Brake > `brake_thr_pct`
+    AND |Steering| (rad→deg) > `steer_thr_deg`. No hydraulics: `Brake` is the
+    regen/brake demand in %. Lap 0 and the incomplete final lap are excluded.
+    Returns aligned `lap_list`, `lt_val` (laptime per lap) and `combined_pct`.
+    """
+    d = _prep(df, extra_cols=("Steering",))
+    keys = ("laps", "laptime", "Brake", "Steering")
+    valid = np.all(np.stack([np.isfinite(d[k]) for k in keys], axis=1), axis=1)
+    d = {k: v[valid] for k, v in d.items()}
+    d = exclude_lap0_and_last_lap(d)
+
+    laps = d["laps"]
+    laptime = d["laptime"]
+    active = (d["Brake"] > brake_thr_pct) & (
+        np.rad2deg(np.abs(d["Steering"])) > steer_thr_deg
+    )
+
+    lap_list = unique_laps(laps)
+    n = len(lap_list)
+    lt_val = np.full(n, np.nan)
+    combined_pct = np.full(n, np.nan)
+    for i, lap in enumerate(lap_list):
+        lm = laps == lap
+        if not lm.any():
+            continue
+        lt_val[i] = laptime[lm].max()
+        combined_pct[i] = 100.0 * float(np.mean(active[lm]))
+    return {"lap_list": lap_list, "lt_val": lt_val, "combined_pct": combined_pct}
+
+
+def combined_brake_steer_fig(
+    dfs: dict[str, pl.DataFrame],
+    x_mode: str = "laps",
+) -> go.Figure:
+    """Combined Braking & Steering per lap — % of lap with Brake AND Steering (OptimumG)."""
+    fig = make_dark_figure(
+        title="Combined Braking & Steering — % of lap braking AND steering",
+        xlabel="Lap" if x_mode == "laps" else "Lap time [s]",
+        ylabel="Brake & steer [% of lap]",
+    )
+    all_laps: list[np.ndarray] = []
+    for i, (run_name, df) in enumerate(dfs.items()):
+        res = _combined_brake_steer_per_lap(df)
+        ok = np.isfinite(res["combined_pct"]) & np.isfinite(res["lt_val"])
+        if not ok.any():
+            continue
+        x_arr, order, _ = per_lap_axis(
+            res["lap_list"][ok], res["lt_val"][ok], x_mode,
+        )
+        y_arr = res["combined_pct"][ok][order]
+        lap_ord = res["lap_list"][ok][order]
+        color = _driver_color(run_name, i)
+        add_lap_scatter(fig, x_arr, y_arr, lap_ord, name=run_name, color=color)
+        add_trend_line(fig, x_arr, y_arr, color=color)
+        all_laps.append(res["lap_list"][ok])
+
+    if x_mode == "laps" and all_laps:
+        ticks = np.unique(np.concatenate(all_laps)).astype(int)
+        fig.update_xaxes(tickvals=ticks)
+    return fig
 
 
 def lap_time_distribution_fig(dfs: dict[str, pl.DataFrame]) -> go.Figure:
@@ -3988,8 +4026,8 @@ def corner_gg_fig(
     s_lo = phases.s_entry_m
     s_hi = phases.s_exit_m
     entries = [
-        (ref_run, ref_lap, "#56CCF2"),
-        (cmp_run, cmp_lap, "#F28C40"),
+        (ref_run, ref_lap, driver_color(ref_run)),
+        (cmp_run, cmp_lap, driver_color(cmp_run)),
     ]
     for run_name, lap_id, color in entries:
         try:
@@ -4047,8 +4085,8 @@ def lap_signal_overlay_fig(
     s_m = comp["s_m"]
     ref_label = str(comp["ref_label"])
     cmp_label = str(comp["cmp_label"])
-    ref_color = "#4DB3F2"
-    cmp_color = "#F28C40"
+    ref_color = driver_color(ref_run)
+    cmp_color = driver_color(cmp_run)
     selected_keys = [
         key for key in (signal_keys or [
             "throttle_pct", "brake_pct", "steering_deg", "vx_mps",

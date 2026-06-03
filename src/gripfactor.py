@@ -34,6 +34,7 @@ from plotly.subplots import make_subplots
 
 from utils import (
     COMPLETE_LAPS_MARKER,
+    driver_color,
     ensure_complete_laps_df,
     exclude_lap0_and_last_lap,
     make_dark_figure,
@@ -56,6 +57,11 @@ _REQUIRED_COLS: tuple[str, ...] = (
     "TimeStamp", "laps", "laptime",
     "Filtering_VN_ax", "Filtering_VN_ay",
 )
+
+# A sample counts as "at the limit" when its combined |G| reaches this fraction
+# of the run's grip envelope (P95 of combined |G|).
+LIMIT_FRAC = 0.90
+_UTIL_PHASES: tuple[str, ...] = ("Braking", "Cornering", "Traction")
 
 
 @dataclass(frozen=True)
@@ -249,6 +255,86 @@ def grip_factor_kpis(
         "table": table,
         "warnings": [],
     }
+
+
+def grip_utilization_kpis(df: pl.DataFrame) -> dict:
+    """Friction-circle utilisation: how hard the driver works the grip envelope.
+
+    ``envelope_g`` = P95 of combined |G| over valid laps (the car's grip ceiling
+    on this circuit). Returns:
+      • utilization_pct       : mean combined |G| as a % of the envelope
+      • time_at_limit_pct     : % of samples with combined |G| >= LIMIT_FRAC·env
+      • phase_time_at_limit_pct: the same, split by Braking / Cornering / Traction
+    Self-normalising (no speed channel needed). A driver that "leaves grip on the
+    table" shows lower utilisation and less time at the limit.
+    """
+    try:
+        d = _from_df(df)
+        d = exclude_lap0_and_last_lap(d)
+    except (KeyError, ValueError) as exc:
+        return {"warnings": [str(exc)]}
+
+    ax_g = d["Filtering_VN_ax"] / G
+    ay_g = d["Filtering_VN_ay"] / G
+    ok = np.isfinite(ax_g) & np.isfinite(ay_g)
+    if int(ok.sum()) < 200:
+        return {"warnings": ["Not enough samples for grip utilisation."]}
+
+    ax_g = ax_g[ok]
+    ay_g = ay_g[ok]
+    combined = np.sqrt(ax_g ** 2 + ay_g ** 2)
+    envelope = float(np.percentile(combined, 95))
+    if not np.isfinite(envelope) or envelope <= 0.0:
+        return {"warnings": ["Could not estimate grip envelope."]}
+
+    near = combined >= LIMIT_FRAC * envelope
+    t = estimate_thresholds(df)
+    masks = _phase_masks(ax_g, ay_g, t)
+    phase_tal = {
+        cat: (float(np.mean(near[masks[cat]]) * 100.0) if masks[cat].any() else float("nan"))
+        for cat in _UTIL_PHASES
+    }
+
+    return {
+        "envelope_g": round(envelope, 3),
+        "limit_frac": LIMIT_FRAC,
+        "utilization_pct": round(float(np.mean(combined) / envelope * 100.0), 1),
+        "time_at_limit_pct": round(float(np.mean(near) * 100.0), 1),
+        "phase_time_at_limit_pct": {
+            cat: (round(v, 1) if np.isfinite(v) else float("nan"))
+            for cat, v in phase_tal.items()
+        },
+        "samples": int(ok.sum()),
+        "warnings": [],
+    }
+
+
+def grip_utilization_fig(dfs: dict[str, pl.DataFrame]) -> go.Figure:
+    """Grouped bars of time-at-limit % (Overall + per phase) per driver."""
+    categories = ["Overall", *_UTIL_PHASES]
+    fig = make_dark_figure(
+        title=f"Time at the Limit  ·  combined |G| ≥ {int(LIMIT_FRAC * 100)}% of grip envelope",
+        xlabel="",
+        ylabel="Time at the limit [%]",
+    )
+    any_bar = False
+    for run_name, df in dfs.items():
+        k = grip_utilization_kpis(df)
+        if k.get("warnings"):
+            continue
+        phase = k["phase_time_at_limit_pct"]
+        ys = [k["time_at_limit_pct"], *(phase.get(cat, float("nan")) for cat in _UTIL_PHASES)]
+        fig.add_trace(go.Bar(
+            x=categories,
+            y=ys,
+            name=run_name.rsplit("/", 1)[-1].removesuffix(".csv"),
+            marker=dict(color=driver_color(run_name)),
+            hovertemplate="%{x}: %{y:.1f}%<extra></extra>",
+        ))
+        any_bar = True
+    if any_bar:
+        fig.update_layout(barmode="group")
+    return fig
 
 
 def grip_factor_evolution_fig(
@@ -490,9 +576,8 @@ def grip_factor_radar_fig(
         showlegend=True,
     )
 
-    palette = ("#4DB3F2", "#F28C40", "#73D973", "#D973D9", "#FFD700")
     theta = list(GRIP_CATEGORIES) + [GRIP_CATEGORIES[0]]
-    for i, (run_name, table) in enumerate(tables_by_run.items()):
+    for run_name, table in tables_by_run.items():
         if table.is_empty():
             continue
         means: list[float] = []
@@ -500,7 +585,7 @@ def grip_factor_radar_fig(
             col = table[f"GF {cat}"].drop_nulls()
             means.append(float(col.mean()) if len(col) > 0 else 0.0)
         r = means + [means[0]]
-        color = palette[i % len(palette)]
+        color = driver_color(run_name)
         fig.add_trace(go.Scatterpolar(
             r=r,
             theta=theta,
