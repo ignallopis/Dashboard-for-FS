@@ -115,12 +115,27 @@ METRIC_HELP: dict[str, str] = {
     "Mean understeer [deg]": "Mean steady-state understeer angle. Positive = understeer.",
     "Min [deg]": "Minimum per-lap understeer angle.",
     "Max [deg]": "Maximum per-lap understeer angle.",
+    "Entry balance": "Front−rear slip angle on turn-in [deg]. Positive = understeer (front slips more).",
+    "Steady balance": "Front−rear slip angle at the apex/steady-state [deg]. Positive = understeer.",
+    "Exit balance": "Front−rear slip angle on corner exit [deg]. Positive = understeer.",
+    "Entry→exit shift": "Exit minus entry balance [deg]: how the car's balance migrates through the corner.",
+    "Peak ay (L)": "P95 lateral g sustained in left turns (envelope max).",
+    "Peak ay (R)": "P95 lateral g sustained in right turns (envelope max).",
+    "L/R asymmetry": "Peak lateral g left minus right [g]: setup/track asymmetry.",
+    "Lat util front": "Front-axle lateral utilisation |Fy|/(mu*Fz): 1.0 = front at its lateral grip limit.",
+    "Lat util rear": "Rear-axle lateral utilisation |Fy|/(mu*Fz): 1.0 = rear at its lateral grip limit.",
+    "Limiting axle (lat)": "Axle with higher peak lateral utilisation = saturates grip first in cornering.",
     # Dynamics · braking force balance
     "Front bias [%]": "Front-axle share of braking force. ~60–67 % is the model target.",
     "Bias std [pp]": "Lap-to-lap spread of front bias [percentage points]. Lower = more repeatable.",
     "RMS to ideal [N]": "RMS distance of measured regen from the ideal load-proportional curve.",
     "Rear overbiased [%]": "Share of braking samples where the rear axle exceeds its ideal share.",
     "Peak brake [g]": "Peak longitudinal deceleration [g].",
+    "Best max braking [g]": "Most negative per-lap braking point in the selected laps. More negative = harder peak decel.",
+    "Mean max braking [g]": "Average of the per-lap Max Braking G values across the selected laps.",
+    "Raising avg end [g]": "Final cumulative mean of Max Braking G across laps. Useful to compare runs without overreacting to one lap.",
+    "Best lap": "Lap with the most negative Max Braking G in the selected laps.",
+    "Mean brake samples": "Average count of braking samples per lap behind the Max Braking G metric.",
     # Dynamics · acceleration force balance
     "Peak accel [g]": "Peak longitudinal acceleration [g].",
     # Dynamics · setup (LLTD)
@@ -318,6 +333,9 @@ def _clear_data_caches() -> None:
         _dyn_accel_envelope_fig_cached,
         _dyn_tractive_effort_fig_cached,
         _dyn_axle_traction_utilisation_fig_cached,
+        _dyn_cornering_balance_phase_fig_cached,
+        _dyn_lateral_grip_envelope_fig_cached,
+        _dyn_axle_lateral_utilisation_fig_cached,
         _driver_summary_cached,
         _driver_throttle_histogram_fig_cached,
         _driver_full_throttle_time_fig_cached,
@@ -1948,6 +1966,15 @@ def _dyn_decel_envelope_fig_cached(
 
 
 @st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _dyn_max_braking_g_per_lap_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+) -> tuple[go.Figure, dict]:
+    _ = run_tokens
+    return dyn.max_braking_g_per_lap_fig(dfs)
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
 def _skidpad_fig_cached(
     metric: str,
     dfs: dict[str, pl.DataFrame],
@@ -2032,6 +2059,33 @@ def _dyn_axle_traction_utilisation_fig_cached(
 ) -> tuple[go.Figure, dict]:
     _ = run_tokens
     return dyn.axle_traction_utilisation_fig(dfs)
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _dyn_cornering_balance_phase_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+) -> tuple[go.Figure, dict]:
+    _ = run_tokens
+    return dyn.cornering_balance_phase_fig(dfs)
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _dyn_lateral_grip_envelope_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+) -> tuple[go.Figure, dict]:
+    _ = run_tokens
+    return dyn.lateral_grip_envelope_fig(dfs)
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _dyn_axle_lateral_utilisation_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+) -> tuple[go.Figure, dict]:
+    _ = run_tokens
+    return dyn.axle_lateral_utilisation_fig(dfs)
 
 
 @st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
@@ -3570,6 +3624,67 @@ def _render_dynamics_braking(dfs: dict[str, pl.DataFrame]) -> None:
     except Exception as exc:
         st.error(f"Decel envelope unavailable: {exc}")
 
+    st.divider()
+    st.subheader("Max Braking G per Lap")
+    st.caption(
+        "Per lap, this takes the minimum filtered longitudinal acceleration "
+        "during real braking samples (`Brake > 5 %`, `ax < -1.0 m/s²`). "
+        "More negative = harder peak braking. The dashed trace is the "
+        "raising average (cumulative mean), which makes run-to-run "
+        "comparison less sensitive to one standout lap."
+    )
+    try:
+        fig, kpis = _dyn_max_braking_g_per_lap_fig_cached(dfs, _run_cache_tokens(dfs))
+        for w in kpis.get("warnings", []):
+            st.warning(w)
+        run_kpis = kpis.get("runs", {})
+        if len(run_kpis) == 1:
+            _run_name, vals = next(iter(run_kpis.items()))
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric(
+                "Best max braking [g]",
+                f"{_fmt(vals.get('best_max_braking_g', np.nan), '.3f')} g",
+                help=METRIC_HELP["Best max braking [g]"],
+            )
+            c2.metric(
+                "Mean max braking [g]",
+                f"{_fmt(vals.get('mean_max_braking_g', np.nan), '.3f')} g",
+                help=METRIC_HELP["Mean max braking [g]"],
+            )
+            c3.metric(
+                "Raising avg end [g]",
+                f"{_fmt(vals.get('raising_avg_last_g', np.nan), '.3f')} g",
+                help=METRIC_HELP["Raising avg end [g]"],
+            )
+            c4.metric(
+                "Best lap",
+                f"L{int(vals.get('best_lap', 0))}",
+                help=METRIC_HELP["Best lap"],
+            )
+            c5.metric(
+                "Mean brake samples",
+                f"{_fmt(vals.get('mean_brake_samples', np.nan), '.0f')}",
+                help=METRIC_HELP["Mean brake samples"],
+            )
+        elif len(run_kpis) > 1:
+            rows = []
+            for run_name, vals in run_kpis.items():
+                rows.append(
+                    {
+                        "Run": run_name,
+                        "Best max braking [g]": round(vals.get("best_max_braking_g", np.nan), 3),
+                        "Mean max braking [g]": round(vals.get("mean_max_braking_g", np.nan), 3),
+                        "Raising avg end [g]": round(vals.get("raising_avg_last_g", np.nan), 3),
+                        "Best lap": int(vals.get("best_lap", 0)),
+                        "Valid laps": int(vals.get("valid_laps", 0)),
+                        "Mean brake samples": round(vals.get("mean_brake_samples", np.nan), 1),
+                    }
+                )
+            _show_summary_table(rows)
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.error(f"Max Braking G per lap unavailable: {exc}")
+
 
 def _render_dynamics_acceleration(dfs: dict[str, pl.DataFrame]) -> None:
     """Vehicle traction performance: capability, limiting regime and the 4WD axle story."""
@@ -4106,7 +4221,130 @@ def _render_manual_gate_editor(
 
 
 def _render_dynamics_cornering(dfs: dict[str, pl.DataFrame]) -> None:
-    """Cornering chassis balance without driver trace/map duplication."""
+    """Cornering vehicle behavior: lateral capability, which axle limits, and
+    balance from three independent physics (slip angle, forces, steering)."""
+    single = len(dfs) == 1
+    tokens = _run_cache_tokens(dfs)
+
+    # 1 · Lateral grip envelope (capability) ---------------------------------
+    st.subheader("Lateral Grip Envelope  ·  |ay| vs Speed (L/R)")
+    st.caption(
+        "P95 lateral g by speed bin vs the aero-scaled grip-μ reference, split "
+        "left vs right turns. How much lateral grip the car sustains, where, and "
+        "whether left and right are symmetric."
+    )
+    try:
+        fig, kpis = _dyn_lateral_grip_envelope_fig_cached(dfs, tokens)
+        for w in kpis.get("warnings", []):
+            st.warning(w)
+        runs = kpis.get("runs", {})
+        if single and runs:
+            v = next(iter(runs.values()))
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Peak ay (L)", f"{_fmt(v['peak_ay_left_g'], '.2f')} g")
+            c2.metric("Peak ay (R)", f"{_fmt(v['peak_ay_right_g'], '.2f')} g")
+            c3.metric("L/R asymmetry", f"{_fmt(v['ay_asymmetry_g'], '+.2f')} g")
+            c4.metric("Samples (L/R)", f"{int(v['samples_left'])}/{int(v['samples_right'])}")
+        elif runs:
+            _show_summary_table(
+                [
+                    {
+                        "Run": r,
+                        "Peak ay L [g]": round(v["peak_ay_left_g"], 2),
+                        "Peak ay R [g]": round(v["peak_ay_right_g"], 2),
+                        "L/R asymmetry": round(v["ay_asymmetry_g"], 2),
+                        "Samples L": int(v["samples_left"]),
+                        "Samples R": int(v["samples_right"]),
+                    }
+                    for r, v in runs.items()
+                ]
+            )
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.error(f"Lateral grip envelope unavailable: {exc}")
+
+    st.divider()
+
+    # 2 · Per-axle lateral utilisation (which axle limits) -------------------
+    st.subheader("Per-axle Lateral Utilisation  ·  |Fy| / (μ·Fz)")
+    st.caption(
+        "Front vs rear lateral grip used in cornering. The axle reaching 1.0 first "
+        "is the limiting end (front first = understeer tendency). Estimated forces; "
+        "single μ per axle assumed."
+    )
+    try:
+        fig, kpis = _dyn_axle_lateral_utilisation_fig_cached(dfs, tokens)
+        for w in kpis.get("warnings", []):
+            st.warning(w)
+        runs = kpis.get("runs", {})
+        if single and runs:
+            v = next(iter(runs.values()))
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Lat util front", f"{_fmt(v['util_front_median'], '.2f')}")
+            c2.metric("Lat util rear", f"{_fmt(v['util_rear_median'], '.2f')}")
+            c3.metric("Limiting axle (lat)", str(v["limiting_axle"]).title())
+            c4.metric("Samples", f"{int(v['samples'])}")
+        elif runs:
+            _show_summary_table(
+                [
+                    {
+                        "Run": r,
+                        "Lat util front [-]": round(v["util_front_median"], 3),
+                        "Lat util rear [-]": round(v["util_rear_median"], 3),
+                        "Limiting axle (lat)": str(v["limiting_axle"]).title(),
+                        "Samples": int(v["samples"]),
+                    }
+                    for r, v in runs.items()
+                ]
+            )
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.error(f"Lateral axle utilisation unavailable: {exc}")
+
+    st.divider()
+
+    # 3 · Balance vs corner phase (slip-angle) -------------------------------
+    st.subheader("Balance vs Corner Phase  ·  Understeer / Oversteer")
+    st.caption(
+        "Front−rear slip angle (Est_SA, deg) over entry → steady → exit, using the "
+        "same turn detection as Lap Analysis. Positive = understeer, negative = "
+        "oversteer; the marker is the median across corners, the bar the P10–P90 "
+        "spread. Slip angles are controller estimates."
+    )
+    try:
+        fig, kpis = _dyn_cornering_balance_phase_fig_cached(dfs, tokens)
+        for w in kpis.get("warnings", []):
+            st.warning(w)
+        runs = kpis.get("runs", {})
+        if single and runs:
+            v = next(iter(runs.values()))
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Entry balance", f"{_fmt(v['balance_entry_deg'], '+.2f')}°")
+            c2.metric("Steady balance", f"{_fmt(v['balance_steady_deg'], '+.2f')}°")
+            c3.metric("Exit balance", f"{_fmt(v['balance_exit_deg'], '+.2f')}°")
+            c4.metric("Entry→exit shift", f"{_fmt(v['balance_shift_deg'], '+.2f')}°")
+        elif runs:
+            _show_summary_table(
+                [
+                    {
+                        "Run": r,
+                        "Entry [deg]": round(v["balance_entry_deg"], 2),
+                        "Steady [deg]": round(v["balance_steady_deg"], 2),
+                        "Exit [deg]": round(v["balance_exit_deg"], 2),
+                        "Shift [deg]": round(v["balance_shift_deg"], 2),
+                        "Corners": int(v["corners"]),
+                        "Samples": int(v["samples"]),
+                    }
+                    for r, v in runs.items()
+                ]
+            )
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.error(f"Balance vs corner phase unavailable: {exc}")
+
+    st.divider()
+
+    # 4 · Understeer Angle (per-lap, steering) -------------------------------
     st.subheader("Understeer Angle")
     st.caption(
         "Mean per-lap understeer angle using the same radius-corner definition "
@@ -4186,6 +4424,7 @@ def _render_dynamics_cornering(dfs: dict[str, pl.DataFrame]) -> None:
 
     st.divider()
 
+    # 5 · Steering vs ay · US/OS curve (steering gradient) -------------------
     st.subheader("Steering vs Lateral Acceleration  ·  US/OS Curve")
     st.caption(
         "Steady-state samples are radius-filtered corners plus low ay and steer jerk. "
@@ -4235,11 +4474,6 @@ def _render_dynamics_cornering(dfs: dict[str, pl.DataFrame]) -> None:
             )
             merged = _overlay_figures({rn: [f] for rn, (f, _k) in steer_results.items()})
             _plotly_chart(merged[0], use_container_width=True, theme=None)
-
-    # Lateral Load Transfer Distribution lives in Dynamics › Setup (it is a
-    # setup signature set by the roll-stiffness split), so it is intentionally
-    # not duplicated here. Cornering keeps the two balance reads above:
-    # Understeer Angle and Steering-vs-ay.
 
 
 def _render_dynamics_grip_factors(dfs: dict[str, pl.DataFrame]) -> None:
