@@ -84,6 +84,11 @@ T_MOTOR_MAX_NM = 27.5  # Max tractive torque per motor
 MAX_POWER_W = 80_000  # Battery power ceiling
 N_MOTORS = 4
 
+# Semantic axle identity colours (front vs rear). Not a per-run palette — these
+# label the two axles within a single run; multi-run still uses driver_color.
+_AXLE_FRONT_COLOR = "#4FC3F7"  # cyan = front axle
+_AXLE_REAR_COLOR = "#FF8A65"  # coral = rear axle
+
 # ── Brake system (Parameters.m) ──────────────────────────────────────────────
 BRAKE_PISTONS_F = 8
 BRAKE_PISTONS_R = 4
@@ -1950,6 +1955,136 @@ def tractive_effort_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     fig.update_layout(height=520, margin=dict(l=70, r=30, t=50, b=65))
     fig.update_xaxes(range=[0.0, 40.0])
     fig.update_yaxes(range=[0.0, y_max])
+    return fig, {"runs": runs, "warnings": warnings, "mu_tire": MU_TIRE}
+
+
+def axle_traction_utilisation_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Per-axle traction utilisation Fx / (mu * Fz) vs longitudinal g.
+
+    Shows which axle saturates grip first under drive — the 4WD traction-limiting
+    axle. Est_FX/Est_FZ are controller estimates and a single mu per axle is
+    assumed, so read this as a comparative grip-headroom signal, not absolute.
+    """
+    required = [
+        "Filtering_VN_ax",
+        "VN_vx",
+        "Throttle",
+        "Est_FXFL",
+        "Est_FXFR",
+        "Est_FXRL",
+        "Est_FXRR",
+        "Est_FZFL",
+        "Est_FZFR",
+        "Est_FZRL",
+        "Est_FZRR",
+    ]
+    if not dfs:
+        return _empty_xy_fig(
+            "Per-axle Traction Utilisation  ·  Fx / (mu*Fz)",
+            "ax [g]",
+            "Fx / (mu*Fz)  [-]",
+            "No runs selected",
+        ), {"runs": {}, "warnings": ["No runs selected."]}
+    multi = len(dfs) > 1
+    fig = make_dark_figure(
+        "Per-axle Traction Utilisation  ·  Fx / (mu*Fz)",
+        "ax [g]",
+        "Fx / (mu*Fz)  [-]",
+    )
+    warnings: list[str] = []
+    runs: dict[str, dict[str, float]] = {}
+    for run_name, df_in in dfs.items():
+        df = ensure_complete_laps_df(df_in)
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            warnings.append(f"{run_name}: missing axle-utilisation columns: {missing}")
+            continue
+        arr = cols_to_numpy(df, required)
+        valid = _base_validity(*(arr[c] for c in required))
+        arr = {k: v[valid] for k, v in arr.items()}
+        ax_g = arr["Filtering_VN_ax"] / G_MPS2
+        fx_front = arr["Est_FXFL"] + arr["Est_FXFR"]
+        fx_rear = arr["Est_FXRL"] + arr["Est_FXRR"]
+        fz_front = arr["Est_FZFL"] + arr["Est_FZFR"]
+        fz_rear = arr["Est_FZRL"] + arr["Est_FZRR"]
+        m = (
+            (arr["Filtering_VN_ax"] > 1.0)
+            & (arr["Throttle"] > 5.0)
+            & (fz_front > 1.0)
+            & (fz_rear > 1.0)
+        )
+        if not m.any():
+            warnings.append(f"{run_name}: no drive samples for axle utilisation.")
+            continue
+        ax_g_m = ax_g[m]
+        util_f = fx_front[m] / (MU_TIRE * fz_front[m])
+        util_r = fx_rear[m] / (MU_TIRE * fz_rear[m])
+        centers_f, med_f, _ = _binned_percentile(
+            ax_g_m, util_f, bin_width=0.1, x_min=0.0, x_max=2.0, percentile=50.0
+        )
+        centers_r, med_r, _ = _binned_percentile(
+            ax_g_m, util_r, bin_width=0.1, x_min=0.0, x_max=2.0, percentile=50.0
+        )
+        vf = np.isfinite(med_f)
+        vr = np.isfinite(med_r)
+        if multi:
+            base = driver_color(run_name)
+            fig.add_trace(
+                go.Scatter(
+                    x=centers_f[vf],
+                    y=med_f[vf],
+                    mode="lines",
+                    line=dict(color=base, width=2.2),
+                    name=f"{run_name} front",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=centers_r[vr],
+                    y=med_r[vr],
+                    mode="lines",
+                    line=dict(color=base, width=2.2, dash="dot"),
+                    name=f"{run_name} rear",
+                )
+            )
+        else:
+            fig.add_trace(
+                go.Scatter(
+                    x=centers_f[vf],
+                    y=med_f[vf],
+                    mode="lines",
+                    line=dict(color=_AXLE_FRONT_COLOR, width=2.4),
+                    name="Front axle",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=centers_r[vr],
+                    y=med_r[vr],
+                    mode="lines",
+                    line=dict(color=_AXLE_REAR_COLOR, width=2.4),
+                    name="Rear axle",
+                )
+            )
+        peak_f = float(np.nanpercentile(util_f, 95.0))
+        peak_r = float(np.nanpercentile(util_r, 95.0))
+        runs[run_name] = {
+            "util_front_median": float(np.nanmedian(util_f)),
+            "util_rear_median": float(np.nanmedian(util_r)),
+            "util_front_p95": peak_f,
+            "util_rear_p95": peak_r,
+            "limiting_axle": "front" if peak_f >= peak_r else "rear",
+            "samples": int(m.sum()),
+        }
+    fig.add_hline(
+        y=1.0,
+        line=dict(color="rgba(235,235,235,0.55)", width=1.5, dash="dot"),
+        annotation_text="axle grip limit",
+        annotation_position="top left",
+    )
+    fig.update_layout(height=520, margin=dict(l=70, r=30, t=50, b=65))
+    fig.update_xaxes(range=[0.0, 2.0])
+    fig.update_yaxes(range=[0.0, 1.3])
     return fig, {"runs": runs, "warnings": warnings, "mu_tire": MU_TIRE}
 
 
