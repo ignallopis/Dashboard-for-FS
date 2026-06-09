@@ -1679,7 +1679,7 @@ def ideal_traction_curve_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, d
             "rear_bias_mean": float(np.nanmean(rear_bias)),
             "rear_bias_ideal_mean": float(np.nanmean(ideal_rear_bias)),
             "rms_dist_to_ideal_N": float(np.sqrt(np.nanmean(dist_to_ideal_n**2))),
-            "peak_combined_accel_g": float(np.nanmax(ax_m) / G_MPS2),
+            "peak_combined_accel_g": float(np.nanpercentile(ax_m, 95.0) / G_MPS2),
             "pct_time_grip_limited": float(np.nanmean(grip_limited) * 100.0),
             "pct_time_power_limited": float(np.nanmean(~grip_limited) * 100.0),
             "samples": int(m.sum()),
