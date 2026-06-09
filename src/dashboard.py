@@ -309,6 +309,8 @@ def _clear_data_caches() -> None:
         _accel_fig_cached,
         _dyn_ideal_traction_curve_fig_cached,
         _dyn_accel_envelope_fig_cached,
+        _dyn_tractive_effort_fig_cached,
+        _dyn_axle_traction_utilisation_fig_cached,
         _driver_summary_cached,
         _driver_throttle_histogram_fig_cached,
         _driver_full_throttle_time_fig_cached,
@@ -2005,6 +2007,24 @@ def _dyn_accel_envelope_fig_cached(
 ) -> tuple[go.Figure, dict]:
     _ = run_tokens
     return dyn.accel_envelope_fig(dfs)
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _dyn_tractive_effort_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+) -> tuple[go.Figure, dict]:
+    _ = run_tokens
+    return dyn.tractive_effort_fig(dfs)
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _dyn_axle_traction_utilisation_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+) -> tuple[go.Figure, dict]:
+    _ = run_tokens
+    return dyn.axle_traction_utilisation_fig(dfs)
 
 
 @st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
