@@ -13,8 +13,25 @@ _BG   = '#141417'
 _TEXT = '#EBEBEB'
 _GRID = 'rgba(128,128,128,0.2)'
 _AXIS = '#E5E5E5'
-# Shared font family so Plotly charts match the Streamlit UI typography.
-FONT_FAMILY = '"Source Sans Pro", system-ui, -apple-system, "Segoe UI", sans-serif'
+# Semantic surface/elevation tokens: cards and hover boxes sit slightly above
+# the flat background so KPIs, tables and panels read as distinct objects.
+_SURFACE        = '#1b1f29'              # elevated card surface (cool, clearly above the app bg)
+_SURFACE_BORDER = 'rgba(255,255,255,0.10)'
+_TEXT_MUTED     = 'rgba(235,235,235,0.60)'
+_HOVER_BG       = 'rgba(28,28,32,0.96)'  # dark hover box (replaces Plotly's light default)
+
+# Brand blue as a single-hue ramp (instead of two unrelated blues): one step for
+# UI chrome, one brighter step for data lines that must pop on the dark plot bg.
+BRAND_BLUE_600  = '#003B74'   # chrome / UI accents (matches logo + .streamlit primaryColor)
+BRAND_BLUE_400  = '#4DB3F2'   # data on dark background (chart accent)
+
+# Shared font families so Plotly charts match the Streamlit UI typography.
+# Display = characterful headers; body = clean sans with real tabular numerals;
+# mono = aligned digits for KPI values and tables. Loaded via @import in the
+# dashboard header CSS (see _render_dashboard_header).
+FONT_DISPLAY = '"Archivo", system-ui, -apple-system, "Segoe UI", sans-serif'
+FONT_FAMILY  = '"IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif'
+FONT_MONO    = '"IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace'
 
 # Per-wheel colours: FL=blue, FR=orange, RL=green, RR=purple
 WHEEL_COLORS  = {'FL': '#4DB3F2', 'FR': '#F28C40', 'RL': '#73D973', 'RR': '#D973D9'}
@@ -116,23 +133,50 @@ _POT_COUNTS_OFFSET_RAD = -0.65180882
 
 # ── Figure helpers ────────────────────────────────────────────────────────────
 
-def make_dark_figure(title: str = '', xlabel: str = '', ylabel: str = '') -> go.Figure:
-    """Return a Plotly Figure with dark motorsport styling."""
-    fig = go.Figure()
+def apply_dark_layout(
+    fig: go.Figure,
+    *,
+    title: str = '',
+    xlabel: str = '',
+    ylabel: str = '',
+    single_axes: bool = True,
+) -> go.Figure:
+    """Apply shared dark motorsport styling to *fig* (single source of truth).
+
+    Sets the layout-level look every chart shares — backgrounds, typography,
+    legend, dark hover box and modebar — plus the primary x/y axes when the
+    figure is single-panel. Multi-panel helpers pass ``single_axes=False`` and
+    style their per-row axes themselves.
+    """
     fig.update_layout(
-        title=dict(text=title, font=dict(size=14, color=_TEXT, family=FONT_FAMILY)),
+        title=dict(text=title, font=dict(size=15, color=_TEXT, family=FONT_DISPLAY)),
         paper_bgcolor=_BG,
         plot_bgcolor=_BG,
         font=dict(color=_TEXT, size=11, family=FONT_FAMILY),
-        xaxis=dict(title=xlabel, color=_AXIS, gridcolor=_GRID,
-                   linecolor=_AXIS, tickcolor=_AXIS, showgrid=True),
-        yaxis=dict(title=ylabel, color=_AXIS, gridcolor=_GRID,
-                   linecolor=_AXIS, tickcolor=_AXIS, showgrid=True),
         legend=dict(bgcolor='rgba(20,20,23,0.85)',
                     bordercolor='rgba(128,128,128,0.3)',
-                    font=dict(color=_TEXT)),
+                    font=dict(color=_TEXT, family=FONT_FAMILY)),
+        hoverlabel=dict(bgcolor=_HOVER_BG, bordercolor=_SURFACE_BORDER,
+                        font=dict(color=_TEXT, family=FONT_FAMILY, size=12)),
+        modebar=dict(bgcolor='rgba(0,0,0,0)', color=_TEXT_MUTED,
+                     activecolor=BRAND_BLUE_400),
     )
+    if single_axes:
+        # Consistent base margin for single-panel charts only; multi-panel
+        # helpers keep their own spacing so subplot titles aren't clipped.
+        fig.update_layout(
+            margin=dict(l=70, r=35, t=55, b=60),
+            xaxis=dict(title=xlabel, color=_AXIS, gridcolor=_GRID,
+                       linecolor=_AXIS, tickcolor=_AXIS, showgrid=True),
+            yaxis=dict(title=ylabel, color=_AXIS, gridcolor=_GRID,
+                       linecolor=_AXIS, tickcolor=_AXIS, showgrid=True),
+        )
     return fig
+
+
+def make_dark_figure(title: str = '', xlabel: str = '', ylabel: str = '') -> go.Figure:
+    """Return a Plotly Figure with dark motorsport styling."""
+    return apply_dark_layout(go.Figure(), title=title, xlabel=xlabel, ylabel=ylabel)
 
 
 def add_lap_scatter(fig: go.Figure, x: np.ndarray, y: np.ndarray,
@@ -1106,10 +1150,13 @@ def load_data(path: str, complete_laps_only: bool = True) -> pl.DataFrame:
 
 # ── Per-lap table colour styling ──────────────────────────────────────────────
 
-_TBL_PURPLE = '#9B59B6'
-_TBL_GREEN  = '#27AE60'
-_TBL_YELLOW = '#F1C40F'
-_TBL_RED    = '#E74C3C'
+# Rank ramp: purple reserved for the single best value; the rest run on a sober,
+# colour-blind-aware teal → amber → muted-red progression (more luminance contrast
+# and hue separation than the old neon green→yellow→red).
+_TBL_PURPLE = '#8E5AA8'   # best (rank 1) — reserved
+_TBL_GREEN  = '#2A9D8F'   # 2nd best — teal-green
+_TBL_YELLOW = '#D9A441'   # middle — amber
+_TBL_RED    = '#C75D5D'   # worst — muted red
 
 _LOWER_BETTER_PATTERNS: tuple[str, ...] = (
     'LapTime', 'laptime', 'lap time', 'Lap time',

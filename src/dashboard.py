@@ -42,7 +42,14 @@ import src.track_map_component as tmc
 import src.videoanalysis as va
 
 from utils import (
+    BRAND_BLUE_600,
+    FONT_DISPLAY,
+    FONT_FAMILY,
+    FONT_MONO,
     WHEEL_COLORS,
+    _SURFACE,
+    _SURFACE_BORDER,
+    _TEXT_MUTED,
     available_laps,
     cols_to_numpy,
     driver_color,
@@ -63,10 +70,6 @@ TRACE_SYMBOLS = ("circle", "square", "diamond", "triangle-up", "x", "cross")
 POTENTIAL_LAP_RUN = "__potential_lap__"
 POTENTIAL_LAP_ID = 1
 FileSignature = tuple[int, int]
-
-# Below this front-LLTD span (percentage points) the Understeer-vs-LLTD scatter
-# is a near-vertical smear (fixed setup) and is demoted to its KPI row.
-_LLTD_INFORMATIVE_SPAN_PP = 0.5
 
 # Central tooltip text for KPI columns / cards. Keyed by the exact display
 # label so the same explanation appears wherever a metric is shown (tables and
@@ -1980,25 +1983,6 @@ def _accel_fig_cached(
 
 
 @st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
-def _dyn_braking_stability_fig_cached(
-    dfs: dict[str, pl.DataFrame],
-    run_tokens: tuple[tuple[str, FileSignature, str], ...],
-) -> tuple[go.Figure, dict]:
-    _ = run_tokens
-    return dyn.braking_stability_fig(dfs)
-
-
-@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
-def _dyn_braking_stability_per_lap_fig_cached(
-    dfs: dict[str, pl.DataFrame],
-    run_tokens: tuple[tuple[str, FileSignature, str], ...],
-    x_mode: str,
-) -> tuple[go.Figure, dict]:
-    _ = run_tokens
-    return dyn.braking_stability_per_lap_fig(dfs, x_mode=x_mode)
-
-
-@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
 def _dyn_ideal_traction_curve_fig_cached(
     dfs: dict[str, pl.DataFrame],
     run_tokens: tuple[tuple[str, FileSignature, str], ...],
@@ -2968,8 +2952,8 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
 def _tab_dynamics(dfs: dict[str, pl.DataFrame]) -> None:
     dyn_section = st.segmented_control(
         "Dynamics section",
-        options=["Braking", "Cornering", "Acceleration", "Setup", "Grip Factors"],
-        default="Braking",
+        options=["Overview", "Braking", "Cornering", "Acceleration", "Setup", "Grip Factors"],
+        default="Overview",
         required=True,
         key="dyn_subsection",
         label_visibility="collapsed",
@@ -2978,6 +2962,9 @@ def _tab_dynamics(dfs: dict[str, pl.DataFrame]) -> None:
 
     if dyn_section == "Braking":
         _render_dynamics_braking(dfs)
+        return
+    if dyn_section == "Overview":
+        _render_dynamics_overview(dfs)
         return
     if dyn_section == "Acceleration":
         _render_dynamics_acceleration(dfs)
@@ -3338,13 +3325,14 @@ def _render_skidpad_top_kpis(skidpad_dfs: dict[str, pl.DataFrame]) -> None:
 
 def _render_ideal_braking_curve(dfs: dict[str, pl.DataFrame]) -> None:
     """Render ideal front/rear brake distribution vs measured regen."""
-    st.subheader("Ideal Braking Curve  ·  Model vs Measured Regen")
+    st.subheader("Ideal Braking Curve  ·  Model vs Measured Regen (regen only)")
     st.caption(
         "Brake-force plane (front axle vs rear axle). Curves are the ideal "
         "load-proportional distribution at 0, 15 and 25 m/s; points are "
-        "measured regenerative force from motor torque. If a `BSE` trace "
-        "appears, treat it as pedal-pressure demand, not as proven hydraulic "
-        "brake torque at the disc."
+        "measured regenerative force from motor torque. **Front bias here is the "
+        "regen split, not the car's total brake balance** — the hydraulic "
+        "friction brakes are not measured. If a `BSE` trace appears, treat it as "
+        "pedal-pressure demand, not as proven hydraulic brake torque at the disc."
     )
     try:
         fig, kpis = _dyn_ideal_braking_curve_fig_cached(dfs, _run_cache_tokens(dfs))
@@ -3379,6 +3367,53 @@ def _render_ideal_braking_curve(dfs: dict[str, pl.DataFrame]) -> None:
         st.error(f"Ideal braking curve unavailable: {exc}")
 
 
+def _render_dynamics_overview(dfs: dict[str, pl.DataFrame]) -> None:
+    """g-g landing view: the car's combined-acceleration envelope at a glance."""
+    st.subheader("g-g Diagram  ·  Combined Acceleration Envelope")
+    st.caption(
+        "Every sample plotted as lateral (ay) vs longitudinal (ax) acceleration "
+        "in G. A single run is coloured by phase (braking / cornering / traction "
+        "/ straight); multiple runs by run. The dashed ring is each run's P95 "
+        "combined-|G| grip envelope; the dotted circle is the design target "
+        "μ=1.70 g. A full, square cloud out to the ring means the grip is being "
+        "used in every direction. See Grip Factors for the per-phase breakdown."
+    )
+    try:
+        fig, kpis = gf.gg_scatter_fig(dfs)
+        for w in kpis.get("warnings", []):
+            st.warning(w)
+        util_by_run = {rn: gf.grip_utilization_kpis(df) for rn, df in dfs.items()}
+        if len(dfs) == 1:
+            rn, k = next(iter(util_by_run.items()))
+            gk = kpis.get("runs", {}).get(rn, {})
+            if not k.get("warnings"):
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Grip envelope", f"{k['envelope_g']:.2f} G",
+                          help="P95 of combined |G| — the car's grip ceiling on this circuit.")
+                c2.metric("Peak combined", f"{_fmt(gk.get('peak_combined_g'), '.2f')} G",
+                          help="P99.5 of combined |G|.")
+                c3.metric("Utilisation", f"{k['utilization_pct']:.1f} %",
+                          help="Mean combined |G| as a % of the envelope.")
+                c4.metric("Time at limit", f"{k['time_at_limit_pct']:.1f} %",
+                          help=f"Share of samples ≥ {int(gf.LIMIT_FRAC * 100)}% of the envelope.")
+        else:
+            rows = [
+                {
+                    "Run": Path(rn).stem,
+                    "Envelope [G]": round(k["envelope_g"], 2),
+                    "Peak [G]": kpis.get("runs", {}).get(rn, {}).get("peak_combined_g"),
+                    "Utilisation [%]": k["utilization_pct"],
+                    "Time at limit [%]": k["time_at_limit_pct"],
+                }
+                for rn, k in util_by_run.items() if not k.get("warnings")
+            ]
+            if rows:
+                _show_summary_table(rows)
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.error(f"g-g diagram unavailable: {exc}")
+
+
 def _render_dynamics_braking(dfs: dict[str, pl.DataFrame]) -> None:
     """Longitudinal chassis response in braking."""
     _render_ideal_braking_curve(dfs)
@@ -3410,69 +3445,6 @@ def _render_dynamics_braking(dfs: dict[str, pl.DataFrame]) -> None:
         _plotly_chart(fig, use_container_width=True, theme=None)
     except Exception as exc:
         st.error(f"Decel envelope unavailable: {exc}")
-
-    st.divider()
-    st.subheader("Braking Stability  ·  Steering vs Yaw Rate Smoothness Ratio")
-    st.caption(
-        "Stability KPI (Rouelle, RCE Sept 2019): ∫steering smoothness / "
-        "∫yaw rate smoothness over each straight-line braking event "
-        "(|ay| < 0.2 g during brake phase). Higher = more stable chassis."
-    )
-    brk_x_mode = _select_per_lap_axis("dyn_brake_stability_axis", default="laps")
-    try:
-        run_tokens = _run_cache_tokens(dfs)
-        fig_evt, kpis_evt = _dyn_braking_stability_fig_cached(dfs, run_tokens)
-        for w in kpis_evt.get("warnings", []):
-            st.warning(w)
-        run_kpis = kpis_evt.get("runs", {})
-        if len(run_kpis) == 1:
-            _name, v = next(iter(run_kpis.items()))
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Events", str(int(v.get("events", 0))))
-            c2.metric("Stability KPI (median)", f"{_fmt(v.get('stability_kpi_median'), '.3f')}")
-            c3.metric("Lockup front [s]", f"{_fmt(v.get('lockup_front_total_s'), '.2f')}")
-            c4.metric("Lockup rear [s]", f"{_fmt(v.get('lockup_rear_total_s'), '.2f')}")
-            c5, c6, c7 = st.columns(3)
-            c5.metric("Stability KPI P25", f"{_fmt(v.get('stability_kpi_p25'), '.3f')}")
-            c6.metric("Stability KPI P75", f"{_fmt(v.get('stability_kpi_p75'), '.3f')}")
-            c7.metric(
-                "∫Steer / ∫Yaw (med)",
-                f"{_fmt(v.get('steering_stability_median'), '.1f')} / "
-                f"{_fmt(v.get('yaw_rate_stability_median'), '.1f')}",
-            )
-        elif len(run_kpis) > 1:
-            rows = [
-                {
-                    "Run": run_name,
-                    "Events": int(v.get("events", 0)),
-                    "Stability KPI (med)": round(v.get("stability_kpi_median", np.nan), 3),
-                    "P25": round(v.get("stability_kpi_p25", np.nan), 3),
-                    "P75": round(v.get("stability_kpi_p75", np.nan), 3),
-                    "Lockup front [s]": round(v.get("lockup_front_total_s", np.nan), 2),
-                    "Lockup rear [s]": round(v.get("lockup_rear_total_s", np.nan), 2),
-                }
-                for run_name, v in run_kpis.items()
-            ]
-            if rows:
-                _show_summary_table(rows)
-        _plotly_chart(fig_evt, use_container_width=True, theme=None)
-
-        fig_lap, kpis_lap = _dyn_braking_stability_per_lap_fig_cached(
-            dfs, run_tokens, brk_x_mode
-        )
-        for w in kpis_lap.get("warnings", []):
-            st.warning(w)
-        _plotly_chart(fig_lap, use_container_width=True, theme=None)
-
-        events_by_run = kpis_evt.get("events_by_run", {}) or {}
-        non_empty = {name: evt for name, evt in events_by_run.items() if not evt.is_empty()}
-        if non_empty:
-            with st.expander("Braking stability events (per run)"):
-                for name, evt_df in non_empty.items():
-                    st.markdown(f"**{Path(name).stem}**")
-                    st.dataframe(evt_df, use_container_width=True, hide_index=True)
-    except Exception as exc:
-        st.error(f"Braking stability unavailable: {exc}")
 
 
 def _render_dynamics_acceleration(dfs: dict[str, pl.DataFrame]) -> None:
@@ -3606,6 +3578,64 @@ def _render_dynamics_setup_signatures(dfs: dict[str, pl.DataFrame]) -> None:
 
     st.divider()
 
+    st.subheader("Lateral Load Transfer Distribution  ·  Balance vs Lateral g")
+    st.caption(
+        "The same front LLTD, but per corner sample vs the roll-stiffness target "
+        f"({dyn.KROLLF_NMRAD / (dyn.KROLLF_NMRAD + dyn.KROLLR_NMRAD) * 100.0:.1f}%). "
+        "Orange = median deviation by |ay| band; blue band = P10–P90 spread. Shows "
+        "whether the balance holds across the grip range. Built on estimated "
+        "normal loads (Est_FZ)."
+    )
+    if len(dfs) == 1:
+        _run_name, df_single = next(iter(dfs.items()))
+        try:
+            fig, kpis = dyn.lateral_load_transfer_fig(df_single)
+            for w in kpis.get("warnings", []):
+                st.warning(w)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Median front LTD", f"{_fmt(kpis.get('ltd_front_median') * 100.0, '.1f')} %")
+            c2.metric("Theoretical", f"{_fmt(kpis.get('ltd_theoretical') * 100.0, '.1f')} %")
+            c3.metric("Deviation", f"{_fmt(kpis.get('deviation_pct'), '+.1f')} %")
+            c4.metric("Samples", str(kpis.get("samples", 0)))
+            st.caption(
+                "Engineer read: use the orange line for the trend and the blue points/band for scatter. "
+                "If the orange line stays below zero, the rear axle is taking more transfer than target."
+            )
+            if np.isfinite(kpis.get("geom_ltd_front_mean", np.nan)):
+                st.caption(f"Roll-spring geometry cross-check: {_fmt(kpis.get('geom_ltd_front_mean') * 100.0, '.1f')}% front LTD.")
+            _plotly_chart(fig, use_container_width=True, theme=None)
+        except Exception as exc:
+            st.warning(f"LTD unavailable: {exc}")
+    else:
+        ltd_results: dict[str, tuple[go.Figure, dict]] = {}
+        for run_name, df_single in dfs.items():
+            try:
+                fig, kpis = dyn.lateral_load_transfer_fig(df_single)
+                ltd_results[run_name] = (fig, kpis)
+            except Exception as exc:
+                st.warning(f"LTD unavailable ({Path(run_name).stem}): {exc}")
+        if ltd_results:
+            for rn, (_f, kpis) in ltd_results.items():
+                for w in kpis.get("warnings", []):
+                    st.warning(f"{Path(rn).stem}: {w}")
+            _show_summary_table([
+                {
+                    "Run": Path(rn).stem,
+                    "Median front LTD [%]": _fmt(kpis.get("ltd_front_median", float("nan")) * 100.0, ".1f"),
+                    "Theoretical [%]": _fmt(kpis.get("ltd_theoretical", float("nan")) * 100.0, ".1f"),
+                    "Deviation [%]": _fmt(kpis.get("deviation_pct"), "+.1f"),
+                    "Samples": kpis.get("samples", 0),
+                }
+                for rn, (_f, kpis) in ltd_results.items()
+            ])
+            merged = _overlay_figures({rn: [f] for rn, (f, _k) in ltd_results.items()})
+            fig_ltd = merged[0]
+            fig_ltd.update_xaxes(autorange=True)
+            fig_ltd.update_yaxes(autorange=True)
+            _plotly_chart(fig_ltd, use_container_width=True, theme=None)
+
+    st.divider()
+
     for run_name, df in dfs.items():
         if len(dfs) > 1:
             st.markdown(f"### {Path(run_name).stem}")
@@ -3620,12 +3650,27 @@ def _render_dynamics_setup_signatures(dfs: dict[str, pl.DataFrame]) -> None:
             fig, kpis = dyn.roll_gradient_fig(df)
             for w in kpis.get("warnings", []):
                 st.warning(w)
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Theory", f"{_fmt(kpis.get('theoretical_deg_per_g'), '.2f')} deg/g")
-            c2.metric("Front grad", f"{_fmt(kpis.get('front_gradient_deg_per_g'), '+.2f')} deg/g")
-            c3.metric("Front dev", f"{_fmt(kpis.get('front_deviation_pct'), '+.1f')} %")
-            c4.metric("Rear grad", f"{_fmt(kpis.get('rear_gradient_deg_per_g'), '+.2f')} deg/g")
-            c5.metric("Rear dev", f"{_fmt(kpis.get('rear_deviation_pct'), '+.1f')} %")
+            if kpis.get("calibrated"):
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Theory", f"{_fmt(kpis.get('theoretical_deg_per_g'), '.2f')} deg/g")
+                c2.metric("Front grad", f"{_fmt(kpis.get('front_gradient_deg_per_g'), '+.2f')} deg/g")
+                c3.metric("Front dev", f"{_fmt(kpis.get('front_deviation_pct'), '+.1f')} %")
+                c4.metric("Rear grad", f"{_fmt(kpis.get('rear_gradient_deg_per_g'), '+.2f')} deg/g")
+                c5.metric("Rear dev", f"{_fmt(kpis.get('rear_deviation_pct'), '+.1f')} %")
+            else:
+                # Uncalibrated: roll comes from raw damper counts, so the absolute
+                # gradient and its deviation-vs-theory are not trustworthy (the
+                # rear especially collapses). Show theory + shape only.
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Theory", f"{_fmt(kpis.get('theoretical_deg_per_g'), '.2f')} deg/g")
+                c2.metric("Front grad", f"{_fmt(kpis.get('front_gradient_deg_per_g'), '+.2f')} deg/g")
+                c3.metric("Rear grad", f"{_fmt(kpis.get('rear_gradient_deg_per_g'), '+.2f')} deg/g")
+                st.caption(
+                    "Uncalibrated — roll is derived from raw damper counts, so only "
+                    "the shape is meaningful; deviation-vs-theory is hidden. Set "
+                    "DAMPER_COUNTS_PER_MM/MOTION_RATIO in src/dynamics.py or log T1 "
+                    "calibration to enable it."
+                )
             _plotly_chart(fig, use_container_width=True, theme=None)
         except Exception as exc:
             st.error(f"Roll gradient unavailable: {exc}")
@@ -3678,7 +3723,11 @@ def _render_dynamics_setup_signatures(dfs: dict[str, pl.DataFrame]) -> None:
         st.divider()
 
         st.subheader("Static Fz Reference")
-        st.caption("Per-corner weight from straight low-input samples vs CAT17x design (706 N/corner). Color: green ≤±5%, yellow ≤±10%, red >±10%.")
+        st.caption(
+            "Per-corner **estimated** load (Est_FZ) from straight low-input samples "
+            "vs CAT17x design (706 N/corner). Color: green ≤±5%, yellow ≤±10%, "
+            "red >±10%."
+        )
         try:
             fig, kpis = dyn.static_fz_reference_fig(df)
             for w in kpis.get("warnings", []):
@@ -3692,14 +3741,16 @@ def _render_dynamics_setup_signatures(dfs: dict[str, pl.DataFrame]) -> None:
                     f"{_fmt(cd.get('measured_n', float('nan')), '.0f')} N",
                     f"{_fmt(cd.get('deviation_pct', float('nan')), '+.1f')} % vs design",
                 )
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2 = st.columns(2)
             fs = kpis.get('front_share_pct', float('nan'))
-            ls = kpis.get('left_share_pct', float('nan'))
-            cw = kpis.get('cross_weight_pct', float('nan'))
             c1.metric("Front share", f"{_fmt(fs, '.1f')} %", f"{_fmt(fs - 50.0, '+.1f')} % vs 50%")
-            c2.metric("Left share", f"{_fmt(ls, '.1f')} %", f"{_fmt(ls - 50.0, '+.1f')} % vs 50%")
-            c3.metric("Cross weight (FL+RR)", f"{_fmt(cw, '.1f')} %", f"{_fmt(cw - 50.0, '+.1f')} % vs 50%")
-            c4.metric("Samples", str(kpis.get("samples", 0)))
+            c2.metric("Samples", str(kpis.get("samples", 0)))
+            st.caption(
+                "Loads are the controller's **estimated** Fz, not measured corner "
+                "weights, so left/right and cross-weight read ~50% by construction "
+                "and are not shown — real corner-weighting needs scales. The "
+                "per-corner deviation above is a sanity check on the estimator/mass."
+            )
             _plotly_chart(fig, use_container_width=True, theme=None)
         except Exception as exc:
             st.error(f"Static Fz reference unavailable: {exc}")
@@ -3897,215 +3948,10 @@ def _render_dynamics_cornering(dfs: dict[str, pl.DataFrame]) -> None:
             merged = _overlay_figures({rn: [f] for rn, (f, _k) in steer_results.items()})
             _plotly_chart(merged[0], use_container_width=True, theme=None)
 
-    st.divider()
-
-    st.subheader("Lateral Load Transfer Distribution  ·  Front Share")
-    st.caption(
-        "Front LTD per corner sample vs. the roll-stiffness target "
-        f"({dyn.KROLLF_NMRAD / (dyn.KROLLF_NMRAD + dyn.KROLLR_NMRAD) * 100.0:.1f}%). "
-        "Orange = median by |ay| band; blue band = P10–P90 spread."
-    )
-    if len(dfs) == 1:
-        _run_name, df_single = next(iter(dfs.items()))
-        try:
-            fig, kpis = dyn.lateral_load_transfer_fig(df_single)
-            for w in kpis.get("warnings", []):
-                st.warning(w)
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Median front LTD", f"{_fmt(kpis.get('ltd_front_mean') * 100.0, '.1f')} %")
-            c2.metric("Theoretical", f"{_fmt(kpis.get('ltd_theoretical') * 100.0, '.1f')} %")
-            c3.metric("Deviation", f"{_fmt(kpis.get('deviation_pct'), '+.1f')} %")
-            c4.metric("Samples", str(kpis.get("samples", 0)))
-            st.caption(
-                "Engineer read: use the orange line for the trend and the blue points/band for scatter. "
-                "If the orange line stays below zero, the rear axle is taking more transfer than target."
-            )
-            if np.isfinite(kpis.get("geom_ltd_front_mean", np.nan)):
-                st.caption(f"Roll-spring geometry cross-check: {_fmt(kpis.get('geom_ltd_front_mean') * 100.0, '.1f')}% front LTD.")
-            _plotly_chart(fig, use_container_width=True, theme=None)
-        except Exception as exc:
-            st.warning(f"LTD unavailable: {exc}")
-    else:
-        ltd_results: dict[str, tuple[go.Figure, dict]] = {}
-        for run_name, df_single in dfs.items():
-            try:
-                fig, kpis = dyn.lateral_load_transfer_fig(df_single)
-                ltd_results[run_name] = (fig, kpis)
-            except Exception as exc:
-                st.warning(f"LTD unavailable ({Path(run_name).stem}): {exc}")
-        if ltd_results:
-            for rn, (_f, kpis) in ltd_results.items():
-                for w in kpis.get("warnings", []):
-                    st.warning(f"{Path(rn).stem}: {w}")
-            _show_summary_table([
-                {
-                    "Run": Path(rn).stem,
-                    "Median front LTD [%]": _fmt(kpis.get("ltd_front_mean", float("nan")) * 100.0, ".1f"),
-                    "Theoretical [%]": _fmt(kpis.get("ltd_theoretical", float("nan")) * 100.0, ".1f"),
-                    "Deviation [%]": _fmt(kpis.get("deviation_pct"), "+.1f"),
-                    "Samples": kpis.get("samples", 0),
-                }
-                for rn, (_f, kpis) in ltd_results.items()
-            ])
-            st.caption(
-                "Engineer read: trend lines show the median deviation per run; "
-                "if trend stays below zero, the rear axle is taking more transfer than target."
-            )
-            merged = _overlay_figures({rn: [f] for rn, (f, _k) in ltd_results.items()})
-            fig_ltd = merged[0]
-            fig_ltd.update_xaxes(autorange=True)
-            fig_ltd.update_yaxes(autorange=True)
-            _plotly_chart(fig_ltd, use_container_width=True, theme=None)
-
-    st.divider()
-
-    st.subheader("Understeer Angle vs LLTD")
-    st.caption(
-        "Equivalent to the Vehicle Balance vs LLTD slide, but keeping the existing "
-        "Understeer Angle name because Vehicle Balance was the same KPI. "
-        "Each point is one valid lap. X is median front LLTD in radius-filtered corners: "
-        "LLTD_front = |Fz_FR - Fz_FL| / (|Fz_FR - Fz_FL| + |Fz_RR - Fz_RL|). "
-        "Y is the mean understeer angle from the same corner samples. With one fixed "
-        "setup, LLTD can be almost constant; the scatter becomes useful when comparing "
-        "setups or runs whose load-transfer distribution actually changes."
-    )
-    try:
-        fig, kpis = dyn.understeer_vs_lltd_fig(dfs)
-        for w in kpis.get("warnings", []):
-            st.warning(w)
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Valid points", str(kpis.get("points", 0)))
-        c2.metric("Mean LLTD", f"{_fmt(kpis.get('lltd_mean_pct'), '.3f')} %")
-        c3.metric("LLTD span", f"{_fmt(kpis.get('lltd_span_pct'), '.3f')} pp")
-        c4.metric("Slope", f"{_fmt(kpis.get('slope_deg_per_lltd_pct'), '+.2f')} deg/%")
-        c5.metric("R²", _fmt(kpis.get("r2"), ".2f"))
-        # The scatter only carries information when LLTD actually varies across
-        # laps. With one fixed setup it collapses to a near-vertical smear
-        # (span ~0.01 pp), so demote it to the KPI row above and skip the plot.
-        lltd_span_pp = kpis.get("lltd_span_pct")
-        lltd_span_is_flat = (
-            lltd_span_pp is not None
-            and np.isfinite(lltd_span_pp)
-            and abs(float(lltd_span_pp)) < _LLTD_INFORMATIVE_SPAN_PP
-        )
-        if lltd_span_is_flat:
-            st.info(
-                f"Front LLTD is essentially constant across laps "
-                f"(span {float(lltd_span_pp):.3f} pp) — the load-transfer "
-                "distribution is fixed by this static setup, so the scatter "
-                "carries no trend. The KPIs above summarise it; the plot becomes "
-                "useful when comparing runs/setups whose LLTD actually changes."
-            )
-        else:
-            _plotly_chart(fig, use_container_width=True, theme=None)
-        table = kpis.get("table")
-        if table is not None and not table.is_empty():
-            with st.expander("Per-lap data"):
-                st.dataframe(
-                    table.with_columns([
-                        pl.col("LapTime [s]").round(3),
-                        pl.col("Mean understeer [deg]").round(3),
-                        pl.col("Front LLTD [%]").round(2),
-                    ]),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-    except Exception as exc:
-        st.warning(f"Understeer vs LLTD unavailable: {exc}")
-
-    st.divider()
-
-    with st.expander("Legacy · Tire Workload · Friction Circle", expanded=False):
-        st.caption(
-            "Radius-filtered corners using the Driver/Lap Analysis logic "
-            "(R = V²/|ay| < 60 m). Utilization uses Est_FX/FY/FZ and μ tire."
-        )
-        for run_name, df_single in dfs.items():
-            if len(dfs) > 1:
-                st.markdown(f"**{Path(run_name).stem}**")
-            try:
-                figs, kpis = dyn.friction_circle_figs(df_single)
-                for w in kpis.get("warnings", []):
-                    st.warning(w)
-                wheel_kpis = kpis.get("wheels", {})
-                cols = st.columns(4)
-                for col, wheel in zip(cols, ("FL", "FR", "RL", "RR")):
-                    wk = wheel_kpis.get(wheel, {})
-                    col.metric(f"{wheel} peak util", _fmt(wk.get("peak_util", float("nan")), ".2f"))
-                cols = st.columns(4)
-                for col, wheel in zip(cols, ("FL", "FR", "RL", "RR")):
-                    wk = wheel_kpis.get(wheel, {})
-                    col.metric(f"{wheel} >0.95", f"{_fmt(wk.get('sat_time_pct', float('nan')), '.1f')} %")
-                for fig in [
-                    fig for fig in figs
-                    if "Tire utilization vs distance" not in (fig.layout.title.text or "")
-                ]:
-                    _plotly_chart(fig, use_container_width=True, theme=None)
-            except Exception as exc:
-                st.warning(f"Friction circle unavailable: {exc}")
-
-    with st.expander("Legacy · Body Slip Angle beta", expanded=False):
-        st.caption("beta = atan2(Est_vyCOG, Est_vxCOG). Apex samples use radius-curvature corners.")
-        for run_name, df_single in dfs.items():
-            if len(dfs) > 1:
-                st.markdown(f"**{Path(run_name).stem}**")
-            try:
-                figs, kpis = dyn.body_slip_angle_fig(df_single)
-                for w in kpis.get("warnings", []):
-                    st.warning(w)
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("|beta| peak", f"{_fmt(kpis.get('peak_abs_beta_deg'), '.2f')} deg")
-                c2.metric("|beta| at apex", f"{_fmt(kpis.get('apex_abs_beta_deg'), '.2f')} deg")
-                c3.metric("max |dbeta/dt|", f"{_fmt(kpis.get('max_beta_rate_degps'), '.1f')} deg/s")
-                c4.metric("Corner samples", str(kpis.get("corner_samples", 0)))
-                for fig in [
-                    fig for fig in figs
-                    if "Body slip angle β vs distance" not in (fig.layout.title.text or "")
-                ]:
-                    _plotly_chart(fig, use_container_width=True, theme=None)
-            except Exception as exc:
-                st.warning(f"Body slip angle unavailable: {exc}")
-
-    with st.expander("Legacy · Tyre Balance · SA Front vs Rear", expanded=False):
-        st.caption(
-            "Balance index = (SA_rear - SA_front)/(SA_rear + SA_front). "
-            "Positive = rear tyres use more slip angle; negative = front tyres use more."
-        )
-        try:
-            balance_kpis = dyn.sa_balance_kpis(dfs)
-            valid_kpis = {
-                run_name: vals
-                for run_name, vals in balance_kpis.items()
-                if not vals.get("warnings")
-            }
-            for run_name, vals in balance_kpis.items():
-                for w in vals.get("warnings", []):
-                    st.warning(f"{run_name}: {w}")
-            if len(valid_kpis) == 1:
-                _run_name, vals = next(iter(valid_kpis.items()))
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Mean balance", _fmt(vals.get("balance_index_mean"), "+.3f"))
-                c2.metric("Peak-|ay| balance", _fmt(vals.get("balance_index_at_peak"), "+.3f"))
-                c3.metric("OS fraction", f"{_fmt(vals.get('os_fraction', np.nan) * 100.0, '.1f')} %")
-                c4.metric("P95 SA front", f"{_fmt(vals.get('peak_sa_front_deg'), '.2f')} deg")
-                c5.metric("P95 SA rear", f"{_fmt(vals.get('peak_sa_rear_deg'), '.2f')} deg")
-            elif len(valid_kpis) > 1:
-                _show_summary_table([
-                    {
-                        "Run": run_name,
-                        "Mean balance": round(vals.get("balance_index_mean", np.nan), 4),
-                        "Peak-|ay| balance": round(vals.get("balance_index_at_peak", np.nan), 4),
-                        "OS fraction [%]": round(vals.get("os_fraction", np.nan) * 100.0, 2),
-                        "P95 SA front [deg]": round(vals.get("peak_sa_front_deg", np.nan), 2),
-                        "P95 SA rear [deg]": round(vals.get("peak_sa_rear_deg", np.nan), 2),
-                        "Corner samples": int(vals.get("n_corner_samples", 0)),
-                    }
-                    for run_name, vals in valid_kpis.items()
-                ])
-            for fig in dyn.sa_balance_figs(dfs):
-                _plotly_chart(fig, use_container_width=True, theme=None)
-        except Exception as exc:
-            st.warning(f"SA balance unavailable: {exc}")
+    # Lateral Load Transfer Distribution lives in Dynamics › Setup (it is a
+    # setup signature set by the roll-stiffness split), so it is intentionally
+    # not duplicated here. Cornering keeps the two balance reads above:
+    # Understeer Angle and Steering-vs-ay.
 
 
 def _render_dynamics_grip_factors(dfs: dict[str, pl.DataFrame]) -> None:
@@ -6004,6 +5850,28 @@ def _tab_rb(dfs: dict[str, pl.DataFrame]) -> None:
     _render_rb_function_check(dfs)
 
 
+def _tab_controls(dfs: dict[str, pl.DataFrame]) -> None:
+    if st.session_state.get("controls_subsection") not in {"TC", "TV", "RB"}:
+        st.session_state["controls_subsection"] = "TC"
+
+    controls_section = st.segmented_control(
+        "Controls section",
+        options=["TC", "TV", "RB"],
+        default="TC",
+        required=True,
+        key="controls_subsection",
+        label_visibility="collapsed",
+        width="stretch",
+    )
+
+    if controls_section == "TC":
+        _tab_tc(dfs)
+    elif controls_section == "TV":
+        _tab_tv(dfs)
+    elif controls_section == "RB":
+        _tab_rb(dfs)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
@@ -6017,8 +5885,83 @@ def _logo_data_uri(path: str, file_signature: FileSignature) -> str | None:
     return f"data:image/png;base64,{encoded}"
 
 
+_GLOBAL_STYLE_CSS = """
+<style>
+  /* Fonts (Archivo / IBM Plex Sans / IBM Plex Mono) are loaded AND applied via
+     the native theme config in .streamlit/config.toml — injected font-family
+     rules lose specificity to Streamlit's own heading/body styles. Only the
+     data-testid rules below (which DO win) live here. */
+  [data-testid="stCaptionContainer"], .stCaption {
+    color: __MUTED__;
+  }
+
+  /* KPI metrics → elevated surface cards with depth (upgrades every st.metric). */
+  [data-testid="stMetric"] {
+    background: __SURFACE__;
+    border: 1px solid __SURFACE_BORDER__;
+    border-left: 3px solid __ACCENT__;
+    border-radius: 10px;
+    padding: 0.7rem 1rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.35);
+  }
+  [data-testid="stMetricLabel"] {
+    font-family: __DISPLAY__;
+    color: __MUTED__;
+    letter-spacing: 0.2px;
+  }
+  /* Big numbers: mono + tabular figures so digits align in a column. */
+  [data-testid="stMetricValue"] {
+    font-family: __MONO__;
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+  /* Best-effort tabular figures for data tables (DOM-rendered cells). */
+  [data-testid="stDataFrame"], [data-testid="stTable"] {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+  [data-testid="stButtonGroup"] [data-baseweb="button-group"] button[data-testid="stBaseButton-segmented_controlActive"],
+  [data-testid="stButtonGroup"] [data-baseweb="button-group"] button[kind="segmented_controlActive"] {
+    color: __ACCENT__ !important;
+    border-color: __ACCENT__ !important;
+    background-color: rgba(0, 59, 116, 0.10) !important;
+    box-shadow: inset 0 0 0 1px __ACCENT__ !important;
+  }
+  [data-testid="stButtonGroup"] [data-baseweb="button-group"] button[data-testid="stBaseButton-segmented_controlActive"] *,
+  [data-testid="stButtonGroup"] [data-baseweb="button-group"] button[kind="segmented_controlActive"] *,
+  [data-testid="stButtonGroup"] [data-baseweb="button-group"] button[data-testid="stBaseButton-segmented_controlActive"] svg,
+  [data-testid="stButtonGroup"] [data-baseweb="button-group"] button[kind="segmented_controlActive"] svg {
+    color: __ACCENT__ !important;
+    fill: __ACCENT__ !important;
+    stroke: __ACCENT__ !important;
+  }
+  [data-testid="stButtonGroup"] [data-baseweb="button-group"] button[data-testid="stBaseButton-segmented_controlActive"]:hover,
+  [data-testid="stButtonGroup"] [data-baseweb="button-group"] button[kind="segmented_controlActive"]:hover,
+  [data-testid="stButtonGroup"] [data-baseweb="button-group"] button[data-testid="stBaseButton-segmented_controlActive"]:focus,
+  [data-testid="stButtonGroup"] [data-baseweb="button-group"] button[kind="segmented_controlActive"]:focus,
+  [data-testid="stButtonGroup"] [data-baseweb="button-group"] button[data-testid="stBaseButton-segmented_controlActive"]:active,
+  [data-testid="stButtonGroup"] [data-baseweb="button-group"] button[kind="segmented_controlActive"]:active {
+    color: __ACCENT__ !important;
+    border-color: __ACCENT__ !important;
+    background-color: rgba(0, 59, 116, 0.16) !important;
+  }
+</style>
+"""
+
+
 def _render_dashboard_header() -> None:
     """Render the dashboard brand and author credit."""
+    st.markdown(
+        _GLOBAL_STYLE_CSS
+        .replace("__BODY__", FONT_FAMILY)
+        .replace("__DISPLAY__", FONT_DISPLAY)
+        .replace("__MONO__", FONT_MONO)
+        .replace("__SURFACE__", _SURFACE)
+        .replace("__SURFACE_BORDER__", _SURFACE_BORDER)
+        .replace("__ACCENT__", BRAND_BLUE_600)
+        .replace("__MUTED__", _TEXT_MUTED),
+        unsafe_allow_html=True,
+    )
     st.markdown(
         """
         <style>
@@ -6212,13 +6155,16 @@ def main() -> None:
         "Driver": _tab_driver,
         "Dynamics": _tab_dynamics,
         "Powertrain": _tab_powertrain,
-        "TC": _tab_tc,
-        "TV": _tab_tv,
-        "RB": _tab_rb,
+        "Controls": _tab_controls,
         "Events": _tab_events,
     }
 
     if "dashboard_section" not in st.session_state:
+        st.session_state["dashboard_section"] = "Driver"
+    elif st.session_state["dashboard_section"] in {"TC", "TV", "RB"}:
+        st.session_state["controls_subsection"] = st.session_state["dashboard_section"]
+        st.session_state["dashboard_section"] = "Controls"
+    elif st.session_state["dashboard_section"] not in section_renderers:
         st.session_state["dashboard_section"] = "Driver"
 
     # `st.tabs` renders every tab on each rerun, which hurts multi-run loading.

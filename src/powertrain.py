@@ -38,6 +38,7 @@ from plotly.subplots import make_subplots
 from scipy.integrate import cumulative_trapezoid
 
 from utils import (
+    apply_dark_layout,
     make_dark_figure,
     add_lap_scatter,
     add_trend_line,
@@ -102,16 +103,9 @@ def _dark_subplots(
         vertical_spacing=0.08,
         subplot_titles=titles,
     )
-    fig.update_layout(
-        paper_bgcolor=_BG,
-        plot_bgcolor=_BG,
-        font=dict(color=_TEXT, size=11),
-        legend=dict(
-            bgcolor="rgba(20,20,23,0.85)",
-            bordercolor="rgba(128,128,128,0.3)",
-            font=dict(color=_TEXT),
-        ),
-    )
+    # Shared dark styling (bg, font family, legend, dark hover box, modebar);
+    # per-row axes are styled below.
+    apply_dark_layout(fig, single_axes=False)
     for i in range(1, rows + 1):
         fig.update_xaxes(
             color=_AXIS,

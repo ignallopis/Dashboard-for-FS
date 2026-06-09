@@ -337,6 +337,135 @@ def grip_utilization_fig(dfs: dict[str, pl.DataFrame]) -> go.Figure:
     return fig
 
 
+# Design-target tyre friction, used only to draw a reference circle on the g-g
+# overview. Mirrors dynamics.MU_TIRE; kept local to avoid a cross-module import.
+_DESIGN_MU_CIRCLE = 1.70
+
+
+def _phase_for_scatter(
+    ax_g: np.ndarray, ay_g: np.ndarray, t: GripThresholds,
+) -> dict[str, np.ndarray]:
+    """Assign each sample ONE colour group for the g-g cloud.
+
+    Phase masks overlap (trail-braking is both braking and cornering), so the
+    scatter needs a single label per point. Priority longitudinal-first reads the
+    cloud as: lower half braking, upper-with-lateral traction, pure lateral
+    cornering, the rest straight-line.
+    """
+    masks = _phase_masks(ax_g, ay_g, t)
+    braking = masks["Braking"]
+    traction = masks["Traction"] & ~braking
+    cornering = masks["Cornering"] & ~braking & ~traction
+    finite = np.isfinite(ax_g) & np.isfinite(ay_g)
+    straight = finite & ~(braking | traction | cornering)
+    return {"Braking": braking, "Traction": traction, "Cornering": cornering, "Straight": straight}
+
+
+def _envelope_circle(radius: float, n: int = 181) -> tuple[np.ndarray, np.ndarray]:
+    """(x, y) of a circle of the given radius, centred at the origin."""
+    theta = np.linspace(0.0, 2.0 * np.pi, n)
+    return radius * np.cos(theta), radius * np.sin(theta)
+
+
+def gg_scatter_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """g-g overview: lateral vs longitudinal acceleration cloud.
+
+    X = ay [g] (signed), Y = ax [g] (signed: +accel / −braking). A single run is
+    coloured by phase (braking / cornering / traction / straight); multiple runs
+    are coloured by run identity. A dashed ring marks each run's P95 combined-|G|
+    grip envelope; the dotted circle is the design-μ reference. Equal-scaled axes
+    so the friction circle reads true.
+    """
+    fig = make_dark_figure(
+        title="g-g Diagram  ·  Lateral vs Longitudinal Acceleration",
+        xlabel="Lateral acceleration ay [g]",
+        ylabel="Longitudinal acceleration ax [g]  (+accel / −braking)",
+    )
+    warnings: list[str] = []
+    runs: dict[str, dict] = {}
+    max_r = _DESIGN_MU_CIRCLE
+    single = len(dfs) == 1
+    phase_colors = {
+        "Braking":   GRIP_COLORS["Braking"],
+        "Cornering": GRIP_COLORS["Cornering"],
+        "Traction":  GRIP_COLORS["Traction"],
+        "Straight":  "#7A7A7A",
+    }
+
+    for run_name, df in dfs.items():
+        try:
+            d = exclude_lap0_and_last_lap(_from_df(df))
+        except (KeyError, ValueError) as exc:
+            warnings.append(f"{run_name}: {exc}")
+            continue
+        ax_g = d["Filtering_VN_ax"] / G
+        ay_g = d["Filtering_VN_ay"] / G
+        ok = np.isfinite(ax_g) & np.isfinite(ay_g)
+        if int(ok.sum()) < 100:
+            warnings.append(f"{run_name}: not enough samples for g-g.")
+            continue
+        ax_g = ax_g[ok]
+        ay_g = ay_g[ok]
+        combined = np.sqrt(ax_g ** 2 + ay_g ** 2)
+        envelope = float(np.percentile(combined, 95))
+        peak = float(np.percentile(combined, 99.5))
+        max_r = max(max_r, peak)
+        stride = max(1, int(np.ceil(ax_g.size / 9000)))
+
+        if single:
+            groups = _phase_for_scatter(ax_g, ay_g, estimate_thresholds(df))
+            for label, mask in groups.items():
+                if not mask.any():
+                    continue
+                fig.add_trace(go.Scattergl(
+                    x=ay_g[mask][::stride], y=ax_g[mask][::stride],
+                    mode="markers",
+                    marker=dict(color=phase_colors[label], size=3, opacity=0.45),
+                    name=label,
+                    hovertemplate="ay=%{x:.2f} g<br>ax=%{y:.2f} g<extra>" + label + "</extra>",
+                ))
+            ring_color = "#EBEBEB"
+        else:
+            color = driver_color(run_name)
+            fig.add_trace(go.Scattergl(
+                x=ay_g[::stride], y=ax_g[::stride],
+                mode="markers",
+                marker=dict(color=color, size=3, opacity=0.40),
+                name=run_name.rsplit("/", 1)[-1].removesuffix(".csv"),
+                hovertemplate="ay=%{x:.2f} g<br>ax=%{y:.2f} g<extra></extra>",
+            ))
+            ring_color = color
+
+        cx, cy = _envelope_circle(envelope)
+        fig.add_trace(go.Scatter(
+            x=cx, y=cy, mode="lines",
+            line=dict(color=ring_color, width=2.0, dash="dash"),
+            name=f"P95 envelope {envelope:.2f} g",
+            showlegend=single,
+            hoverinfo="skip",
+        ))
+        runs[run_name] = {
+            "envelope_g": round(envelope, 3),
+            "peak_combined_g": round(peak, 3),
+            "samples": int(ok.sum()),
+        }
+
+    mx, my = _envelope_circle(_DESIGN_MU_CIRCLE)
+    fig.add_trace(go.Scatter(
+        x=mx, y=my, mode="lines",
+        line=dict(color="rgba(235,235,235,0.45)", width=1.4, dash="dot"),
+        name=f"Design μ={_DESIGN_MU_CIRCLE:.2f} g",
+        hoverinfo="skip",
+    ))
+    lim = max_r * 1.08
+    fig.add_hline(y=0.0, line=dict(color="rgba(200,200,200,0.35)", dash="dot", width=1))
+    fig.add_vline(x=0.0, line=dict(color="rgba(200,200,200,0.35)", dash="dot", width=1))
+    fig.update_layout(height=640, margin=dict(l=70, r=40, t=55, b=65), hovermode="closest")
+    fig.update_xaxes(range=[-lim, lim])
+    fig.update_yaxes(range=[-lim, lim], scaleanchor="x", scaleratio=1)
+    return fig, {"runs": runs, "warnings": warnings}
+
+
 def grip_factor_evolution_fig(
     table: pl.DataFrame,
     x_mode: str = "laps",

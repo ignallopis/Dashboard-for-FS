@@ -633,6 +633,8 @@ def _dark_subplot_layout(fig: go.Figure, title: str) -> go.Figure:
         plot_bgcolor=base.layout.plot_bgcolor,
         font=base.layout.font,
         legend=base.layout.legend,
+        hoverlabel=base.layout.hoverlabel,
+        modebar=base.layout.modebar,
     )
     fig.update_xaxes(
         color=base.layout.xaxis.color,
