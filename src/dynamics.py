@@ -2227,6 +2227,130 @@ def axle_traction_utilisation_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figu
     return fig, {"runs": runs, "warnings": warnings, "mu_tire": MU_TIRE}
 
 
+def axle_lateral_utilisation_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Per-axle lateral grip utilisation |Fy| / (mu * Fz) vs lateral g.
+
+    Shows which axle saturates its lateral grip first in cornering: the axle
+    reaching 1.0 first is the limiting end (front first = understeer tendency).
+    Est_FY/Est_FZ are controller estimates with a single mu per axle assumed, so
+    read this as a comparative grip-headroom signal, not an absolute limit.
+    """
+    required = [
+        "VN_ay",
+        "Est_FYFL",
+        "Est_FYFR",
+        "Est_FYRL",
+        "Est_FYRR",
+        "Est_FZFL",
+        "Est_FZFR",
+        "Est_FZRL",
+        "Est_FZRR",
+    ]
+    if not dfs:
+        return _empty_xy_fig(
+            "Per-axle Lateral Utilisation  ·  |Fy| / (mu*Fz)",
+            "|ay| [g]",
+            "|Fy| / (mu*Fz)  [-]",
+            "No runs selected",
+        ), {"runs": {}, "warnings": ["No runs selected."]}
+    multi = len(dfs) > 1
+    fig = make_dark_figure(
+        "Per-axle Lateral Utilisation  ·  |Fy| / (mu*Fz)",
+        "|ay| [g]",
+        "|Fy| / (mu*Fz)  [-]",
+    )
+    warnings: list[str] = []
+    runs: dict[str, dict[str, float]] = {}
+    for run_name, df_in in dfs.items():
+        df = ensure_complete_laps_df(df_in)
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            warnings.append(f"{run_name}: missing axle-lateral columns: {missing}")
+            continue
+        arr = cols_to_numpy(df, required)
+        valid = _base_validity(*(arr[c] for c in required))
+        arr = {k: v[valid] for k, v in arr.items()}
+        ay_g = np.abs(arr["VN_ay"]) / G_MPS2
+        fy_front = np.abs(arr["Est_FYFL"] + arr["Est_FYFR"])
+        fy_rear = np.abs(arr["Est_FYRL"] + arr["Est_FYRR"])
+        fz_front = arr["Est_FZFL"] + arr["Est_FZFR"]
+        fz_rear = arr["Est_FZRL"] + arr["Est_FZRR"]
+        m = (ay_g > 0.3) & (fz_front > 1.0) & (fz_rear > 1.0)
+        if not m.any():
+            warnings.append(f"{run_name}: no cornering samples for lateral utilisation.")
+            continue
+        ay_g_m = ay_g[m]
+        util_f = fy_front[m] / (MU_TIRE * fz_front[m])
+        util_r = fy_rear[m] / (MU_TIRE * fz_rear[m])
+        centers_f, med_f, _ = _binned_percentile(
+            ay_g_m, util_f, bin_width=0.1, x_min=0.0, x_max=2.0, percentile=50.0
+        )
+        centers_r, med_r, _ = _binned_percentile(
+            ay_g_m, util_r, bin_width=0.1, x_min=0.0, x_max=2.0, percentile=50.0
+        )
+        vf = np.isfinite(med_f)
+        vr = np.isfinite(med_r)
+        if multi:
+            base = driver_color(run_name)
+            fig.add_trace(
+                go.Scatter(
+                    x=centers_f[vf],
+                    y=med_f[vf],
+                    mode="lines",
+                    line=dict(color=base, width=2.2),
+                    name=f"{run_name} front",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=centers_r[vr],
+                    y=med_r[vr],
+                    mode="lines",
+                    line=dict(color=base, width=2.2, dash="dot"),
+                    name=f"{run_name} rear",
+                )
+            )
+        else:
+            fig.add_trace(
+                go.Scatter(
+                    x=centers_f[vf],
+                    y=med_f[vf],
+                    mode="lines",
+                    line=dict(color=_AXLE_FRONT_COLOR, width=2.4),
+                    name="Front axle",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=centers_r[vr],
+                    y=med_r[vr],
+                    mode="lines",
+                    line=dict(color=_AXLE_REAR_COLOR, width=2.4),
+                    name="Rear axle",
+                )
+            )
+        peak_f = float(np.nanpercentile(util_f, 95.0))
+        peak_r = float(np.nanpercentile(util_r, 95.0))
+        runs[run_name] = {
+            "util_front_median": float(np.nanmedian(util_f)),
+            "util_rear_median": float(np.nanmedian(util_r)),
+            "util_front_p95": peak_f,
+            "util_rear_p95": peak_r,
+            "limiting_axle": "front" if peak_f >= peak_r else "rear",
+            "samples": int(m.sum()),
+        }
+    fig.add_hline(
+        y=1.0,
+        line=dict(color="rgba(235,235,235,0.55)", width=1.5, dash="dot"),
+        annotation_text="axle grip limit",
+        annotation_position="top left",
+    )
+    fig.update_layout(height=520, margin=dict(l=70, r=30, t=50, b=65))
+    fig.update_xaxes(range=[0.0, 2.0])
+    fig.update_yaxes(range=[0.0, 1.3])
+    return fig, {"runs": runs, "warnings": warnings, "mu_tire": MU_TIRE}
+
+
 def lateral_load_transfer_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
     """Front lateral-load-transfer share in radius-filtered corners."""
     required = [
