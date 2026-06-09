@@ -2351,6 +2351,97 @@ def axle_lateral_utilisation_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figur
     return fig, {"runs": runs, "warnings": warnings, "mu_tire": MU_TIRE}
 
 
+def lateral_grip_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """P95 lateral g by speed bin vs the aero-scaled grip-mu reference, split
+    left vs right turns.
+
+    Shows how much lateral grip the car sustains, at what speed, and whether it
+    is symmetric between left and right corners. Lateral mu approximated by the
+    design value (1.70); read the L/R gap as a setup-asymmetry signal.
+    """
+    required = ["VN_ay", "VN_vx"]
+    if not dfs:
+        return _empty_xy_fig(
+            "Lateral Grip Envelope",
+            "Vehicle speed [m/s]",
+            "|ay| [g]",
+            "No runs selected",
+        ), {"runs": {}, "warnings": ["No runs selected."]}
+    fig = make_dark_figure("Lateral Grip Envelope", "Vehicle speed [m/s]", "|ay| [g]")
+    warnings: list[str] = []
+    runs: dict[str, dict[str, float]] = {}
+    all_ay_g: list[float] = []
+    multi = len(dfs) > 1
+    for run_name, df_in in dfs.items():
+        df = ensure_complete_laps_df(df_in)
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            warnings.append(f"{run_name}: missing lateral-envelope columns: {missing}")
+            continue
+        arr = cols_to_numpy(df, required)
+        vx = np.abs(arr["VN_vx"])
+        ay = arr["VN_ay"]
+        ay_g = ay / G_MPS2
+        base_ok = np.isfinite(vx) & np.isfinite(ay_g) & (np.abs(ay_g) > 0.2)
+        color = driver_color(run_name)
+        side_peaks: dict[str, float] = {}
+        side_counts: dict[str, int] = {}
+        for side, sign, is_dot in (("left", 1.0, False), ("right", -1.0, True)):
+            sm = base_ok & (np.sign(ay) == sign)
+            side_counts[side] = int(sm.sum())
+            if not sm.any():
+                continue
+            centers, p95, _ = _binned_percentile(
+                vx[sm],
+                np.abs(ay_g[sm]),
+                bin_width=2.0,
+                x_min=0.0,
+                x_max=40.0,
+                percentile=95.0,
+            )
+            valid = np.isfinite(p95)
+            if not valid.any():
+                continue
+            fig.add_trace(
+                go.Scatter(
+                    x=centers[valid],
+                    y=p95[valid],
+                    mode="lines+markers",
+                    line=dict(color=color, width=2.2, dash=("dot" if is_dot else None)),
+                    marker=dict(size=4),
+                    name=(f"{run_name} {side}" if multi else side.title()),
+                )
+            )
+            side_peaks[side] = float(np.nanmax(p95[valid]))
+            all_ay_g.append(side_peaks[side])
+        left_peak = side_peaks.get("left", float("nan"))
+        right_peak = side_peaks.get("right", float("nan"))
+        runs[run_name] = {
+            "peak_ay_left_g": left_peak,
+            "peak_ay_right_g": right_peak,
+            "ay_asymmetry_g": left_peak - right_peak,
+            "samples_left": side_counts.get("left", 0),
+            "samples_right": side_counts.get("right", 0),
+        }
+    v_grid = np.linspace(1.0, 40.0, 400)
+    aero_down = 0.5 * RHO_AIR_KGM3 * (v_grid**2) * abs(CL_AERO) * A_AERO_M2
+    grip_limit_g = MU_TIRE * (1.0 + aero_down / (MASS_KG * G_MPS2))
+    fig.add_trace(
+        go.Scatter(
+            x=v_grid,
+            y=grip_limit_g,
+            mode="lines",
+            line=dict(color="#73D973", width=1.8, dash="dash"),
+            name=f"Grip limit μ={MU_TIRE:.2f} (aero-scaled)",
+        )
+    )
+    y_max = max(MU_TIRE * 1.25, (max(all_ay_g) * 1.15 if all_ay_g else 0.0))
+    fig.update_layout(height=520, margin=dict(l=70, r=30, t=50, b=65))
+    fig.update_yaxes(range=[0.0, y_max])
+    fig.update_xaxes(range=[0.0, 40.0])
+    return fig, {"runs": runs, "warnings": warnings, "mu_tire": MU_TIRE}
+
+
 def lateral_load_transfer_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
     """Front lateral-load-transfer share in radius-filtered corners."""
     required = [
