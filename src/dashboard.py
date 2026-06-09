@@ -121,6 +121,11 @@ METRIC_HELP: dict[str, str] = {
     "RMS to ideal [N]": "RMS distance of measured regen from the ideal load-proportional curve.",
     "Rear overbiased [%]": "Share of braking samples where the rear axle exceeds its ideal share.",
     "Peak brake [g]": "Peak longitudinal deceleration [g].",
+    "Best max braking [g]": "Most negative per-lap braking point in the selected laps. More negative = harder peak decel.",
+    "Mean max braking [g]": "Average of the per-lap Max Braking G values across the selected laps.",
+    "Raising avg end [g]": "Final cumulative mean of Max Braking G across laps. Useful to compare runs without overreacting to one lap.",
+    "Best lap": "Lap with the most negative Max Braking G in the selected laps.",
+    "Mean brake samples": "Average count of braking samples per lap behind the Max Braking G metric.",
     # Dynamics · acceleration force balance
     "Peak accel [g]": "Peak longitudinal acceleration [g].",
     # Dynamics · setup (LLTD)
@@ -1948,6 +1953,15 @@ def _dyn_decel_envelope_fig_cached(
 
 
 @st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _dyn_max_braking_g_per_lap_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+) -> tuple[go.Figure, dict]:
+    _ = run_tokens
+    return dyn.max_braking_g_per_lap_fig(dfs)
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
 def _skidpad_fig_cached(
     metric: str,
     dfs: dict[str, pl.DataFrame],
@@ -3569,6 +3583,67 @@ def _render_dynamics_braking(dfs: dict[str, pl.DataFrame]) -> None:
         _plotly_chart(fig, use_container_width=True, theme=None)
     except Exception as exc:
         st.error(f"Decel envelope unavailable: {exc}")
+
+    st.divider()
+    st.subheader("Max Braking G per Lap")
+    st.caption(
+        "Per lap, this takes the minimum filtered longitudinal acceleration "
+        "during real braking samples (`Brake > 5 %`, `ax < -1.0 m/s²`). "
+        "More negative = harder peak braking. The dashed trace is the "
+        "raising average (cumulative mean), which makes run-to-run "
+        "comparison less sensitive to one standout lap."
+    )
+    try:
+        fig, kpis = _dyn_max_braking_g_per_lap_fig_cached(dfs, _run_cache_tokens(dfs))
+        for w in kpis.get("warnings", []):
+            st.warning(w)
+        run_kpis = kpis.get("runs", {})
+        if len(run_kpis) == 1:
+            _run_name, vals = next(iter(run_kpis.items()))
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric(
+                "Best max braking [g]",
+                f"{_fmt(vals.get('best_max_braking_g', np.nan), '.3f')} g",
+                help=METRIC_HELP["Best max braking [g]"],
+            )
+            c2.metric(
+                "Mean max braking [g]",
+                f"{_fmt(vals.get('mean_max_braking_g', np.nan), '.3f')} g",
+                help=METRIC_HELP["Mean max braking [g]"],
+            )
+            c3.metric(
+                "Raising avg end [g]",
+                f"{_fmt(vals.get('raising_avg_last_g', np.nan), '.3f')} g",
+                help=METRIC_HELP["Raising avg end [g]"],
+            )
+            c4.metric(
+                "Best lap",
+                f"L{int(vals.get('best_lap', 0))}",
+                help=METRIC_HELP["Best lap"],
+            )
+            c5.metric(
+                "Mean brake samples",
+                f"{_fmt(vals.get('mean_brake_samples', np.nan), '.0f')}",
+                help=METRIC_HELP["Mean brake samples"],
+            )
+        elif len(run_kpis) > 1:
+            rows = []
+            for run_name, vals in run_kpis.items():
+                rows.append(
+                    {
+                        "Run": run_name,
+                        "Best max braking [g]": round(vals.get("best_max_braking_g", np.nan), 3),
+                        "Mean max braking [g]": round(vals.get("mean_max_braking_g", np.nan), 3),
+                        "Raising avg end [g]": round(vals.get("raising_avg_last_g", np.nan), 3),
+                        "Best lap": int(vals.get("best_lap", 0)),
+                        "Valid laps": int(vals.get("valid_laps", 0)),
+                        "Mean brake samples": round(vals.get("mean_brake_samples", np.nan), 1),
+                    }
+                )
+            _show_summary_table(rows)
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.error(f"Max Braking G per lap unavailable: {exc}")
 
 
 def _render_dynamics_acceleration(dfs: dict[str, pl.DataFrame]) -> None:

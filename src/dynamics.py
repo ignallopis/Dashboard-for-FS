@@ -1560,6 +1560,145 @@ def decel_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     return fig, {"runs": runs, "warnings": warnings, "reference_decel_g": reference_g}
 
 
+def max_braking_g_per_lap_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Per-lap peak braking g and its raising average.
+
+    Max Braking G follows the OptimumG-style definition shown in the user
+    reference: the most negative longitudinal acceleration sample in each lap's
+    real braking phases. Because the channel is already the filtered
+    ``Filtering_VN_ax``, the per-lap minimum is meaningful as a peak-braking
+    KPI, while the cumulative mean ("raising average") reveals the run trend.
+    """
+    required = ["laps", "laptime", "Filtering_VN_ax", "Brake"]
+    min_samples_per_lap = 5
+    reference_g = -1.79
+
+    fig = make_dark_figure("Max Braking G per Lap", "Lap", "Min ax during braking [g]")
+    warnings: list[str] = []
+    runs: dict[str, dict[str, float | int]] = {}
+    all_laps: list[np.ndarray] = []
+    y_min = np.inf
+    y_max = -np.inf
+
+    for run_name, df_in in dfs.items():
+        df = ensure_complete_laps_df(df_in)
+        missing = [col for col in required if col not in df.columns]
+        if missing:
+            warnings.append(f"{run_name}: missing max-braking columns: {missing}")
+            continue
+
+        arr = cols_to_numpy(df, required)
+        lap_ids = np.sort(unique_laps(arr["laps"]).astype(int))
+        lap_times_s = np.full(len(lap_ids), np.nan)
+        peak_braking_g = np.full(len(lap_ids), np.nan)
+        brake_samples = np.zeros(len(lap_ids), dtype=int)
+
+        for i, lap_id in enumerate(lap_ids):
+            lap_mask = arr["laps"] == lap_id
+            if lap_mask.any():
+                lap_times_s[i] = float(np.nanmax(arr["laptime"][lap_mask]))
+            braking_mask = (
+                lap_mask
+                & np.isfinite(arr["Filtering_VN_ax"])
+                & np.isfinite(arr["Brake"])
+                & (arr["Brake"] > 5.0)
+                & (arr["Filtering_VN_ax"] < -1.0)
+            )
+            brake_samples[i] = int(braking_mask.sum())
+            if brake_samples[i] < min_samples_per_lap:
+                continue
+            peak_braking_g[i] = float(np.nanmin(arr["Filtering_VN_ax"][braking_mask]) / G_MPS2)
+
+        ok = np.isfinite(peak_braking_g) & np.isfinite(lap_times_s)
+        if not ok.any():
+            warnings.append(f"{run_name}: no valid per-lap braking peaks.")
+            continue
+
+        lap_ord = lap_ids[ok]
+        lt_ord = lap_times_s[ok]
+        y_ord = peak_braking_g[ok]
+        samples_ord = brake_samples[ok]
+        raising_avg = np.cumsum(y_ord) / np.arange(1, len(y_ord) + 1)
+        color = driver_color(run_name)
+        customdata = np.column_stack([lap_ord, lt_ord, samples_ord])
+
+        fig.add_trace(
+            go.Scatter(
+                x=lap_ord,
+                y=y_ord,
+                mode="lines+markers",
+                name=run_name,
+                legendgroup=run_name,
+                line=dict(color=color, width=2.2),
+                marker=dict(
+                    color=color,
+                    size=8,
+                    line=dict(color="#EBEBEB", width=0.6),
+                ),
+                customdata=customdata,
+                hovertemplate=(
+                    "Lap=%{customdata[0]:.0f}<br>"
+                    "LapTime=%{customdata[1]:.2f} s<br>"
+                    "Max braking=%{y:.3f} g<br>"
+                    "Brake samples=%{customdata[2]:.0f}<extra></extra>"
+                ),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=lap_ord,
+                y=raising_avg,
+                mode="lines+markers",
+                name=f"{run_name} raising avg",
+                legendgroup=run_name,
+                line=dict(color=color, width=1.7, dash="dash"),
+                marker=dict(color=color, size=6, symbol="diamond"),
+                opacity=0.90,
+                hovertemplate=("Lap=%{x:.0f}<br>Raising avg=%{y:.3f} g<extra></extra>"),
+            )
+        )
+
+        best_idx = int(np.nanargmin(y_ord))
+        runs[run_name] = {
+            "valid_laps": int(len(lap_ord)),
+            "best_lap": int(lap_ord[best_idx]),
+            "best_max_braking_g": float(np.nanmin(y_ord)),
+            "mean_max_braking_g": float(np.nanmean(y_ord)),
+            "raising_avg_last_g": float(raising_avg[-1]),
+            "mean_brake_samples": float(np.nanmean(samples_ord)),
+        }
+        all_laps.append(lap_ord)
+        y_min = min(y_min, float(np.nanmin(np.concatenate([y_ord, raising_avg]))))
+        y_max = max(y_max, float(np.nanmax(np.concatenate([y_ord, raising_avg]))))
+
+    fig.add_hline(
+        y=reference_g,
+        line=dict(color="#73D973", width=1.6, dash="dot"),
+        annotation_text="CAT17x design target -1.79 g",
+        annotation_position="bottom right",
+    )
+    if all_laps:
+        fig.update_xaxes(tickvals=np.unique(np.concatenate(all_laps)).astype(int))
+    if np.isfinite(y_min) and np.isfinite(y_max):
+        pad = max(0.04, 0.08 * (y_max - y_min))
+        fig.update_yaxes(range=[y_min - pad, min(-0.2, y_max + pad)])
+    fig.update_layout(
+        height=520,
+        margin=dict(l=70, r=35, t=55, b=65),
+        hovermode="closest",
+        legend=dict(
+            bgcolor="rgba(20,20,23,0.85)",
+            bordercolor="rgba(128,128,128,0.3)",
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1.0,
+        ),
+    )
+    return fig, {"runs": runs, "warnings": warnings, "reference_max_braking_g": abs(reference_g)}
+
+
 def _ideal_traction_forces(
     ax_mps2: np.ndarray,
     vx_mps: np.ndarray | float,
