@@ -1845,6 +1845,114 @@ def accel_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     }
 
 
+def tractive_effort_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Total drive force vs speed with grip / torque / power bounds.
+
+    The canonical tractive-effort diagram: measured drive force (sum of Est_FX
+    over the four wheels) against the three limiting envelopes — tyre grip,
+    motor-torque ceiling and the 80 kW power hyperbola. Est_FX are controller
+    estimates, not measured forces.
+    """
+    required = [
+        "Filtering_VN_ax",
+        "VN_vx",
+        "Throttle",
+        "Est_FXFL",
+        "Est_FXFR",
+        "Est_FXRL",
+        "Est_FXRR",
+    ]
+    if not dfs:
+        return _empty_xy_fig(
+            "Tractive Effort  ·  Drive Force vs Speed",
+            "Vehicle speed [m/s]",
+            "Drive force [kN]",
+            "No runs selected",
+        ), {"runs": {}, "warnings": ["No runs selected."]}
+    fig = make_dark_figure(
+        "Tractive Effort  ·  Drive Force vs Speed",
+        "Vehicle speed [m/s]",
+        "Drive force [kN]",
+    )
+    warnings: list[str] = []
+    runs: dict[str, dict[str, float]] = {}
+    f_max_seen = 1.0
+    for run_name, df_in in dfs.items():
+        df = ensure_complete_laps_df(df_in)
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            warnings.append(f"{run_name}: missing tractive-effort columns: {missing}")
+            continue
+        arr = cols_to_numpy(df, required)
+        valid = _base_validity(*(arr[c] for c in required))
+        arr = {k: v[valid] for k, v in arr.items()}
+        vx = np.abs(arr["VN_vx"])
+        ax = arr["Filtering_VN_ax"]
+        total_n = arr["Est_FXFL"] + arr["Est_FXFR"] + arr["Est_FXRL"] + arr["Est_FXRR"]
+        m = (ax > 1.0) & (arr["Throttle"] > 5.0) & (total_n > 0.0) & np.isfinite(vx)
+        if not m.any():
+            warnings.append(f"{run_name}: no drive samples for tractive effort.")
+            continue
+        vx_m = vx[m]
+        f_kn = total_n[m] / 1000.0
+        f_max_seen = max(f_max_seen, float(np.nanpercentile(f_kn, 99.0)))
+        fx_tire_n, fx_torque_n, fx_power_n, _fx_max_n = _accel_envelope_curves(vx_m)
+        binding = np.argmin(np.vstack([fx_tire_n, fx_torque_n, fx_power_n]), axis=0)
+        stride = max(1, int(np.ceil(vx_m.size / 8000)))
+        color = driver_color(run_name)
+        fig.add_trace(
+            go.Scattergl(
+                x=vx_m[::stride],
+                y=f_kn[::stride],
+                mode="markers",
+                marker=dict(color=color, size=3, opacity=0.45),
+                name=run_name,
+                hovertemplate="vx=%{x:.1f} m/s<br>F=%{y:.2f} kN<extra></extra>",
+            )
+        )
+        runs[run_name] = {
+            "peak_drive_kN": float(np.nanpercentile(f_kn, 95.0)),
+            "pct_torque_limited": float(np.mean(binding == 1) * 100.0),
+            "pct_grip_limited": float(np.mean(binding == 0) * 100.0),
+            "pct_power_limited": float(np.mean(binding == 2) * 100.0),
+            "samples": int(m.sum()),
+        }
+    v_grid = np.linspace(1.0, 40.0, 400)
+    fx_tire_n, fx_torque_n, fx_power_n, _ = _accel_envelope_curves(v_grid)
+    fig.add_trace(
+        go.Scatter(
+            x=v_grid,
+            y=fx_tire_n / 1000.0,
+            mode="lines",
+            line=dict(color="#73D973", width=1.8, dash="dash"),
+            name=f"Grip limit μ={MU_TIRE:.2f}",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=v_grid,
+            y=fx_torque_n / 1000.0,
+            mode="lines",
+            line=dict(color="#5BC8F5", width=1.8, dash="dash"),
+            name=f"Torque limit ({N_MOTORS}x{T_MOTOR_MAX_NM:.0f} Nm)",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=v_grid,
+            y=fx_power_n / 1000.0,
+            mode="lines",
+            line=dict(color="#F2D44D", width=1.8, dash="dash"),
+            name=f"Power limit {MAX_POWER_W / 1000:.0f} kW",
+        )
+    )
+    y_max = max(f_max_seen * 1.1, float(np.nanmax(fx_torque_n) / 1000.0) * 1.1)
+    fig.update_layout(height=520, margin=dict(l=70, r=30, t=50, b=65))
+    fig.update_xaxes(range=[0.0, 40.0])
+    fig.update_yaxes(range=[0.0, y_max])
+    return fig, {"runs": runs, "warnings": warnings, "mu_tire": MU_TIRE}
+
+
 def lateral_load_transfer_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
     """Front lateral-load-transfer share in radius-filtered corners."""
     required = [
