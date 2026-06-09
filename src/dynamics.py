@@ -9,6 +9,7 @@ Usage:
 
 from __future__ import annotations
 from typing import Literal
+import cornering as corn
 import numpy as np
 import polars as pl
 import plotly.graph_objects as go
@@ -2440,6 +2441,150 @@ def lateral_grip_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, 
     fig.update_yaxes(range=[0.0, y_max])
     fig.update_xaxes(range=[0.0, 40.0])
     return fig, {"runs": runs, "warnings": warnings, "mu_tire": MU_TIRE}
+
+
+_BALANCE_PHASES = ("entry", "steady", "exit")
+_BALANCE_PHASE_X = {"entry": 0.0, "steady": 1.0, "exit": 2.0}
+
+
+def cornering_balance_phase_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Under/oversteer (front-minus-rear |slip angle|, deg) per corner phase:
+    entry (turn-in) -> steady (apex) -> exit. Positive = understeer (front tyres
+    slip more), negative = oversteer. Phases come from the Lap-Analysis turn
+    machinery (reference-lap corner phases projected onto every valid lap). Slip
+    angles are controller estimates: read distributions across corners, not
+    single points.
+    """
+    required = ["Est_SAFL", "Est_SAFR", "Est_SARL", "Est_SARR"]
+    if not dfs:
+        return _empty_xy_fig(
+            "Balance vs Corner Phase",
+            "Corner phase",
+            "Front − rear slip angle [deg]",
+            "No runs selected",
+        ), {"runs": {}, "warnings": ["No runs selected."]}
+    fig = make_dark_figure(
+        "Balance vs Corner Phase  ·  Understeer (+) / Oversteer (−)",
+        "Corner phase",
+        "Front − rear slip angle [deg]",
+    )
+    warnings: list[str] = []
+    runs: dict[str, dict] = {}
+    multi = len(dfs) > 1
+    run_index = {name: i for i, name in enumerate(dfs)}
+    for run_name, df_in in dfs.items():
+        df = ensure_complete_laps_df(df_in)
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            warnings.append(f"{run_name}: missing slip-angle columns: {missing}")
+            continue
+        try:
+            d = corn.compute_radius_curvature(df)
+        except Exception as exc:  # noqa: BLE001 - surface as a warning, keep other runs
+            warnings.append(f"{run_name}: radius/curvature failed: {exc}")
+            continue
+        laps = d["laps"]
+        lap_ids = unique_laps(laps)
+        valid_laps = (
+            lap_ids[(lap_ids > 0) & (lap_ids != np.nanmax(lap_ids))]
+            if lap_ids.size
+            else np.array([])
+        )
+        if valid_laps.size == 0:
+            warnings.append(f"{run_name}: no valid laps for corner phases.")
+            continue
+        best_lap = min(
+            valid_laps,
+            key=lambda lp: float(np.nanmax(d["laptime"][laps == lp])),
+        )
+        reference_turns = corn.detect_turns_on_lap(d, run_name, int(best_lap))
+        if not reference_turns:
+            warnings.append(f"{run_name}: no turns detected.")
+            continue
+        ref_lm = laps == best_lap
+        ref_phases = corn.compute_corner_phases(
+            reference_turns, d["s_lap_m"][ref_lm], d["brake_pct"][ref_lm]
+        )
+        arr = cols_to_numpy(df, required)
+        sa_front = 0.5 * (arr["Est_SAFL"] + arr["Est_SAFR"])
+        sa_rear = 0.5 * (arr["Est_SARL"] + arr["Est_SARR"])
+        balance_deg = np.degrees(np.abs(sa_front) - np.abs(sa_rear))
+        s = d["s_lap_m"]
+        phase_corner_vals: dict[str, list[float]] = {p: [] for p in _BALANCE_PHASES}
+        n_samples = 0
+        for cp in ref_phases:
+            bands = {
+                "entry": (cp.s_brake_off_m, cp.s_apex_lo_m),
+                "steady": (cp.s_apex_lo_m, cp.s_apex_hi_m),
+                "exit": (cp.s_apex_hi_m, cp.s_exit_end_m),
+            }
+            for phase, (lo, hi) in bands.items():
+                if not (np.isfinite(lo) and np.isfinite(hi) and hi > lo):
+                    continue
+                per_lap_meds: list[float] = []
+                for lap in valid_laps:
+                    lm = (laps == lap) & (s >= lo) & (s < hi) & np.isfinite(balance_deg)
+                    cnt = int(lm.sum())
+                    if cnt >= 5:
+                        per_lap_meds.append(float(np.nanmedian(balance_deg[lm])))
+                        n_samples += cnt
+                if per_lap_meds:
+                    phase_corner_vals[phase].append(float(np.nanmedian(per_lap_meds)))
+        color = driver_color(run_name)
+        phase_med: dict[str, float] = {}
+        for phase in _BALANCE_PHASES:
+            vals = np.array(phase_corner_vals[phase], dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                phase_med[phase] = float("nan")
+                continue
+            med = float(np.nanmedian(vals))
+            p10 = float(np.nanpercentile(vals, 10)) if vals.size >= 3 else med
+            p90 = float(np.nanpercentile(vals, 90)) if vals.size >= 3 else med
+            phase_med[phase] = med
+            x0 = _BALANCE_PHASE_X[phase] + (0.08 * run_index[run_name] if multi else 0.0)
+            fig.add_trace(
+                go.Scatter(
+                    x=[x0, x0],
+                    y=[p10, p90],
+                    mode="lines",
+                    line=dict(color=color, width=2.0),
+                    showlegend=False,
+                    hoverinfo="skip",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=[x0],
+                    y=[med],
+                    mode="markers",
+                    marker=dict(color=color, size=11, line=dict(color="#1a1a1a", width=1)),
+                    name=run_name,
+                    showlegend=(multi and phase == "entry"),
+                    hovertemplate=f"{phase}<br>median=%{{y:.2f}}°<extra>{run_name}</extra>",
+                )
+            )
+        runs[run_name] = {
+            "balance_entry_deg": phase_med["entry"],
+            "balance_steady_deg": phase_med["steady"],
+            "balance_exit_deg": phase_med["exit"],
+            "balance_shift_deg": phase_med["exit"] - phase_med["entry"],
+            "corners": int(len(reference_turns)),
+            "samples": int(n_samples),
+        }
+    fig.add_hline(
+        y=0.0,
+        line=dict(color="rgba(235,235,235,0.5)", width=1.4, dash="dot"),
+        annotation_text="neutral",
+        annotation_position="top left",
+    )
+    fig.update_xaxes(
+        tickvals=[0.0, 1.0, 2.0],
+        ticktext=["Entry", "Steady", "Exit"],
+        range=[-0.5, 2.6],
+    )
+    fig.update_layout(height=520, margin=dict(l=70, r=30, t=50, b=65))
+    return fig, {"runs": runs, "warnings": warnings}
 
 
 def lateral_load_transfer_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
