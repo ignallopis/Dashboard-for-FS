@@ -1,0 +1,15 @@
+# Ruff config for CAT17x. `ruff format` runs automatically via a PostToolUse hook
+# (behaviour-preserving). `ruff check` is run manually — its autofix can remove
+# imports used for re-export, so a human should glance at it.
+line-length = 100
+target-version = "py312"
+
+[format]
+quote-style = "double"
+
+[lint]
+# E = pycodestyle errors, F = pyflakes (unused imports/vars), I = import sorting.
+select = ["E", "F", "I"]
+# Long lines are handled by the formatter where possible; don't fail on the rest
+# (URLs, long help strings, dense numeric literals).
+ignore = ["E501"]

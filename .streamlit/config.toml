@@ -1,0 +1,17 @@
+[server]
+enableStaticServing = true
+headless = true
+
+[theme]
+base = "dark"
+# Brand-blue accent for UI chrome (selected tabs, widgets) instead of the
+# default red/pink, which collided with "red = a driver" in the charts.
+primaryColor = "#003B74"
+# Custom fonts applied the *native* way (name:url) so Streamlit loads AND
+# applies them with the right specificity — injected CSS lost to Streamlit's
+# own heading styles. Body = IBM Plex Sans, headings = Archivo (display),
+# code/mono = IBM Plex Mono. These match utils.FONT_FAMILY/FONT_DISPLAY/FONT_MONO
+# so Plotly charts and the Streamlit UI share the same typography.
+font = "IBM Plex Sans:https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap"
+headingFont = "Archivo:https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&display=swap"
+codeFont = "IBM Plex Mono:https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600&display=swap"
