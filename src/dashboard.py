@@ -76,6 +76,16 @@ FileSignature = tuple[int, int]
 # label so the same explanation appears wherever a metric is shown (tables and
 # st.metric cards). Columns/metrics not listed simply render without a tooltip.
 METRIC_HELP: dict[str, str] = {
+    "Traction eff. grip [%]": "P95 achieved ax over the aero-scaled tyre-grip limit, max across speed bins in the grip-limited regime. 100% = riding the tyre limit; the gap mixes wheelspin (see TC) and torque shaping. On circuit logs this is low because acceleration is rarely traction-limited — read it comparatively run-to-run.",
+    "Grip-limited [%]": "Share of acceleration samples where tyre grip (not power) is the binding limit (low speed).",
+    "Power-limited [%]": "Share of acceleration samples where the 80 kW power cap is the binding limit (high speed).",
+    "Peak drive [kN]": "P95 total drive force (sum of Est_FX over four wheels) in acceleration.",
+    "Torque-limited [%]": "Share of acceleration samples capped by the motor-torque ceiling (very low speed / launch).",
+    "Util front [-]": "Front-axle traction utilisation Fx/(mu*Fz): 1.0 = front axle at its grip limit.",
+    "Util rear [-]": "Rear-axle traction utilisation Fx/(mu*Fz): 1.0 = rear axle at its grip limit.",
+    "Limiting axle": "Axle with the higher peak utilisation = the one that saturates grip first under drive.",
+    "Rear bias [%]": "Measured share of drive force on the rear axle.",
+    "Ideal rear [%]": "Load-proportional ideal rear share given the rearward load shift under acceleration.",
     # Generic
     "Run": "Telemetry run / driver.",
     "Valid laps": "Laps that passed the lap-validity filter and were used.",
@@ -112,10 +122,7 @@ METRIC_HELP: dict[str, str] = {
     "Rear overbiased [%]": "Share of braking samples where the rear axle exceeds its ideal share.",
     "Peak brake [g]": "Peak longitudinal deceleration [g].",
     # Dynamics · acceleration force balance
-    "Rear bias [%]": "Rear-axle share of drive force.",
-    "Ideal rear [%]": "Model-ideal rear share under longitudinal load transfer.",
     "Peak accel [g]": "Peak longitudinal acceleration [g].",
-    "Power-limited [%]": "Share of accel samples capped by the 80 kW power limit.",
     # Dynamics · setup (LLTD)
     "Mean LLTD [%]": "Front share of lateral load transfer, mid-corner average.",
     "Min [%]": "Minimum per-lap LLTD front share.",
@@ -3565,58 +3572,166 @@ def _render_dynamics_braking(dfs: dict[str, pl.DataFrame]) -> None:
 
 
 def _render_dynamics_acceleration(dfs: dict[str, pl.DataFrame]) -> None:
-    """Longitudinal chassis response in acceleration."""
-    st.subheader("Ideal Traction Curve  ·  Model vs Measured Drive")
-    st.caption(
-        "Drive-force plane (front axle vs rear axle). Curves are the ideal AWD "
-        "load-proportional distribution under longitudinal load transfer."
-    )
+    """Vehicle traction performance: capability, limiting regime and the 4WD axle story."""
+    single = len(dfs) == 1
+    tokens = _run_cache_tokens(dfs)
+
+    # 1 · Accel Envelope ------------------------------------------------------
+    st.subheader("Accel Envelope  ·  Longitudinal G vs Speed")
     try:
-        fig, kpis = _dyn_ideal_traction_curve_fig_cached(dfs, _run_cache_tokens(dfs))
+        fig, kpis = _dyn_accel_envelope_fig_cached(dfs, tokens)
+        crossover = kpis.get("crossover_mps", float("nan"))
+        st.caption(
+            "P95 ax by speed bin vs the grip-μ and 80 kW power references. "
+            f"Grip→power crossover ≈ {_fmt(crossover, '.1f')} m/s. "
+            "Traction efficiency = how much of the tyre's longitudinal grip we convert "
+            "to forward acceleration in the grip-limited regime (read comparatively)."
+        )
         for w in kpis.get("warnings", []):
             st.warning(w)
-        rows = [
-            {
-                "Run": run_name,
-                "Rear bias [%]": round(vals.get("rear_bias_mean", np.nan) * 100.0, 1),
-                "Ideal rear [%]": round(vals.get("rear_bias_ideal_mean", np.nan) * 100.0, 1),
-                "RMS to ideal [N]": round(vals.get("rms_dist_to_ideal_N", np.nan), 1),
-                "Peak accel [g]": round(vals.get("peak_combined_accel_g", np.nan), 3),
-                "Power-limited [%]": round(vals.get("pct_time_power_limited", np.nan), 1),
-                "Samples": int(vals.get("samples", 0)),
-            }
-            for run_name, vals in kpis.get("runs", {}).items()
-        ]
-        if rows:
-            _show_summary_table(rows)
-        _plotly_chart(fig, use_container_width=True, theme=None)
-    except Exception as exc:
-        st.error(f"Ideal traction curve unavailable: {exc}")
-
-    st.divider()
-
-    st.subheader("Longitudinal Accel Envelope")
-    st.caption(
-        "P95 ax in acceleration events by 5 m/s speed bin, with grip-limited "
-        f"μ={dyn.MU_TIRE:.2f} g and 80 kW power-limited references."
-    )
-    try:
-        fig, kpis = _dyn_accel_envelope_fig_cached(dfs, _run_cache_tokens(dfs))
-        for w in kpis.get("warnings", []):
-            st.warning(w)
-        rows = [
-            {
-                "Run": run_name,
-                "Peak ax [g]": round(vals.get("peak_ax_g", np.nan), 3),
-                "Samples": int(vals.get("samples", 0)),
-            }
-            for run_name, vals in kpis.get("runs", {}).items()
-        ]
-        if rows:
-            _show_summary_table(rows)
+        runs = kpis.get("runs", {})
+        if single and runs:
+            v = next(iter(runs.values()))
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Peak ax (P95)", f"{_fmt(v['peak_ax_g'], '.2f')} g")
+            c2.metric(
+                "Limited by",
+                f"{_fmt(v['pct_grip_limited'], '.0f')}% grip / {_fmt(v['pct_power_limited'], '.0f')}% power",
+            )
+            c3.metric("Traction eff. (grip)", f"{_fmt(v['traction_efficiency_grip_pct'], '.0f')} %")
+            c4.metric("Samples", f"{int(v['samples'])}")
+        elif runs:
+            _show_summary_table(
+                [
+                    {
+                        "Run": r,
+                        "Peak ax [g]": round(v["peak_ax_g"], 3),
+                        "Grip-limited [%]": round(v["pct_grip_limited"], 1),
+                        "Power-limited [%]": round(v["pct_power_limited"], 1),
+                        "Traction eff. grip [%]": round(v["traction_efficiency_grip_pct"], 1),
+                        "Samples": int(v["samples"]),
+                    }
+                    for r, v in runs.items()
+                ]
+            )
         _plotly_chart(fig, use_container_width=True, theme=None)
     except Exception as exc:
         st.error(f"Accel envelope unavailable: {exc}")
+
+    st.divider()
+
+    # 2 · Tractive Effort -----------------------------------------------------
+    st.subheader("Tractive Effort  ·  Drive Force vs Speed")
+    st.caption(
+        "Total drive force (Σ Est_FX) vs speed against the grip, motor-torque and "
+        "80 kW power bounds. The torque ceiling is what limits launch. "
+        "Est_FX are controller estimates, not measured forces."
+    )
+    try:
+        fig, kpis = _dyn_tractive_effort_fig_cached(dfs, tokens)
+        for w in kpis.get("warnings", []):
+            st.warning(w)
+        runs = kpis.get("runs", {})
+        if single and runs:
+            v = next(iter(runs.values()))
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Peak drive (P95)", f"{_fmt(v['peak_drive_kN'], '.2f')} kN")
+            c2.metric("Torque-limited", f"{_fmt(v['pct_torque_limited'], '.0f')} %")
+            c3.metric("Grip-limited", f"{_fmt(v['pct_grip_limited'], '.0f')} %")
+            c4.metric("Power-limited", f"{_fmt(v['pct_power_limited'], '.0f')} %")
+        elif runs:
+            _show_summary_table(
+                [
+                    {
+                        "Run": r,
+                        "Peak drive [kN]": round(v["peak_drive_kN"], 2),
+                        "Torque-limited [%]": round(v["pct_torque_limited"], 1),
+                        "Grip-limited [%]": round(v["pct_grip_limited"], 1),
+                        "Power-limited [%]": round(v["pct_power_limited"], 1),
+                        "Samples": int(v["samples"]),
+                    }
+                    for r, v in runs.items()
+                ]
+            )
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.error(f"Tractive effort unavailable: {exc}")
+
+    st.divider()
+
+    # 3 · Per-axle Traction Utilisation --------------------------------------
+    st.subheader("Per-axle Traction Utilisation  ·  Fx / (μ·Fz)")
+    st.caption(
+        "Front vs rear axle grip used for drive. The axle reaching 1.0 first is the "
+        "traction-limiting axle — shift torque toward the other. Estimated forces; "
+        "single μ per axle assumed."
+    )
+    try:
+        fig, kpis = _dyn_axle_traction_utilisation_fig_cached(dfs, tokens)
+        for w in kpis.get("warnings", []):
+            st.warning(w)
+        runs = kpis.get("runs", {})
+        if single and runs:
+            v = next(iter(runs.values()))
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Util front (med)", f"{_fmt(v['util_front_median'], '.2f')}")
+            c2.metric("Util rear (med)", f"{_fmt(v['util_rear_median'], '.2f')}")
+            c3.metric("Limiting axle", str(v["limiting_axle"]).title())
+            c4.metric("Samples", f"{int(v['samples'])}")
+        elif runs:
+            _show_summary_table(
+                [
+                    {
+                        "Run": r,
+                        "Util front [-]": round(v["util_front_median"], 3),
+                        "Util rear [-]": round(v["util_rear_median"], 3),
+                        "Limiting axle": str(v["limiting_axle"]).title(),
+                        "Samples": int(v["samples"]),
+                    }
+                    for r, v in runs.items()
+                ]
+            )
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.error(f"Axle utilisation unavailable: {exc}")
+
+    st.divider()
+
+    # 4 · Drive Distribution vs Load Transfer --------------------------------
+    st.subheader("Drive Distribution vs Load Transfer")
+    st.caption(
+        "Under acceleration load shifts to the rear axle; this checks whether drive "
+        "torque is split front/rear to follow that shift = maximum 4WD traction. "
+        "Est_FX are controller estimates, not measured forces."
+    )
+    try:
+        fig, kpis = _dyn_ideal_traction_curve_fig_cached(dfs, tokens)
+        for w in kpis.get("warnings", []):
+            st.warning(w)
+        runs = kpis.get("runs", {})
+        if single and runs:
+            v = next(iter(runs.values()))
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Rear bias (real)", f"{_fmt(v['rear_bias_mean'] * 100.0, '.1f')} %")
+            c2.metric("Rear bias (ideal)", f"{_fmt(v['rear_bias_ideal_mean'] * 100.0, '.1f')} %")
+            c3.metric("Peak accel (P95)", f"{_fmt(v['peak_combined_accel_g'], '.2f')} g")
+            c4.metric("Samples", f"{int(v['samples'])}")
+        elif runs:
+            _show_summary_table(
+                [
+                    {
+                        "Run": r,
+                        "Rear bias [%]": round(v["rear_bias_mean"] * 100.0, 1),
+                        "Ideal rear [%]": round(v["rear_bias_ideal_mean"] * 100.0, 1),
+                        "Peak accel [g]": round(v["peak_combined_accel_g"], 3),
+                        "Samples": int(v["samples"]),
+                    }
+                    for r, v in runs.items()
+                ]
+            )
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.error(f"Drive distribution unavailable: {exc}")
 
 
 def _render_setup_calibration_banner(df: pl.DataFrame) -> None:
