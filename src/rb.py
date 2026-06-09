@@ -8,6 +8,7 @@ KPIs are computed during valid braking phases:
 When available, active RB phases are further restricted to `RB_Enable == 1.0`.
 Slip-ratio tracking uses the braking target SR = -0.20.
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -160,7 +161,9 @@ def _first_delay_ms(
 ) -> float:
     if end < start:
         return np.nan
-    rel = np.flatnonzero(np.isfinite(signal[start:end + 1]) & (signal[start:end + 1] >= threshold))
+    rel = np.flatnonzero(
+        np.isfinite(signal[start : end + 1]) & (signal[start : end + 1] >= threshold)
+    )
     if rel.size == 0:
         return np.nan
     return float(rel[0] * dt_s * 1000.0)
@@ -294,14 +297,16 @@ def _lockup_events(
             counts_by_wheel[wheel] += 1
             counts_by_lap.setdefault(lap, {w: 0 for w in WHEELS})
             counts_by_lap[lap][wheel] += 1
-            event_rows.append({
-                "wheel": wheel,
-                "lap": lap,
-                "start": start,
-                "end": end,
-                "min_sr": min_sr,
-                "duration_ms": _event_duration_s(start, end, dt_s) * 1000.0,
-            })
+            event_rows.append(
+                {
+                    "wheel": wheel,
+                    "lap": lap,
+                    "start": start,
+                    "end": end,
+                    "min_sr": min_sr,
+                    "duration_ms": _event_duration_s(start, end, dt_s) * 1000.0,
+                }
+            )
 
     return {
         "events": event_rows,
@@ -326,12 +331,8 @@ def _lockup_per_lap(
     brake_time_s = np.full(n_laps, np.nan, dtype=float)
     total_lock_time_s = np.full(n_laps, np.nan, dtype=float)
     total_lock_pct_brake = np.full(n_laps, np.nan, dtype=float)
-    lock_time_s_by_wheel = {
-        wheel: np.full(n_laps, np.nan, dtype=float) for wheel in WHEELS
-    }
-    lock_events_by_wheel = {
-        wheel: np.zeros(n_laps, dtype=int) for wheel in WHEELS
-    }
+    lock_time_s_by_wheel = {wheel: np.full(n_laps, np.nan, dtype=float) for wheel in WHEELS}
+    lock_events_by_wheel = {wheel: np.zeros(n_laps, dtype=int) for wheel in WHEELS}
 
     for idx, lap in enumerate(lap_list):
         lap_mask = laps == lap
@@ -352,9 +353,7 @@ def _lockup_per_lap(
 
         total_lock_time_s[idx] = lap_total_lock_time_s
         total_lock_pct_brake[idx] = (
-            100.0 * lap_total_lock_time_s / lap_brake_time_s
-            if lap_brake_time_s > 1e-9
-            else np.nan
+            100.0 * lap_total_lock_time_s / lap_brake_time_s if lap_brake_time_s > 1e-9 else np.nan
         )
 
     table_dict: dict[str, np.ndarray] = {
@@ -472,10 +471,18 @@ def _prepare_arrays_from_df(
     ax_col = _ax_signal(df.columns)
     vx_col = _vx_signal(df.columns)
     cols = [
-        "TimeStamp", "laps", "laptime", "Brake", ax_col, vx_col,
+        "TimeStamp",
+        "laps",
+        "laptime",
+        "Brake",
+        ax_col,
+        vx_col,
         "RB_Enable",
         "RB_intensityTarget",
-        "Est_SRFL", "Est_SRFR", "Est_SRRL", "Est_SRRR",
+        "Est_SRFL",
+        "Est_SRFR",
+        "Est_SRRL",
+        "Est_SRRR",
     ]
     d = _from_df(df, cols)
     d["time"] = d["TimeStamp"] - d["TimeStamp"][0]
@@ -490,12 +497,22 @@ def _prepare_arrays_from_csv() -> dict[str, np.ndarray]:
     header = pl.read_csv(CSV_PATH, n_rows=1).columns
     ax_col = _ax_signal(header)
     vx_col = _vx_signal(header)
-    d = _load([
-        "TimeStamp", "laps", "laptime", "Brake", ax_col, vx_col,
-        "RB_Enable",
-        "RB_intensityTarget",
-        "Est_SRFL", "Est_SRFR", "Est_SRRL", "Est_SRRR",
-    ])
+    d = _load(
+        [
+            "TimeStamp",
+            "laps",
+            "laptime",
+            "Brake",
+            ax_col,
+            vx_col,
+            "RB_Enable",
+            "RB_intensityTarget",
+            "Est_SRFL",
+            "Est_SRFR",
+            "Est_SRRL",
+            "Est_SRRR",
+        ]
+    )
     d["time"] = d["TimeStamp"] - d["TimeStamp"][0]
     d["ax"] = d.pop(ax_col)
     d["vx"] = d.pop(vx_col)
@@ -578,26 +595,26 @@ def _compute_rb(d: dict[str, np.ndarray]) -> dict:
         intensity_mean[i] = np.nanmean(d["RB_intensityTarget"][lrm])
 
     valid_ok = np.isfinite(lt_val) & (rb_samps >= MIN_SAMPLES_PER_LAP) & np.isfinite(sr_mae)
-    table = pl.DataFrame({
-        "Lap": lap_list[valid_ok].astype(int),
-        "LapTime [s]": np.round(lt_val[valid_ok], 3),
-        "Brake samples": brake_samps[valid_ok].astype(int),
-        "RB samples": rb_samps[valid_ok].astype(int),
-        "RB active / brake [%]": np.round(rb_cover[valid_ok] * 100.0, 2),
-        "SR MAE": np.round(sr_mae[valid_ok], 4),
-        "SR Bias": np.round(sr_bias[valid_ok], 4),
-        "In target [%]": np.round(in_target_pct[valid_ok], 2),
-        "Overslip [%]": np.round(overslip_pct[valid_ok], 2),
-        "Underslip [%]": np.round(underslip_pct[valid_ok], 2),
-        "RB intensity target": np.round(intensity_mean[valid_ok], 3),
-    })
+    table = pl.DataFrame(
+        {
+            "Lap": lap_list[valid_ok].astype(int),
+            "LapTime [s]": np.round(lt_val[valid_ok], 3),
+            "Brake samples": brake_samps[valid_ok].astype(int),
+            "RB samples": rb_samps[valid_ok].astype(int),
+            "RB active / brake [%]": np.round(rb_cover[valid_ok] * 100.0, 2),
+            "SR MAE": np.round(sr_mae[valid_ok], 4),
+            "SR Bias": np.round(sr_bias[valid_ok], 4),
+            "In target [%]": np.round(in_target_pct[valid_ok], 2),
+            "Overslip [%]": np.round(overslip_pct[valid_ok], 2),
+            "Underslip [%]": np.round(underslip_pct[valid_ok], 2),
+            "RB intensity target": np.round(intensity_mean[valid_ok], 3),
+        }
+    )
 
     warnings: list[str] = []
     notes: list[str] = []
     if not use_rb_enable and np.any(brake_mask):
-        notes.append(
-            "RB KPIs inferred from braking phases because `RB_Enable` is always 0.0."
-        )
+        notes.append("RB KPIs inferred from braking phases because `RB_Enable` is always 0.0.")
     if not valid_ok.any():
         if not np.any(brake_mask):
             warnings.append(
@@ -641,12 +658,23 @@ def _prepare_braking_regen_arrays(df: pl.DataFrame) -> dict[str, np.ndarray]:
     damper_cols = [f"Damp{wheel}" for wheel in WHEELS]
 
     required = [
-        "TimeStamp", "laps", "laptime", "Brake", ax_col, vx_col,
-        "Vbat", "Current", "RB_intensityTarget",
-        "Est_SRFL", "Est_SRFR", "Est_SRRL", "Est_SRRR",
+        "TimeStamp",
+        "laps",
+        "laptime",
+        "Brake",
+        ax_col,
+        vx_col,
+        "Vbat",
+        "Current",
+        "RB_intensityTarget",
+        "Est_SRFL",
+        "Est_SRFR",
+        "Est_SRRL",
+        "Est_SRRR",
     ]
     optional = [
-        "dist_km", "steering_actualPosRad",
+        "dist_km",
+        "steering_actualPosRad",
         *MASTER_TORQUE_COLS.values(),
         *ACTUAL_TORQUE_COLS.values(),
         *wheel_speed_cols,
@@ -743,10 +771,7 @@ def _braking_regen_analysis(
 
     raw_brake = (d["Brake"] >= BRAKE_THRESHOLD) & (speed_ms >= MIN_SPEED)
     brake_event_mask = keep_min_duration_segments(raw_brake, MIN_EVENT_DURATION, dt_s)
-    braking_response_mask = (
-        brake_event_mask
-        & (decel_ms2 >= max(0.2, -AX_BRAKE_THRESHOLD * 0.5))
-    )
+    braking_response_mask = brake_event_mask & (decel_ms2 >= max(0.2, -AX_BRAKE_THRESHOLD * 0.5))
 
     if not brake_event_mask.any():
         raise ValueError("No valid brake events passed the Brake/vx filter.")
@@ -832,7 +857,13 @@ def _braking_regen_analysis(
         current_error = regen_current_a[seg] - target_current_a[seg]
         if target_m.any():
             current_mae = float(np.nanmean(np.abs(current_error[target_m])))
-            current_near = float(np.mean(np.abs(current_error[target_m]) <= np.maximum(5.0, 0.10 * target_current_a[seg][target_m])) * 100.0)
+            current_near = float(
+                np.mean(
+                    np.abs(current_error[target_m])
+                    <= np.maximum(5.0, 0.10 * target_current_a[seg][target_m])
+                )
+                * 100.0
+            )
         else:
             current_mae = np.nan
             current_near = np.nan
@@ -843,7 +874,7 @@ def _braking_regen_analysis(
             end,
         )
         if is_straight_event:
-            straight_event_mask[start:end + 1] = True
+            straight_event_mask[start : end + 1] = True
         yaw_metrics = _yaw_event_metrics(
             d["yaw_rate"],
             start,
@@ -870,7 +901,9 @@ def _braking_regen_analysis(
             lockup_counts[wheel] = len(_segment_bounds(wheel_lock_mask))
             event_lockups += lockup_counts[wheel]
             wheel_sr = sr[wheel][seg]
-            min_sr_by_wheel[wheel] = float(np.nanmin(wheel_sr)) if np.isfinite(wheel_sr).any() else np.nan
+            min_sr_by_wheel[wheel] = (
+                float(np.nanmin(wheel_sr)) if np.isfinite(wheel_sr).any() else np.nan
+            )
             if lockup_counts[wheel] > 0 and np.isfinite(min_sr_by_wheel[wheel]):
                 event_worst_sr = (
                     min_sr_by_wheel[wheel]
@@ -913,69 +946,77 @@ def _braking_regen_analysis(
             if np.isfinite(val):
                 sr_steady_by_wheel[wheel].append(float(val))
 
-        events.append({
-            "Event": event_id,
-            "Lap": int(round(_safe_median(d["laps"][seg]))),
-            "Start distance [m]": round(float(distance_m[start]), 1),
-            "Duration [s]": round(duration_s, 3),
-            "Distance [m]": round(distance_delta, 1),
-            "Entry speed [m/s]": round(entry_speed, 2),
-            "Exit speed [m/s]": round(exit_speed, 2),
-            "Delta v [m/s]": round(delta_v, 2),
-            "Mean brake [%]": round(_safe_mean(d["Brake"][seg]), 1),
-            "Mean decel [m/s²]": round(_safe_mean(decel_ms2[seg]), 3),
-            "Peak decel [m/s²]": round(float(np.nanmax(decel_ms2[seg])), 3),
-            "Mean Master regen [Nm]": round(_safe_mean(master_regen_nm[seg]), 2),
-            "Mean actual regen [Nm]": round(_safe_mean(actual_regen_nm[seg]), 2),
-            "Recovered [Wh]": round(energy_wh, 3),
-            "Kinetic lost [Wh]": round(kinetic_wh, 3),
-            "Recovery [%]": round(recovery_pct, 2),
-            "Wh/s braking": round(energy_wh / duration_s if duration_s > 1e-9 else np.nan, 3),
-            "Wh/m braking": round(energy_wh / distance_delta if distance_delta > 1e-9 else np.nan, 4),
-            "Wh per m/s": round(energy_wh / delta_v if delta_v > 1e-9 else np.nan, 3),
-            "Front regen share [%]": round(_safe_mean(front_share[seg]) * 100.0, 2),
-            "Current target MAE [A]": round(current_mae, 2),
-            "Current near target [%]": round(current_near, 2),
-            "Delay Master [ms]": round(_first_delay_ms(master_regen_nm, start, end, 2.0, dt_s), 1),
-            "Delay current [ms]": round(_first_delay_ms(regen_current_a, start, end, 2.0, dt_s), 1),
-            "Delay decel [ms]": round(_first_delay_ms(decel_ms2, start, end, 0.5, dt_s), 1),
-            "Straight brake event": bool(is_straight_event),
-            "Yaw straight peak [rad/s]": round(yaw_metrics["Yaw straight peak [rad/s]"], 3),
-            "Yaw straight integral [rad]": round(yaw_metrics["Yaw straight integral [rad]"], 3),
-            "Beta peak [deg]": round(beta_metrics["Beta peak [deg]"], 3),
-            "Front L-R decel asym [m/s²]": round(lr_asym["Front L-R decel asym [m/s²]"], 3),
-            "Rear L-R decel asym [m/s²]": round(lr_asym["Rear L-R decel asym [m/s²]"], 3),
-            "Mean Fz FL [N]": round(mean_fz_event_n["FL"], 2),
-            "Mean Fz FR [N]": round(mean_fz_event_n["FR"], 2),
-            "Mean Fz RL [N]": round(mean_fz_event_n["RL"], 2),
-            "Mean Fz RR [N]": round(mean_fz_event_n["RR"], 2),
-            "Mean |Trq| FL [Nm]": round(mean_trq_event_nm["FL"], 2),
-            "Mean |Trq| FR [Nm]": round(mean_trq_event_nm["FR"], 2),
-            "Mean |Trq| RL [Nm]": round(mean_trq_event_nm["RL"], 2),
-            "Mean |Trq| RR [Nm]": round(mean_trq_event_nm["RR"], 2),
-            "Fz share FL [%]": round(fz_share_event_pct["FL"], 2),
-            "Fz share FR [%]": round(fz_share_event_pct["FR"], 2),
-            "Fz share RL [%]": round(fz_share_event_pct["RL"], 2),
-            "Fz share RR [%]": round(fz_share_event_pct["RR"], 2),
-            "Brake share FL [%]": round(brake_share_event_pct["FL"], 2),
-            "Brake share FR [%]": round(brake_share_event_pct["FR"], 2),
-            "Brake share RL [%]": round(brake_share_event_pct["RL"], 2),
-            "Brake share RR [%]": round(brake_share_event_pct["RR"], 2),
-            "Min SR FL": round(min_sr_by_wheel["FL"], 3),
-            "Min SR FR": round(min_sr_by_wheel["FR"], 3),
-            "Min SR RL": round(min_sr_by_wheel["RL"], 3),
-            "Min SR RR": round(min_sr_by_wheel["RR"], 3),
-            "Lockups": int(event_lockups),
-            "Lockup worst SR": round(event_worst_sr, 3),
-            "Steady SR osc mean [-]": round(steady_metrics["Steady SR osc mean [-]"], 4),
-            "Steady SR osc max [-]": round(steady_metrics["Steady SR osc max [-]"], 4),
-            "Front share mean [%]": round(bias_metrics["Front share mean [%]"], 2),
-            "Fz front share mean [%]": round(bias_metrics["Fz front share mean [%]"], 2),
-            "Front share vs Fz MAE [%]": round(bias_metrics["Front share vs Fz MAE [%]"], 2),
-            "Front share vs Fz bias [%]": round(bias_metrics["Front share vs Fz bias [%]"], 2),
-            "Pitch peak [rad/s]": round(pitch_metrics["Pitch peak [rad/s]"], 3),
-            "Dive asym peak [damper]": round(pitch_metrics["Dive asym peak [damper]"], 3),
-        })
+        events.append(
+            {
+                "Event": event_id,
+                "Lap": int(round(_safe_median(d["laps"][seg]))),
+                "Start distance [m]": round(float(distance_m[start]), 1),
+                "Duration [s]": round(duration_s, 3),
+                "Distance [m]": round(distance_delta, 1),
+                "Entry speed [m/s]": round(entry_speed, 2),
+                "Exit speed [m/s]": round(exit_speed, 2),
+                "Delta v [m/s]": round(delta_v, 2),
+                "Mean brake [%]": round(_safe_mean(d["Brake"][seg]), 1),
+                "Mean decel [m/s²]": round(_safe_mean(decel_ms2[seg]), 3),
+                "Peak decel [m/s²]": round(float(np.nanmax(decel_ms2[seg])), 3),
+                "Mean Master regen [Nm]": round(_safe_mean(master_regen_nm[seg]), 2),
+                "Mean actual regen [Nm]": round(_safe_mean(actual_regen_nm[seg]), 2),
+                "Recovered [Wh]": round(energy_wh, 3),
+                "Kinetic lost [Wh]": round(kinetic_wh, 3),
+                "Recovery [%]": round(recovery_pct, 2),
+                "Wh/s braking": round(energy_wh / duration_s if duration_s > 1e-9 else np.nan, 3),
+                "Wh/m braking": round(
+                    energy_wh / distance_delta if distance_delta > 1e-9 else np.nan, 4
+                ),
+                "Wh per m/s": round(energy_wh / delta_v if delta_v > 1e-9 else np.nan, 3),
+                "Front regen share [%]": round(_safe_mean(front_share[seg]) * 100.0, 2),
+                "Current target MAE [A]": round(current_mae, 2),
+                "Current near target [%]": round(current_near, 2),
+                "Delay Master [ms]": round(
+                    _first_delay_ms(master_regen_nm, start, end, 2.0, dt_s), 1
+                ),
+                "Delay current [ms]": round(
+                    _first_delay_ms(regen_current_a, start, end, 2.0, dt_s), 1
+                ),
+                "Delay decel [ms]": round(_first_delay_ms(decel_ms2, start, end, 0.5, dt_s), 1),
+                "Straight brake event": bool(is_straight_event),
+                "Yaw straight peak [rad/s]": round(yaw_metrics["Yaw straight peak [rad/s]"], 3),
+                "Yaw straight integral [rad]": round(yaw_metrics["Yaw straight integral [rad]"], 3),
+                "Beta peak [deg]": round(beta_metrics["Beta peak [deg]"], 3),
+                "Front L-R decel asym [m/s²]": round(lr_asym["Front L-R decel asym [m/s²]"], 3),
+                "Rear L-R decel asym [m/s²]": round(lr_asym["Rear L-R decel asym [m/s²]"], 3),
+                "Mean Fz FL [N]": round(mean_fz_event_n["FL"], 2),
+                "Mean Fz FR [N]": round(mean_fz_event_n["FR"], 2),
+                "Mean Fz RL [N]": round(mean_fz_event_n["RL"], 2),
+                "Mean Fz RR [N]": round(mean_fz_event_n["RR"], 2),
+                "Mean |Trq| FL [Nm]": round(mean_trq_event_nm["FL"], 2),
+                "Mean |Trq| FR [Nm]": round(mean_trq_event_nm["FR"], 2),
+                "Mean |Trq| RL [Nm]": round(mean_trq_event_nm["RL"], 2),
+                "Mean |Trq| RR [Nm]": round(mean_trq_event_nm["RR"], 2),
+                "Fz share FL [%]": round(fz_share_event_pct["FL"], 2),
+                "Fz share FR [%]": round(fz_share_event_pct["FR"], 2),
+                "Fz share RL [%]": round(fz_share_event_pct["RL"], 2),
+                "Fz share RR [%]": round(fz_share_event_pct["RR"], 2),
+                "Brake share FL [%]": round(brake_share_event_pct["FL"], 2),
+                "Brake share FR [%]": round(brake_share_event_pct["FR"], 2),
+                "Brake share RL [%]": round(brake_share_event_pct["RL"], 2),
+                "Brake share RR [%]": round(brake_share_event_pct["RR"], 2),
+                "Min SR FL": round(min_sr_by_wheel["FL"], 3),
+                "Min SR FR": round(min_sr_by_wheel["FR"], 3),
+                "Min SR RL": round(min_sr_by_wheel["RL"], 3),
+                "Min SR RR": round(min_sr_by_wheel["RR"], 3),
+                "Lockups": int(event_lockups),
+                "Lockup worst SR": round(event_worst_sr, 3),
+                "Steady SR osc mean [-]": round(steady_metrics["Steady SR osc mean [-]"], 4),
+                "Steady SR osc max [-]": round(steady_metrics["Steady SR osc max [-]"], 4),
+                "Front share mean [%]": round(bias_metrics["Front share mean [%]"], 2),
+                "Fz front share mean [%]": round(bias_metrics["Fz front share mean [%]"], 2),
+                "Front share vs Fz MAE [%]": round(bias_metrics["Front share vs Fz MAE [%]"], 2),
+                "Front share vs Fz bias [%]": round(bias_metrics["Front share vs Fz bias [%]"], 2),
+                "Pitch peak [rad/s]": round(pitch_metrics["Pitch peak [rad/s]"], 3),
+                "Dive asym peak [damper]": round(pitch_metrics["Dive asym peak [damper]"], 3),
+            }
+        )
 
     table = pl.DataFrame(events) if events else pl.DataFrame()
     if table.is_empty():
@@ -983,7 +1024,9 @@ def _braking_regen_analysis(
 
     response = braking_response_mask & np.isfinite(master_regen_nm) & (master_regen_nm > 1.0)
     target_mask = brake_event_mask & np.isfinite(target_current_a) & (target_current_a > 1.0)
-    high_demand = brake_event_mask & (master_regen_nm >= np.nanpercentile(master_regen_nm[brake_event_mask], 75))
+    high_demand = brake_event_mask & (
+        master_regen_nm >= np.nanpercentile(master_regen_nm[brake_event_mask], 75)
+    )
     if target_mask.any():
         current_shortfall = high_demand & (regen_current_a < 0.75 * target_current_a)
     else:
@@ -1010,25 +1053,53 @@ def _braking_regen_analysis(
         "event_count": int(table.height),
         "mean_decel_ms2": float(table["Mean decel [m/s²]"].mean()),
         "peak_decel_ms2": float(table["Peak decel [m/s²]"].max()),
-        "brake_decel_gain": _origin_slope(d["Brake"][braking_response_mask], decel_ms2[braking_response_mask]),
-        "brake_decel_corr": _finite_corr(d["Brake"][braking_response_mask], decel_ms2[braking_response_mask]),
+        "brake_decel_gain": _origin_slope(
+            d["Brake"][braking_response_mask], decel_ms2[braking_response_mask]
+        ),
+        "brake_decel_corr": _finite_corr(
+            d["Brake"][braking_response_mask], decel_ms2[braking_response_mask]
+        ),
         "torque_decel_gain": _origin_slope(master_regen_nm[response], decel_ms2[response]),
         "torque_decel_corr": _finite_corr(master_regen_nm[response], decel_ms2[response]),
         "total_recovered_wh": total_recovered_wh,
         "mean_event_recovered_wh": float(table["Recovered [Wh]"].mean()),
-        "recovery_efficiency_pct": 100.0 * total_recovered_wh / total_kinetic_wh if total_kinetic_wh > 1e-9 else np.nan,
-        "regen_density_wh_s": total_recovered_wh / total_duration_s if total_duration_s > 1e-9 else np.nan,
-        "regen_density_wh_m": total_recovered_wh / total_distance_m if total_distance_m > 1e-9 else np.nan,
-        "regen_density_wh_dv": total_recovered_wh / total_delta_v_ms if total_delta_v_ms > 1e-9 else np.nan,
+        "recovery_efficiency_pct": 100.0 * total_recovered_wh / total_kinetic_wh
+        if total_kinetic_wh > 1e-9
+        else np.nan,
+        "regen_density_wh_s": total_recovered_wh / total_duration_s
+        if total_duration_s > 1e-9
+        else np.nan,
+        "regen_density_wh_m": total_recovered_wh / total_distance_m
+        if total_distance_m > 1e-9
+        else np.nan,
+        "regen_density_wh_dv": total_recovered_wh / total_delta_v_ms
+        if total_delta_v_ms > 1e-9
+        else np.nan,
         "front_regen_share_pct": _safe_mean(front_share[brake_event_mask]) * 100.0,
-        "current_target_mae_a": _safe_mean(np.abs(regen_current_a[target_mask] - target_current_a[target_mask])) if target_mask.any() else np.nan,
-        "current_near_target_pct": float(np.mean(np.abs(regen_current_a[target_mask] - target_current_a[target_mask]) <= np.maximum(5.0, 0.10 * target_current_a[target_mask])) * 100.0) if target_mask.any() else np.nan,
-        "acceptance_shortfall_pct": float(np.mean(current_shortfall[brake_event_mask]) * 100.0) if brake_event_mask.any() else np.nan,
+        "current_target_mae_a": _safe_mean(
+            np.abs(regen_current_a[target_mask] - target_current_a[target_mask])
+        )
+        if target_mask.any()
+        else np.nan,
+        "current_near_target_pct": float(
+            np.mean(
+                np.abs(regen_current_a[target_mask] - target_current_a[target_mask])
+                <= np.maximum(5.0, 0.10 * target_current_a[target_mask])
+            )
+            * 100.0
+        )
+        if target_mask.any()
+        else np.nan,
+        "acceptance_shortfall_pct": float(np.mean(current_shortfall[brake_event_mask]) * 100.0)
+        if brake_event_mask.any()
+        else np.nan,
         "delay_master_ms": float(table["Delay Master [ms]"].median()),
         "delay_current_ms": float(table["Delay current [ms]"].median()),
         "delay_decel_ms": float(table["Delay decel [ms]"].median()),
         "yaw_disturbance_p95_radps": _safe_p95(np.abs(d["yaw_rate"][straight_event_mask])),
-        "lr_yaw_corr": _finite_corr(lr_imbalance[straight_event_mask], d["yaw_rate"][straight_event_mask]),
+        "lr_yaw_corr": _finite_corr(
+            lr_imbalance[straight_event_mask], d["yaw_rate"][straight_event_mask]
+        ),
         "yaw_event_max_p95_radps": _safe_p95(yaw_event_peaks_arr),
         "yaw_event_max_worst_radps": _safe_max(yaw_event_peaks_arr),
         "yaw_event_integral_p95_rad": _safe_p95(yaw_event_integrals_arr),
@@ -1084,18 +1155,20 @@ def _braking_regen_analysis(
         mask &= (slip >= -0.7) & (slip <= 0.1)
         if not np.any(mask):
             continue
-        fig_torque_decel.add_trace(go.Scattergl(
-            x=slip[mask],
-            y=decel_ms2[response][mask],
-            mode="markers",
-            name=wheel,
-            marker=dict(
-                color=WHEEL_COLORS[wheel],
-                size=4,
-                opacity=0.45,
-                symbol=WHEEL_SYMBOLS[wheel],
-            ),
-        ))
+        fig_torque_decel.add_trace(
+            go.Scattergl(
+                x=slip[mask],
+                y=decel_ms2[response][mask],
+                mode="markers",
+                name=wheel,
+                marker=dict(
+                    color=WHEEL_COLORS[wheel],
+                    size=4,
+                    opacity=0.45,
+                    symbol=WHEEL_SYMBOLS[wheel],
+                ),
+            )
+        )
     fig_torque_decel.add_vrect(
         x0=SR_TARGET_BRAKE - DELTA_SR,
         x1=SR_TARGET_BRAKE + DELTA_SR,
@@ -1120,33 +1193,37 @@ def _braking_regen_analysis(
         wheel_vals = wheel_table[col].to_numpy()
         wheel_events = wheel_table["Event"].to_numpy()
         wheel_laps = wheel_table["Lap"].to_numpy()
-        fig_min_sr.add_trace(go.Box(
-            x=np.full(wheel_vals.size, wheel),
-            y=wheel_vals,
-            name=wheel,
-            marker=dict(color=WHEEL_COLORS[wheel], size=5, opacity=0.45),
-            line=dict(color=WHEEL_COLORS[wheel]),
-            boxmean=True,
-            boxpoints="all",
-            jitter=0.28,
-            pointpos=0.0,
-            customdata=np.column_stack([wheel_events, wheel_laps]),
-            hovertemplate=(
-                "Wheel %{x}"
-                "<br>Min SR %{y:.3f}"
-                "<br>Event %{customdata[0]:.0f}"
-                "<br>Lap %{customdata[1]:.0f}"
-                "<extra></extra>"
-            ),
-        ))
-    fig_min_sr.add_trace(go.Scatter(
-        x=list(WHEELS),
-        y=[LOCKUP_SR_THRESHOLD] * len(WHEELS),
-        mode="lines",
-        name="Lockup threshold",
-        line=dict(color="rgba(255,255,255,0.65)", dash="dash", width=1.3),
-        hoverinfo="skip",
-    ))
+        fig_min_sr.add_trace(
+            go.Box(
+                x=np.full(wheel_vals.size, wheel),
+                y=wheel_vals,
+                name=wheel,
+                marker=dict(color=WHEEL_COLORS[wheel], size=5, opacity=0.45),
+                line=dict(color=WHEEL_COLORS[wheel]),
+                boxmean=True,
+                boxpoints="all",
+                jitter=0.28,
+                pointpos=0.0,
+                customdata=np.column_stack([wheel_events, wheel_laps]),
+                hovertemplate=(
+                    "Wheel %{x}"
+                    "<br>Min SR %{y:.3f}"
+                    "<br>Event %{customdata[0]:.0f}"
+                    "<br>Lap %{customdata[1]:.0f}"
+                    "<extra></extra>"
+                ),
+            )
+        )
+    fig_min_sr.add_trace(
+        go.Scatter(
+            x=list(WHEELS),
+            y=[LOCKUP_SR_THRESHOLD] * len(WHEELS),
+            mode="lines",
+            name="Lockup threshold",
+            line=dict(color="rgba(255,255,255,0.65)", dash="dash", width=1.3),
+            hoverinfo="skip",
+        )
+    )
 
     x_axis_mode = x_mode if x_mode in ("laps", "laptime") else "laps"
     lock_x, lock_order, lock_xlabel = per_lap_axis(
@@ -1161,31 +1238,35 @@ def _braking_regen_analysis(
     )
     for wheel in WHEELS:
         wheel_vals = lockup_per_lap["lock_time_s_by_wheel"][wheel][lock_order]
-        fig_lock_time.add_trace(go.Scatter(
-            x=lock_x,
-            y=wheel_vals,
-            mode="lines+markers",
-            name=wheel,
-            line=dict(color=WHEEL_COLORS[wheel], width=2.0),
-            marker=dict(
-                color=WHEEL_COLORS[wheel],
-                size=7,
-                symbol=WHEEL_SYMBOLS[wheel],
-            ),
-            customdata=np.column_stack([
-                lockup_per_lap["lap_list"][lock_order],
-                lockup_per_lap["lock_events_by_wheel"][wheel][lock_order],
-            ]),
-            hovertemplate=(
-                f"{wheel}"
-                f"<br>{lock_xlabel} %{{x:.3f}}" if x_axis_mode == "laptime"
-                else f"{wheel}<br>{lock_xlabel} %{{x:.0f}}"
+        fig_lock_time.add_trace(
+            go.Scatter(
+                x=lock_x,
+                y=wheel_vals,
+                mode="lines+markers",
+                name=wheel,
+                line=dict(color=WHEEL_COLORS[wheel], width=2.0),
+                marker=dict(
+                    color=WHEEL_COLORS[wheel],
+                    size=7,
+                    symbol=WHEEL_SYMBOLS[wheel],
+                ),
+                customdata=np.column_stack(
+                    [
+                        lockup_per_lap["lap_list"][lock_order],
+                        lockup_per_lap["lock_events_by_wheel"][wheel][lock_order],
+                    ]
+                ),
+                hovertemplate=(
+                    f"{wheel}<br>{lock_xlabel} %{{x:.3f}}"
+                    if x_axis_mode == "laptime"
+                    else f"{wheel}<br>{lock_xlabel} %{{x:.0f}}"
+                )
+                + "<br>Lock time %{y:.3f} s"
+                + "<br>Lock events %{customdata[1]:.0f}"
+                + "<br>Lap %{customdata[0]:.0f}"
+                + "<extra></extra>",
             )
-            + "<br>Lock time %{y:.3f} s"
-            + "<br>Lock events %{customdata[1]:.0f}"
-            + "<br>Lap %{customdata[0]:.0f}"
-            + "<extra></extra>",
-        ))
+        )
 
     fig_wheel_fz_torque = make_dark_figure(
         title="Braking torque vs vertical load by wheel across braking events",
@@ -1205,46 +1286,49 @@ def _braking_regen_analysis(
         y_vals = wheel_table[y_col].to_numpy()
         finite_fz_vals.append(x_vals)
         finite_trq_vals.append(y_vals)
-        fig_wheel_fz_torque.add_trace(go.Scattergl(
-            x=x_vals,
-            y=y_vals,
-            mode="markers",
-            name=wheel,
-            marker=dict(
-                color=WHEEL_COLORS[wheel],
-                size=7,
-                opacity=0.15,
-            ),
-            showlegend=False,
-            customdata=np.column_stack([
-                wheel_table["Event"].to_numpy(),
-                wheel_table["Lap"].to_numpy(),
-            ]),
-            hovertemplate=(
-                f"{wheel}"
-                "<br>Mean Fz %{x:.1f} N"
-                "<br>Mean |Trq| %{y:.2f} Nm"
-                "<br>Event %{customdata[0]:.0f}"
-                "<br>Lap %{customdata[1]:.0f}"
-                "<extra></extra>"
-            ),
-        ))
+        fig_wheel_fz_torque.add_trace(
+            go.Scattergl(
+                x=x_vals,
+                y=y_vals,
+                mode="markers",
+                name=wheel,
+                marker=dict(
+                    color=WHEEL_COLORS[wheel],
+                    size=7,
+                    opacity=0.15,
+                ),
+                showlegend=False,
+                customdata=np.column_stack(
+                    [
+                        wheel_table["Event"].to_numpy(),
+                        wheel_table["Lap"].to_numpy(),
+                    ]
+                ),
+                hovertemplate=(
+                    f"{wheel}"
+                    "<br>Mean Fz %{x:.1f} N"
+                    "<br>Mean |Trq| %{y:.2f} Nm"
+                    "<br>Event %{customdata[0]:.0f}"
+                    "<br>Lap %{customdata[1]:.0f}"
+                    "<extra></extra>"
+                ),
+            )
+        )
         slope_nm_per_n = _origin_slope(x_vals, y_vals)
         if np.isfinite(slope_nm_per_n):
             x_line_max = float(np.nanmax(x_vals))
-            fig_wheel_fz_torque.add_trace(go.Scatter(
-                x=[0.0, x_line_max],
-                y=[0.0, slope_nm_per_n * x_line_max],
-                mode="lines",
-                name=wheel,
-                line=dict(color=WHEEL_COLORS[wheel], width=2.5),
-                hovertemplate=(
-                    f"{wheel}"
-                    "<br>Fz %{x:.1f} N"
-                    "<br>Fit |Trq| %{y:.2f} Nm"
-                    "<extra></extra>"
-                ),
-            ))
+            fig_wheel_fz_torque.add_trace(
+                go.Scatter(
+                    x=[0.0, x_line_max],
+                    y=[0.0, slope_nm_per_n * x_line_max],
+                    mode="lines",
+                    name=wheel,
+                    line=dict(color=WHEEL_COLORS[wheel], width=2.5),
+                    hovertemplate=(
+                        f"{wheel}<br>Fz %{{x:.1f}} N<br>Fit |Trq| %{{y:.2f}} Nm<extra></extra>"
+                    ),
+                )
+            )
     if finite_fz_vals and finite_trq_vals:
         all_fz_vals = np.concatenate(finite_fz_vals)
         all_trq_vals = np.concatenate(finite_trq_vals)
@@ -1262,17 +1346,24 @@ def _braking_regen_analysis(
         trq_max = float(np.nanmax(all_trq_vals))
         trq_pad = max(1.0, 0.10 * (trq_max - trq_min))
         if np.isfinite(slope_nm_per_n):
-            fig_wheel_fz_torque.add_trace(go.Scatter(
-                x=[0.0, x1],
-                y=[0.0, slope_nm_per_n * x1],
-                mode="lines",
-                name="Fz-proportional reference",
-                line=dict(color="rgba(255,255,255,0.55)", dash="dash", width=1.4),
-                hoverinfo="skip",
-                showlegend=False,
-            ))
+            fig_wheel_fz_torque.add_trace(
+                go.Scatter(
+                    x=[0.0, x1],
+                    y=[0.0, slope_nm_per_n * x1],
+                    mode="lines",
+                    name="Fz-proportional reference",
+                    line=dict(color="rgba(255,255,255,0.55)", dash="dash", width=1.4),
+                    hoverinfo="skip",
+                    showlegend=False,
+                )
+            )
         fig_wheel_fz_torque.update_xaxes(range=[x0, x1])
-        fig_wheel_fz_torque.update_yaxes(range=[0.0, max(trq_max + trq_pad, slope_nm_per_n * x1 if np.isfinite(slope_nm_per_n) else 0.0)])
+        fig_wheel_fz_torque.update_yaxes(
+            range=[
+                0.0,
+                max(trq_max + trq_pad, slope_nm_per_n * x1 if np.isfinite(slope_nm_per_n) else 0.0),
+            ]
+        )
 
     return [fig_torque_decel, fig_min_sr, fig_lock_time, fig_wheel_fz_torque], kpis
 
@@ -1300,6 +1391,7 @@ def main() -> None:
 # Function check  —  is RB delivering SR ≈ −0.20 and recovering energy?
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def rb_function_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
     """Function-level check for Regenerative Braking.
 
@@ -1309,11 +1401,21 @@ def rb_function_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
     df = ensure_complete_laps_df(df)
     ax_col = _ax_signal(df.columns)
     vx_col = _vx_signal(df.columns)
-    needed = ["TimeStamp", "laps", "laptime", "Brake",
-              "Vbat", "Current",
-              "RB_Enable",
-              "Est_SRFL", "Est_SRFR", "Est_SRRL", "Est_SRRR",
-              ax_col, vx_col]
+    needed = [
+        "TimeStamp",
+        "laps",
+        "laptime",
+        "Brake",
+        "Vbat",
+        "Current",
+        "RB_Enable",
+        "Est_SRFL",
+        "Est_SRFR",
+        "Est_SRRL",
+        "Est_SRRR",
+        ax_col,
+        vx_col,
+    ]
     arr = cols_to_numpy(df, needed)
 
     finite = np.all(np.stack([np.isfinite(arr[c]) for c in needed], axis=1), axis=1)
@@ -1354,9 +1456,7 @@ def rb_function_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
     pct_in_target = (
         float(((s_g >= lower_thr) & (s_g <= upper_thr)).mean() * 100.0) if s_g.size else np.nan
     )
-    pct_lockup_risk = (
-        float((s_g < lower_thr).mean() * 100.0) if s_g.size else np.nan
-    )
+    pct_lockup_risk = float((s_g < lower_thr).mean() * 100.0) if s_g.size else np.nan
 
     pct_in_target_w = {}
     for w in WHEELS:
@@ -1382,9 +1482,7 @@ def rb_function_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
             energy_wh.append(0.0)
         lap_ids.append(int(lap))
         n_lap = int(lm.sum())
-        brake_time_pct.append(
-            float(brake_mask[lm].sum() / n_lap * 100.0) if n_lap else np.nan
-        )
+        brake_time_pct.append(float(brake_mask[lm].sum() / n_lap * 100.0) if n_lap else np.nan)
 
     energy_wh_arr = np.array(energy_wh, dtype=float)
     brake_time_pct_arr = np.array(brake_time_pct, dtype=float)
@@ -1407,16 +1505,23 @@ def rb_function_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
         if s.size == 0:
             continue
         s = s[(s >= -0.7) & (s <= 0.3)]
-        fig_hist.add_trace(go.Histogram(
-            x=s, name=w, histnorm="probability density",
-            marker=dict(color=WHEEL_COLORS[w]),
-            opacity=0.55, nbinsx=80,
-        ))
+        fig_hist.add_trace(
+            go.Histogram(
+                x=s,
+                name=w,
+                histnorm="probability density",
+                marker=dict(color=WHEEL_COLORS[w]),
+                opacity=0.55,
+                nbinsx=80,
+            )
+        )
     fig_hist.update_layout(barmode="overlay")
-    fig_hist.add_vrect(x0=lower_thr, x1=upper_thr,
-                       fillcolor="rgba(115, 217, 115, 0.10)", line_width=0)
-    fig_hist.add_vline(x=SR_TARGET_BRAKE,
-                       line=dict(color="rgba(255,255,255,0.6)", dash="dash", width=1.4))
+    fig_hist.add_vrect(
+        x0=lower_thr, x1=upper_thr, fillcolor="rgba(115, 217, 115, 0.10)", line_width=0
+    )
+    fig_hist.add_vline(
+        x=SR_TARGET_BRAKE, line=dict(color="rgba(255,255,255,0.6)", dash="dash", width=1.4)
+    )
 
     # ── Fig 2: Energy recovered vs braking effort, per lap ────────────────────
     fig_brake_vs_energy = make_dark_figure(
@@ -1424,16 +1529,17 @@ def rb_function_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
         xlabel="Time braking [% of lap]",
         ylabel="Energy recovered [Wh]",
     )
-    fig_brake_vs_energy.add_trace(go.Scatter(
-        x=brake_time_pct_arr,
-        y=energy_wh_arr,
-        mode="markers+text",
-        text=[f"L{lid}" for lid in lap_ids],
-        textposition="top center",
-        marker=dict(size=10, color="#73D973",
-                    line=dict(width=1, color="#1A1A1A")),
-        name="Lap",
-    ))
+    fig_brake_vs_energy.add_trace(
+        go.Scatter(
+            x=brake_time_pct_arr,
+            y=energy_wh_arr,
+            mode="markers+text",
+            text=[f"L{lid}" for lid in lap_ids],
+            textposition="top center",
+            marker=dict(size=10, color="#73D973", line=dict(width=1, color="#1A1A1A")),
+            name="Lap",
+        )
+    )
 
     kpis = {
         "pct_in_target": pct_in_target,

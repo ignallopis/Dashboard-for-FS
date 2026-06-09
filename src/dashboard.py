@@ -6,6 +6,7 @@ This is the only file that calls st.plotly_chart() or any other st.* rendering
 functions.  All src/ modules return go.Figure objects (and kpis dicts) and never
 render themselves.
 """
+
 from __future__ import annotations
 
 import base64
@@ -172,6 +173,7 @@ _TELEMETRY_SIGNAL_HEADER_COLS = {"laps", "VN_vx", "VN_latitude", "VN_longitude"}
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
+
 def _file_signature(path: Path) -> FileSignature:
     """Return a cache-busting signature for *path* based on its current stat()."""
     stat = path.stat()
@@ -186,9 +188,8 @@ def _is_telemetry_csv(path: Path) -> bool:
     except OSError:
         return False
     header_cols = set(header)
-    return (
-        _TELEMETRY_REQUIRED_HEADER_COLS.issubset(header_cols)
-        and bool(_TELEMETRY_SIGNAL_HEADER_COLS & header_cols)
+    return _TELEMETRY_REQUIRED_HEADER_COLS.issubset(header_cols) and bool(
+        _TELEMETRY_SIGNAL_HEADER_COLS & header_cols
     )
 
 
@@ -445,15 +446,17 @@ def _add_manual_gate_line_to_fig(
         yref="y",
         line=dict(color="#4DB3F2", width=3),
     )
-    fig.add_trace(go.Scattergl(
-        x=[x0, x1],
-        y=[y0, y1],
-        mode="markers",
-        marker=dict(color="#4DB3F2", size=8, symbol="circle"),
-        name="Manual finish line",
-        hovertemplate="Manual finish line<extra></extra>",
-        showlegend=False,
-    ))
+    fig.add_trace(
+        go.Scattergl(
+            x=[x0, x1],
+            y=[y0, y1],
+            mode="markers",
+            marker=dict(color="#4DB3F2", size=8, symbol="circle"),
+            name="Manual finish line",
+            hovertemplate="Manual finish line<extra></extra>",
+            showlegend=False,
+        )
+    )
     return fig
 
 
@@ -507,36 +510,35 @@ def _add_lap_detection_gates_to_fig(
         color = driver_color(run_name) if multi_run else "#F2F2F2"
         label = f"Lapcount finish · {Path(run_name).stem}" if multi_run else "Lapcount finish"
 
-        fig.add_trace(go.Scattergl(
-            x=gate_lon,
-            y=gate_lat,
-            mode="lines",
-            name=label,
-            line=dict(color=color, width=2.5, dash="dash"),
-            hovertemplate=(
-                f"{label}<br>"
-                f"mode={mode}<br>"
-                f"half width={gate_half_width_m:.1f} m"
-                "<extra></extra>"
-            ),
-        ))
-        fig.add_trace(go.Scattergl(
-            x=[finish_lon],
-            y=[finish_lat],
-            mode="markers",
-            marker=dict(
-                size=10,
-                color=color,
-                symbol="x",
-                line=dict(color="#FFFFFF", width=1.5),
-            ),
-            showlegend=False,
-            hovertemplate=(
-                f"{label} centre"
-                f"<br>lon={finish_lon:.6f}"
-                f"<br>lat={finish_lat:.6f}<extra></extra>"
-            ),
-        ))
+        fig.add_trace(
+            go.Scattergl(
+                x=gate_lon,
+                y=gate_lat,
+                mode="lines",
+                name=label,
+                line=dict(color=color, width=2.5, dash="dash"),
+                hovertemplate=(
+                    f"{label}<br>mode={mode}<br>half width={gate_half_width_m:.1f} m<extra></extra>"
+                ),
+            )
+        )
+        fig.add_trace(
+            go.Scattergl(
+                x=[finish_lon],
+                y=[finish_lat],
+                mode="markers",
+                marker=dict(
+                    size=10,
+                    color=color,
+                    symbol="x",
+                    line=dict(color="#FFFFFF", width=1.5),
+                ),
+                showlegend=False,
+                hovertemplate=(
+                    f"{label} centre<br>lon={finish_lon:.6f}<br>lat={finish_lat:.6f}<extra></extra>"
+                ),
+            )
+        )
     return fig
 
 
@@ -549,7 +551,9 @@ def _render_lap_phase_fullscreen_dialog(
     event_state_key: str,
 ) -> None:
     """Render the Lap Analysis phase map in a large dialog."""
-    st.caption("Click a curve to include/exclude it from Lap Analysis, or draw a line for the finish line.")
+    st.caption(
+        "Click a curve to include/exclude it from Lap Analysis, or draw a line for the finish line."
+    )
     phase_event = tmc.render_track_map_component(
         tmc.serialize_figure(phase_fig),
         height_px=760,
@@ -638,7 +642,9 @@ def _autodetect_laps(data_dir: Path) -> None:
                     # falls back to GPS-based auto-estimation when the gate is
                     # missing or stale.
                     n = lapcount.detect_and_write_laps(
-                        path, mode="skidpad", gate_line_lonlat=persisted_gate,
+                        path,
+                        mode="skidpad",
+                        gate_line_lonlat=persisted_gate,
                     )
                 elif persisted_mode == "acceleration":
                     n = lapcount.detect_and_write_laps(path, mode="acceleration")
@@ -647,7 +653,8 @@ def _autodetect_laps(data_dir: Path) -> None:
                     # manual gate; otherwise auto-fit would silently relocate
                     # the start/finish line on every algorithm version bump.
                     n = lapcount.detect_and_write_laps(
-                        path, gate_line_lonlat=persisted_gate,
+                        path,
+                        gate_line_lonlat=persisted_gate,
                     )
                 else:
                     n = lapcount.detect_and_write_laps(path)
@@ -664,9 +671,7 @@ def _autodetect_laps(data_dir: Path) -> None:
         if n > 0:
             st.sidebar.info(f"`{path.name}`: detected {n} laps ({mode_label})")
         else:
-            st.sidebar.warning(
-                f"`{path.name}`: no laps detected from GPS ({mode_label})"
-            )
+            st.sidebar.warning(f"`{path.name}`: no laps detected from GPS ({mode_label})")
     if modified:
         _clear_data_caches()
 
@@ -691,8 +696,7 @@ def _current_event_mode_label(raw_df: pl.DataFrame | None) -> str:
     return _EVENT_MODE_TO_LABEL.get(str(values[0]).strip().lower(), "Auto")
 
 
-def _fresh_manual_gate_line(
-) -> tuple[tuple[float, float], tuple[float, float]] | None:
+def _fresh_manual_gate_line() -> tuple[tuple[float, float], tuple[float, float]] | None:
     """Return the session manual gate only if it has not been consumed yet.
 
     A single drawn line carries the originating ``event_id`` of the track
@@ -717,13 +721,18 @@ def _mark_manual_gate_consumed() -> None:
         st.session_state["_dyn_manual_gate_consumed_event_id"] = event_id
 
 
-def _stored_gate_line(raw_df: pl.DataFrame | None
-                      ) -> tuple[tuple[float, float], tuple[float, float]] | None:
+def _stored_gate_line(
+    raw_df: pl.DataFrame | None,
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
     """Recover a previously written gate line (lon, lat) from CSV metadata."""
     if raw_df is None:
         return None
-    cols = ("lapcount_gate_lon0_deg", "lapcount_gate_lat0_deg",
-            "lapcount_gate_lon1_deg", "lapcount_gate_lat1_deg")
+    cols = (
+        "lapcount_gate_lon0_deg",
+        "lapcount_gate_lat0_deg",
+        "lapcount_gate_lon1_deg",
+        "lapcount_gate_lat1_deg",
+    )
     if not all(c in raw_df.columns for c in cols):
         return None
     try:
@@ -764,7 +773,9 @@ def _redetect_with_event_mode(
         # no plausible laps.
         try:
             n = lapcount.detect_and_write_laps(
-                str(csv_path), mode="skidpad", gate_line_lonlat=gate_line,
+                str(csv_path),
+                mode="skidpad",
+                gate_line_lonlat=gate_line,
             )
         except Exception as exc:
             return False, f"`{csv_path.name}`: skidpad detection failed — {exc}"
@@ -829,8 +840,8 @@ def _render_event_mode_selector(
                 if gate_line is not None:
                     consumed_fresh_gate = True
             else:
-                st.session_state[f"event_mode_{csv_path.name}"] = (
-                    _current_event_mode_label(raw_dfs.get(csv_path.name))
+                st.session_state[f"event_mode_{csv_path.name}"] = _current_event_mode_label(
+                    raw_dfs.get(csv_path.name)
                 )
     if consumed_fresh_gate:
         _mark_manual_gate_consumed()
@@ -955,7 +966,12 @@ def _style_trace_for_run(
         and "markers" not in mode
     )
 
-    if hasattr(out, "line") and out.line is not None and not is_ideal_share_line and not is_fz_reference_line:
+    if (
+        hasattr(out, "line")
+        and out.line is not None
+        and not is_ideal_share_line
+        and not is_fz_reference_line
+    ):
         out.line.color = trace_color
         if trace_type != "box" and mode != "markers":
             out.line.dash = run_dash if is_wheel_line else dash
@@ -988,20 +1004,11 @@ def _style_trace_for_run(
         and all(isinstance(x_val, str) for x_val in x_vals)
     ):
         out.x = np.full(len(x_vals), run_label)
-    elif (
-        base_name == "Lockup threshold"
-        and getattr(out, "x", None) is not None
-    ):
+    elif base_name == "Lockup threshold" and getattr(out, "x", None) is not None:
         out.x = [f"{run_label} · {str(x)}" for x in out.x]
-    elif (
-        base_name == "Yaw instability threshold"
-        and getattr(out, "x", None) is not None
-    ):
+    elif base_name == "Yaw instability threshold" and getattr(out, "x", None) is not None:
         out.x = [run_label for _ in out.x]
-    elif (
-        base_name == "F/R summary"
-        and getattr(out, "x", None) is not None
-    ):
+    elif base_name == "F/R summary" and getattr(out, "x", None) is not None:
         out.x = [f"{run_label} · FR" for _ in out.x]
     return out
 
@@ -1795,7 +1802,9 @@ def _overlay_figures(figs_by_run: dict[str, list[go.Figure]]) -> list[go.Figure]
                 tickvals = getattr(fig.layout[axis_name], "tickvals", None)
                 if tickvals is None:
                     continue
-                tickvals_by_axis.setdefault(str(axis_name), set()).update(float(v) for v in tickvals)
+                tickvals_by_axis.setdefault(str(axis_name), set()).update(
+                    float(v) for v in tickvals
+                )
 
         for axis_name, tickvals in tickvals_by_axis.items():
             if tickvals:
@@ -1823,9 +1832,7 @@ def _concat_run_tables(run_tables: dict[str, pl.DataFrame]) -> pl.DataFrame:
 def _kpi_column_config(columns) -> dict:
     """Tooltip config for KPI table columns, sourced from METRIC_HELP."""
     return {
-        col: st.column_config.Column(help=METRIC_HELP[col])
-        for col in columns
-        if col in METRIC_HELP
+        col: st.column_config.Column(help=METRIC_HELP[col]) for col in columns if col in METRIC_HELP
     }
 
 
@@ -2368,18 +2375,20 @@ def _render_tc_function_check(dfs: dict[str, pl.DataFrame]) -> None:
             st.warning(f"{detail_name}: TC function check unavailable: {exc}")
             continue
         all_figs[detail_name] = figs
-        rows.append({
-            "Run": Path(detail_name).stem,
-            "Target met": "YES" if kpis["objective_ok"] else "NO",
-            "In target [%]": round(kpis["pct_in_target"], 1),
-            "Median SR": round(kpis["median_sr"], 3),
-            "Target gap [%]": round(kpis["target_gap_pct"], 1),
-            "Failure mode": kpis["failure_mode"],
-            "Too low SR [%]": round(kpis["pct_all_underslip"], 1),
-            "Too high SR [%]": round(kpis["pct_any_overslip"], 1),
-            "TC response [%]": round(kpis["pct_cut_when_overslip"], 1),
-            "Worst wheel": kpis["worst_wheel"],
-        })
+        rows.append(
+            {
+                "Run": Path(detail_name).stem,
+                "Target met": "YES" if kpis["objective_ok"] else "NO",
+                "In target [%]": round(kpis["pct_in_target"], 1),
+                "Median SR": round(kpis["median_sr"], 3),
+                "Target gap [%]": round(kpis["target_gap_pct"], 1),
+                "Failure mode": kpis["failure_mode"],
+                "Too low SR [%]": round(kpis["pct_all_underslip"], 1),
+                "Too high SR [%]": round(kpis["pct_any_overslip"], 1),
+                "TC response [%]": round(kpis["pct_cut_when_overslip"], 1),
+                "Worst wheel": kpis["worst_wheel"],
+            }
+        )
         for note in kpis.get("notes", []):
             st.info(f"{Path(detail_name).stem}: {note}")
     if rows:
@@ -2404,11 +2413,7 @@ def _render_tv_corner_balance(dfs: dict[str, pl.DataFrame]) -> None:
         ref_option = st.session_state.get("drv_corner_ref")
         ref_run: str
         ref_lap: int
-        if (
-            isinstance(ref_option, tuple)
-            and len(ref_option) >= 2
-            and str(ref_option[0]) in dfs
-        ):
+        if isinstance(ref_option, tuple) and len(ref_option) >= 2 and str(ref_option[0]) in dfs:
             ref_run = str(ref_option[0])
             ref_lap = int(ref_option[1])
         else:
@@ -2465,14 +2470,16 @@ def _render_tv_corner_balance(dfs: dict[str, pl.DataFrame]) -> None:
             st.warning(f"{run_name}: {warning}")
         lap_tables[run_name] = kpis["lap_table"]
         turn_tables[run_name] = kpis["turn_table"]
-        rows.append({
-            "Run": Path(run_name).stem,
-            "Corners": int(kpis["corners"]),
-            "Median balance [%]": round(kpis["median_balance_pct"], 1),
-            "Understeer corners [%]": round(kpis["understeer_corners_pct"], 1),
-            "Oversteer corners [%]": round(kpis["oversteer_corners_pct"], 1),
-            "Neutral corners [%]": round(kpis["neutral_corners_pct"], 1),
-        })
+        rows.append(
+            {
+                "Run": Path(run_name).stem,
+                "Corners": int(kpis["corners"]),
+                "Median balance [%]": round(kpis["median_balance_pct"], 1),
+                "Understeer corners [%]": round(kpis["understeer_corners_pct"], 1),
+                "Oversteer corners [%]": round(kpis["oversteer_corners_pct"], 1),
+                "Neutral corners [%]": round(kpis["neutral_corners_pct"], 1),
+            }
+        )
     _show_summary_table(rows)
     for run_name, (figs, _kpis) in run_results.items():
         st.markdown(f"**{Path(run_name).stem}**")
@@ -2487,9 +2494,7 @@ def _render_tv_corner_balance(dfs: dict[str, pl.DataFrame]) -> None:
 def _render_rb_function_check(dfs: dict[str, pl.DataFrame]) -> None:
     st.divider()
     st.subheader("RB — Slip Ratio & Energy Recovery")
-    st.caption(
-        "Is RB holding SR ≈ −0.20 under braking and recovering meaningful energy?"
-    )
+    st.caption("Is RB holding SR ≈ −0.20 under braking and recovering meaningful energy?")
     all_figs: dict[str, list[go.Figure]] = {}
     rows = []
     for run_name, df in dfs.items():
@@ -2499,14 +2504,16 @@ def _render_rb_function_check(dfs: dict[str, pl.DataFrame]) -> None:
             st.warning(f"{run_name}: RB function check unavailable: {exc}")
             continue
         all_figs[run_name] = figs
-        rows.append({
-            "Run": Path(run_name).stem,
-            "In target [%]": round(kpis["pct_in_target"], 1),
-            "Lock-up risk [%]": round(kpis["pct_lockup_risk"], 1),
-            "Recovered total [Wh]": round(kpis["energy_recovered_wh_total"], 1),
-            "Recovered / lap [Wh]": round(kpis["energy_recovered_wh_median_lap"], 1),
-            "Regen coverage [%]": round(kpis["regen_coverage_pct"], 1),
-        })
+        rows.append(
+            {
+                "Run": Path(run_name).stem,
+                "In target [%]": round(kpis["pct_in_target"], 1),
+                "Lock-up risk [%]": round(kpis["pct_lockup_risk"], 1),
+                "Recovered total [Wh]": round(kpis["energy_recovered_wh_total"], 1),
+                "Recovered / lap [Wh]": round(kpis["energy_recovered_wh_median_lap"], 1),
+                "Regen coverage [%]": round(kpis["regen_coverage_pct"], 1),
+            }
+        )
     if rows:
         _show_summary_table(rows)
     for fig in _overlay_figures(all_figs):
@@ -2516,9 +2523,7 @@ def _render_rb_function_check(dfs: dict[str, pl.DataFrame]) -> None:
 def _render_pc_function_check(dfs: dict[str, pl.DataFrame]) -> None:
     st.divider()
     st.subheader("PC — Battery Power Cap")
-    st.caption(
-        "Is P_bat staying under the 80 kW cap and exploiting it near full throttle?"
-    )
+    st.caption("Is P_bat staying under the 80 kW cap and exploiting it near full throttle?")
     all_figs: dict[str, list[go.Figure]] = {}
     rows = []
     for run_name, df in dfs.items():
@@ -2528,16 +2533,17 @@ def _render_pc_function_check(dfs: dict[str, pl.DataFrame]) -> None:
             st.warning(f"{run_name}: PC function check unavailable: {exc}")
             continue
         all_figs[run_name] = [
-            fig for fig in figs
-            if "Battery power vs time" not in (fig.layout.title.text or "")
+            fig for fig in figs if "Battery power vs time" not in (fig.layout.title.text or "")
         ]
-        rows.append({
-            "Run": Path(run_name).stem,
-            "Over cap [%]": round(kpis["pct_over_cap"], 2),
-            "Overshoot events": int(kpis["n_overshoot_events"]),
-            "Peak Pbat [kW]": round(kpis["peak_kw"], 1),
-            "Near cap @ full [%]": round(kpis["pct_near_cap_at_full"], 1),
-        })
+        rows.append(
+            {
+                "Run": Path(run_name).stem,
+                "Over cap [%]": round(kpis["pct_over_cap"], 2),
+                "Overshoot events": int(kpis["n_overshoot_events"]),
+                "Peak Pbat [kW]": round(kpis["peak_kw"], 1),
+                "Near cap @ full [%]": round(kpis["pct_near_cap_at_full"], 1),
+            }
+        )
     if rows:
         _show_summary_table(rows)
     for fig in _overlay_figures(all_figs):
@@ -2572,17 +2578,20 @@ def _render_endurance_projection(dfs: dict[str, pl.DataFrame], pt_x_mode: str) -
         single_tok = _run_cache_tokens({run_name: df})
         try:
             _f, energy_by_run[run_name] = _pt_energy_per_lap_fig_cached(
-                {run_name: df}, single_tok, pt_x_mode)
+                {run_name: df}, single_tok, pt_x_mode
+            )
         except Exception:
             energy_by_run[run_name] = {}
         try:
             _f, battery_by_run[run_name] = _pt_battery_status_fig_cached(
-                {run_name: df}, single_tok, pt_x_mode)
+                {run_name: df}, single_tok, pt_x_mode
+            )
         except Exception:
             battery_by_run[run_name] = {}
         try:
             _f, thermal_by_run[run_name] = _pt_thermal_evolution_fig_cached(
-                {run_name: df}, single_tok, "laps")
+                {run_name: df}, single_tok, "laps"
+            )
         except Exception:
             thermal_by_run[run_name] = {}
 
@@ -2612,12 +2621,17 @@ def _render_endurance_projection(dfs: dict[str, pl.DataFrame], pt_x_mode: str) -
     observed_max = max((r["laps_done"] for r in runs_for_proj.values()), default=1) or 1
     pc1, pc2 = st.columns(2)
     target_laps = pc1.number_input(
-        "Target laps (endurance)", min_value=1, value=int(observed_max), step=1,
+        "Target laps (endurance)",
+        min_value=1,
+        value=int(observed_max),
+        step=1,
         help="Full endurance lap target. Default = laps logged in the run.",
     )
     usable_pack_kwh = pc2.number_input(
-        "Usable pack energy [kWh]", min_value=0.1,
-        value=float(pt.ACCUMULATOR_USABLE_KWH_DEFAULT), step=0.1,
+        "Usable pack energy [kWh]",
+        min_value=0.1,
+        value=float(pt.ACCUMULATOR_USABLE_KWH_DEFAULT),
+        step=0.1,
         help="Accumulator usable energy — set per car (placeholder default).",
     )
 
@@ -2628,15 +2642,18 @@ def _render_endurance_projection(dfs: dict[str, pl.DataFrame], pt_x_mode: str) -
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Finish verdict", _VERDICT_BADGE.get(proj["verdict"], proj["verdict"]))
         c2.metric(
-            "Projected SoC at flag", f"{_fmt(proj['soc_projected_end'], '.1f')}%",
+            "Projected SoC at flag",
+            f"{_fmt(proj['soc_projected_end'], '.1f')}%",
             help="Current SoC − SoC-drop/lap × remaining laps. <0 = runs out early.",
         )
         c3.metric(
-            "Energy margin", f"{_fmt(proj['energy_margin_kwh'], '+.2f')} kWh",
+            "Energy margin",
+            f"{_fmt(proj['energy_margin_kwh'], '+.2f')} kWh",
             help="Usable pack − projected total (kWh/lap × target laps).",
         )
         c4.metric(
-            "Lift & coast needed", f"{_fmt(proj['liftcoast_required_pct'], '.1f')}%",
+            "Lift & coast needed",
+            f"{_fmt(proj['liftcoast_required_pct'], '.1f')}%",
             help="Per-lap energy cut required to fit the pack budget (0 = none).",
         )
         c5, c6, c7, c8 = st.columns(4)
@@ -2656,15 +2673,18 @@ def _render_endurance_projection(dfs: dict[str, pl.DataFrame], pt_x_mode: str) -
             t1, t2, t3, t4 = st.columns(4)
             t1.metric("Motor peak P95", f"{_fmt(th['motor_peak_c'], '.0f')} °C")
             t2.metric(
-                "Motor headroom", f"{_fmt(th['motor_headroom_c'], '.0f')} °C",
+                "Motor headroom",
+                f"{_fmt(th['motor_headroom_c'], '.0f')} °C",
                 help=f"Margin to OT limit {pt.MOTOR_OT_LIMIT_C:.0f} °C.",
             )
             t3.metric(
-                "Inverter headroom", f"{_fmt(th['inverter_headroom_c'], '.0f')} °C",
+                "Inverter headroom",
+                f"{_fmt(th['inverter_headroom_c'], '.0f')} °C",
                 help=f"Margin to OT limit {pt.INVERTER_OT_LIMIT_C:.0f} °C.",
             )
             t4.metric(
-                "Motor @ flag (proj)", f"{_fmt(th['motor_projected_end_c'], '.0f')} °C",
+                "Motor @ flag (proj)",
+                f"{_fmt(th['motor_projected_end_c'], '.0f')} °C",
                 help="Motor P95 projected forward by its thermal slope to the target lap.",
             )
             st.caption(
@@ -2687,8 +2707,7 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
     # ── Energy ───────────────────────────────────────────────────────────────
     st.subheader("Energy per Lap")
     st.caption(
-        "Net battery energy per lap (consumed − recovered). "
-        "Stable bars = consistent driving."
+        "Net battery energy per lap (consumed − recovered). Stable bars = consistent driving."
     )
     energy_x_mode = pt_x_mode
     try:
@@ -2697,8 +2716,8 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
             for w in kpis.get("warnings", []):
                 st.warning(w)
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Mean net / lap",     f"{kpis['e_mean']:.4f} kWh")
-            c2.metric("Total net",          f"{kpis['e_total']:.3f} kWh")
+            c1.metric("Mean net / lap", f"{kpis['e_mean']:.4f} kWh")
+            c2.metric("Total net", f"{kpis['e_total']:.3f} kWh")
             c3.metric("Coefficient of Variation", f"{kpis['cv']:.1f}%")
             c4.metric(
                 f"R² (Enet vs {'laptime' if energy_x_mode == 'laptime' else 'lap'})",
@@ -2706,14 +2725,14 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
             )
             c5, c6, c7, c8 = st.columns(4)
             c5.metric("Mean battery power", f"{kpis['p_mean']:.1f} kW")
-            c6.metric("Consumed / lap",     f"{kpis['e_cons_mean']:.4f} kWh")
-            c7.metric("Recovered / lap",    f"{kpis['e_rec_mean']:.4f} kWh")
-            c8.metric("Fastest lap",        f"L{kpis['fastest_lap']} — {kpis['fastest_lt']:.2f} s")
+            c6.metric("Consumed / lap", f"{kpis['e_cons_mean']:.4f} kWh")
+            c7.metric("Recovered / lap", f"{kpis['e_rec_mean']:.4f} kWh")
+            c8.metric("Fastest lap", f"L{kpis['fastest_lap']} — {kpis['fastest_lt']:.2f} s")
             c9, c10, c11, c12 = st.columns(4)
-            c9.metric("Total consumed",     f"{kpis['e_cons_total']:.3f} kWh")
-            c10.metric("Total recovered",   f"{kpis['e_rec_total']:.3f} kWh")
-            c11.metric("Min net lap",       f"L{kpis['min_e_lap']} — {kpis['min_e']:.4f} kWh")
-            c12.metric("Max net lap",       f"L{kpis['max_e_lap']} — {kpis['max_e']:.4f} kWh")
+            c9.metric("Total consumed", f"{kpis['e_cons_total']:.3f} kWh")
+            c10.metric("Total recovered", f"{kpis['e_rec_total']:.3f} kWh")
+            c11.metric("Min net lap", f"L{kpis['min_e_lap']} — {kpis['min_e']:.4f} kWh")
+            c12.metric("Max net lap", f"L{kpis['max_e_lap']} — {kpis['max_e']:.4f} kWh")
             _plotly_chart(fig, use_container_width=True, theme=None)
             with st.expander("Per-lap data"):
                 st.dataframe(kpis["table"], use_container_width=True, hide_index=True)
@@ -2729,27 +2748,33 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
             for _run_name, (_fig, kpis) in run_results.items():
                 for w in kpis.get("warnings", []):
                     st.warning(w)
-            _show_summary_table([
-                {
-                    "Run": run_name,
-                    "Mean net / lap [kWh]": round(kpis["e_mean"], 4),
-                    "Total net [kWh]": round(kpis["e_total"], 3),
-                    "Consumed / lap [kWh]": round(kpis["e_cons_mean"], 4),
-                    "Recovered / lap [kWh]": round(kpis["e_rec_mean"], 4),
-                    "Mean battery power [kW]": round(kpis["p_mean"], 1),
-                    "Fastest lap": int(kpis["fastest_lap"]),
-                    "Fastest lt [s]": round(kpis["fastest_lt"], 2),
-                }
-                for run_name, (_fig, kpis) in run_results.items()
-            ])
+            _show_summary_table(
+                [
+                    {
+                        "Run": run_name,
+                        "Mean net / lap [kWh]": round(kpis["e_mean"], 4),
+                        "Total net [kWh]": round(kpis["e_total"], 3),
+                        "Consumed / lap [kWh]": round(kpis["e_cons_mean"], 4),
+                        "Recovered / lap [kWh]": round(kpis["e_rec_mean"], 4),
+                        "Mean battery power [kW]": round(kpis["p_mean"], 1),
+                        "Fastest lap": int(kpis["fastest_lap"]),
+                        "Fastest lt [s]": round(kpis["fastest_lt"], 2),
+                    }
+                    for run_name, (_fig, kpis) in run_results.items()
+                ]
+            )
             _plotly_chart(
-                _overlay_figures({run_name: [fig] for run_name, (fig, _kpis) in run_results.items()})[0],
+                _overlay_figures(
+                    {run_name: [fig] for run_name, (fig, _kpis) in run_results.items()}
+                )[0],
                 use_container_width=True,
                 theme=None,
             )
             with st.expander("Per-lap data"):
                 st.dataframe(
-                    _concat_run_tables({run_name: kpis["table"] for run_name, (_fig, kpis) in run_results.items()}),
+                    _concat_run_tables(
+                        {run_name: kpis["table"] for run_name, (_fig, kpis) in run_results.items()}
+                    ),
                     use_container_width=True,
                     hide_index=True,
                 )
@@ -2761,8 +2786,7 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
     # ── Power per wheel ───────────────────────────────────────────────────────
     st.subheader("Power Distribution per Wheel")
     st.caption(
-        "Mean motor power per wheel. Front/Rear and Left/Right splits "
-        "highlight asymmetries."
+        "Mean motor power per wheel. Front/Rear and Left/Right splits highlight asymmetries."
     )
     power_x_mode = pt_x_mode
     try:
@@ -2772,15 +2796,11 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
                 st.warning(w)
             c1, c2, c3 = st.columns(3)
             c1.metric("Mean total power", f"{kpis['mean_total_kw']:.1f} kW")
-            c2.metric("Front / Rear",
-                      f"{kpis['fr_pct']:.1f}% / {100 - kpis['fr_pct']:.1f}%")
-            c3.metric("Left / Right",
-                      f"{kpis['lr_pct']:.1f}% / {100 - kpis['lr_pct']:.1f}%")
+            c2.metric("Front / Rear", f"{kpis['fr_pct']:.1f}% / {100 - kpis['fr_pct']:.1f}%")
+            c3.metric("Left / Right", f"{kpis['lr_pct']:.1f}% / {100 - kpis['lr_pct']:.1f}%")
             c4, c5, c6, c7 = st.columns(4)
             for w, col in zip(("FL", "FR", "RL", "RR"), [c4, c5, c6, c7]):
-                col.metric(w,
-                           f"{kpis['wheel_mean_kw'][w]:.2f} kW"
-                           f"  ({kpis['wheel_pct'][w]:.1f}%)")
+                col.metric(w, f"{kpis['wheel_mean_kw'][w]:.2f} kW  ({kpis['wheel_pct'][w]:.1f}%)")
             _plotly_chart(fig, use_container_width=True, theme=None)
             with st.expander("Per-lap data"):
                 st.dataframe(kpis["table"], use_container_width=True, hide_index=True)
@@ -2796,27 +2816,33 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
             for _run_name, (_fig, kpis) in run_results.items():
                 for w in kpis.get("warnings", []):
                     st.warning(w)
-            _show_summary_table([
-                {
-                    "Run": run_name,
-                    "Mean total power [kW]": round(kpis["mean_total_kw"], 1),
-                    "Front share [%]": round(kpis["fr_pct"], 1),
-                    "Left share [%]": round(kpis["lr_pct"], 1),
-                    "FL [kW]": round(kpis["wheel_mean_kw"]["FL"], 2),
-                    "FR [kW]": round(kpis["wheel_mean_kw"]["FR"], 2),
-                    "RL [kW]": round(kpis["wheel_mean_kw"]["RL"], 2),
-                    "RR [kW]": round(kpis["wheel_mean_kw"]["RR"], 2),
-                }
-                for run_name, (_fig, kpis) in run_results.items()
-            ])
+            _show_summary_table(
+                [
+                    {
+                        "Run": run_name,
+                        "Mean total power [kW]": round(kpis["mean_total_kw"], 1),
+                        "Front share [%]": round(kpis["fr_pct"], 1),
+                        "Left share [%]": round(kpis["lr_pct"], 1),
+                        "FL [kW]": round(kpis["wheel_mean_kw"]["FL"], 2),
+                        "FR [kW]": round(kpis["wheel_mean_kw"]["FR"], 2),
+                        "RL [kW]": round(kpis["wheel_mean_kw"]["RL"], 2),
+                        "RR [kW]": round(kpis["wheel_mean_kw"]["RR"], 2),
+                    }
+                    for run_name, (_fig, kpis) in run_results.items()
+                ]
+            )
             _plotly_chart(
-                _overlay_figures({run_name: [fig] for run_name, (fig, _kpis) in run_results.items()})[0],
+                _overlay_figures(
+                    {run_name: [fig] for run_name, (fig, _kpis) in run_results.items()}
+                )[0],
                 use_container_width=True,
                 theme=None,
             )
             with st.expander("Per-lap data"):
                 st.dataframe(
-                    _concat_run_tables({run_name: kpis["table"] for run_name, (_fig, kpis) in run_results.items()}),
+                    _concat_run_tables(
+                        {run_name: kpis["table"] for run_name, (_fig, kpis) in run_results.items()}
+                    ),
                     use_container_width=True,
                     hide_index=True,
                 )
@@ -2835,16 +2861,23 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
             for w in kpis.get("warnings", []):
                 st.warning(w)
             c1, c2, c3 = st.columns(3)
-            c1.metric("SoC start",         f"{_fmt(kpis['soc_start'], '.1f')}%")
-            c2.metric("SoC end",           f"{_fmt(kpis['soc_end'], '.1f')}%",
-                      delta=(f"-{_fmt(kpis['soc_total_drop'], '.1f')}%" if np.isfinite(kpis["soc_total_drop"]) else None))
-            c3.metric("Voltage sag",        f"{kpis['voltage_sag']:.1f} V")
+            c1.metric("SoC start", f"{_fmt(kpis['soc_start'], '.1f')}%")
+            c2.metric(
+                "SoC end",
+                f"{_fmt(kpis['soc_end'], '.1f')}%",
+                delta=(
+                    f"-{_fmt(kpis['soc_total_drop'], '.1f')}%"
+                    if np.isfinite(kpis["soc_total_drop"])
+                    else None
+                ),
+            )
+            c3.metric("Voltage sag", f"{kpis['voltage_sag']:.1f} V")
             c4, c5, c6 = st.columns(3)
             c4.metric("Mean SoC drop / lap", f"{kpis['soc_drop_per_lap']:.2f}%")
-            c5.metric("Mean voltage",        f"{kpis['mean_voltage']:.1f} V")
-            c6.metric("Min voltage",         f"{kpis['min_voltage']:.1f} V")
+            c5.metric("Mean voltage", f"{kpis['mean_voltage']:.1f} V")
+            c6.metric("Min voltage", f"{kpis['min_voltage']:.1f} V")
             c7 = st.columns(1)[0]
-            c7.metric("Mean current",        f"{kpis['mean_current']:.1f} A")
+            c7.metric("Mean current", f"{kpis['mean_current']:.1f} A")
             _plotly_chart(fig, use_container_width=True, theme=None)
             with st.expander("Per-lap data"):
                 st.dataframe(kpis["table"], use_container_width=True, hide_index=True)
@@ -2860,25 +2893,31 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
             for _run_name, (_fig, kpis) in run_results.items():
                 for w in kpis.get("warnings", []):
                     st.warning(w)
-            _show_summary_table([
-                {
-                    "Run": run_name,
-                    "Mean dSoC / lap [%]": round(kpis["soc_drop_per_lap"], 2),
-                    "Voltage sag [V]": round(kpis["voltage_sag"], 1),
-                    "Mean voltage [V]": round(kpis["mean_voltage"], 1),
-                    "Min voltage [V]": round(kpis["min_voltage"], 1),
-                    "Mean current [A]": round(kpis["mean_current"], 1),
-                }
-                for run_name, (_fig, kpis) in run_results.items()
-            ])
+            _show_summary_table(
+                [
+                    {
+                        "Run": run_name,
+                        "Mean dSoC / lap [%]": round(kpis["soc_drop_per_lap"], 2),
+                        "Voltage sag [V]": round(kpis["voltage_sag"], 1),
+                        "Mean voltage [V]": round(kpis["mean_voltage"], 1),
+                        "Min voltage [V]": round(kpis["min_voltage"], 1),
+                        "Mean current [A]": round(kpis["mean_current"], 1),
+                    }
+                    for run_name, (_fig, kpis) in run_results.items()
+                ]
+            )
             _plotly_chart(
-                _overlay_figures({run_name: [fig] for run_name, (fig, _kpis) in run_results.items()})[0],
+                _overlay_figures(
+                    {run_name: [fig] for run_name, (fig, _kpis) in run_results.items()}
+                )[0],
                 use_container_width=True,
                 theme=None,
             )
             with st.expander("Per-lap data"):
                 st.dataframe(
-                    _concat_run_tables({run_name: kpis["table"] for run_name, (_fig, kpis) in run_results.items()}),
+                    _concat_run_tables(
+                        {run_name: kpis["table"] for run_name, (_fig, kpis) in run_results.items()}
+                    ),
                     use_container_width=True,
                     hide_index=True,
                 )
@@ -2900,14 +2939,13 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
             for w in kpis.get("warnings", []):
                 st.warning(w)
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Peak motor (P95)",    f"{kpis['peak_motor']:.1f} °C")
+            c1.metric("Peak motor (P95)", f"{kpis['peak_motor']:.1f} °C")
             c2.metric("Peak inverter (P95)", f"{kpis['peak_inverter']:.1f} °C")
-            c3.metric("Peak battery Tmax",   f"{kpis['peak_batt_tmax']:.1f} °C")
+            c3.metric("Peak battery Tmax", f"{kpis['peak_batt_tmax']:.1f} °C")
             c4.metric("Motor thermal slope", f"{kpis['motor_thermal_slope']:+.2f} °C/lap")
             c5, c6, c7, c8 = st.columns(4)
             for w, col in zip(("FL", "FR", "RL", "RR"), [c5, c6, c7, c8]):
-                col.metric(f"Motor {w} peak",
-                           f"{kpis['motor_peak_by_wheel'][w]:.1f} °C")
+                col.metric(f"Motor {w} peak", f"{kpis['motor_peak_by_wheel'][w]:.1f} °C")
             _plotly_chart(fig, use_container_width=True, theme=None)
             with st.expander("Per-lap data"):
                 st.dataframe(kpis["table"], use_container_width=True, hide_index=True)
@@ -2923,24 +2961,30 @@ def _tab_powertrain(dfs: dict[str, pl.DataFrame]) -> None:
             for _run_name, (_fig, kpis) in run_results.items():
                 for w in kpis.get("warnings", []):
                     st.warning(w)
-            _show_summary_table([
-                {
-                    "Run": run_name,
-                    "Peak motor [°C]": round(kpis["peak_motor"], 1),
-                    "Peak inverter [°C]": round(kpis["peak_inverter"], 1),
-                    "Peak batt Tmax [°C]": round(kpis["peak_batt_tmax"], 1),
-                    "Motor slope [°C/lap]": round(kpis["motor_thermal_slope"], 2),
-                }
-                for run_name, (_fig, kpis) in run_results.items()
-            ])
+            _show_summary_table(
+                [
+                    {
+                        "Run": run_name,
+                        "Peak motor [°C]": round(kpis["peak_motor"], 1),
+                        "Peak inverter [°C]": round(kpis["peak_inverter"], 1),
+                        "Peak batt Tmax [°C]": round(kpis["peak_batt_tmax"], 1),
+                        "Motor slope [°C/lap]": round(kpis["motor_thermal_slope"], 2),
+                    }
+                    for run_name, (_fig, kpis) in run_results.items()
+                ]
+            )
             _plotly_chart(
-                _overlay_figures({run_name: [fig] for run_name, (fig, _kpis) in run_results.items()})[0],
+                _overlay_figures(
+                    {run_name: [fig] for run_name, (fig, _kpis) in run_results.items()}
+                )[0],
                 use_container_width=True,
                 theme=None,
             )
             with st.expander("Per-lap data"):
                 st.dataframe(
-                    _concat_run_tables({run_name: kpis["table"] for run_name, (_fig, kpis) in run_results.items()}),
+                    _concat_run_tables(
+                        {run_name: kpis["table"] for run_name, (_fig, kpis) in run_results.items()}
+                    ),
                     use_container_width=True,
                     hide_index=True,
                 )
@@ -2981,8 +3025,7 @@ def _tab_dynamics(dfs: dict[str, pl.DataFrame]) -> None:
 
 def _tab_events(dfs: dict[str, pl.DataFrame]) -> None:
     any_event_run = any(
-        accel.is_acceleration_run(df) or skidpad.is_skidpad_run(df)
-        for df in dfs.values()
+        accel.is_acceleration_run(df) or skidpad.is_skidpad_run(df) for df in dfs.values()
     )
     if not any_event_run:
         st.info(
@@ -3017,65 +3060,102 @@ def _filter_acceleration_mode_df(df: pl.DataFrame) -> pl.DataFrame:
 
 _ACCEL_KPI_SPEC: list[tuple[str, str, str, bool]] = [
     # (display, kpi key, format, lower_is_better)
-    ("Time [s]",                   "event_time_s",              ".3f", True),
-    ("Peak vx [km/h]",             "peak_vx_kmh",               ".1f", False),
-    ("Mean ax [G]",                "mean_ax_g",                 ".3f", False),
-    ("Peak ax [G]",                "peak_ax_g",                 ".3f", False),
-    ("t 0–15 m [s]",               "t_0_15m_s",                 ".3f", True),
-    ("t 15–45 m [s]",              "t_15_45m_s",                ".3f", True),
-    ("t 45–75 m [s]",              "t_45_75m_s",                ".3f", True),
-    ("t→30 km/h [s]",              "t_to_30kmh_s",              ".3f", True),
-    ("t→60 km/h [s]",              "t_to_60kmh_s",              ".3f", True),
-    ("t→100 km/h [s]",             "t_to_100kmh_s",             ".3f", True),
-    ("Launch ax 0–0.5 s [G]",      "launch_ax_g_05s",           ".3f", False),
-    ("Launch SR peak",             "launch_sr_peak",            ".3f", True),
-    ("Throttle rise 10→90 % [s]",  "throttle_rise_time_s",      ".3f", True),
-    ("Mean ax 0–30 m [G]",         "mean_ax_g_traction",        ".3f", False),
-    ("SR in band on throttle [%]", "pct_sr_in_band_on_throttle",".1f", False),
-    ("Wheelspin events",           "wheelspin_events",          ".0f", True),
-    ("P_DC peak [kW]",             "p_dc_peak_kw",              ".1f", False),
-    ("P_DC mean [kW]",             "p_dc_mean_kw",              ".1f", False),
-    ("P_DC in 70–80 kW [%]",       "pct_time_p_dc_70_80kw",     ".1f", False),
-    ("P_DC > 80 kW [%]",           "pct_time_p_dc_over_80kw",   ".2f", True),
-    ("V_DC sag [%]",               "v_dc_sag_pct",              ".1f", True),
-    ("I_DC peak [A]",              "i_dc_peak_a",               ".0f", False),
-    ("Energy DC [kJ]",             "energy_dc_kj",              ".1f", True),
-    ("F/R torque split [%]",       "fr_torque_split_pct",       ".1f", False),
-    ("L/R imbalance front [%]",    "lr_imbalance_front_pct",    ".1f", True),
-    ("L/R imbalance rear [%]",     "lr_imbalance_rear_pct",     ".1f", True),
-    ("Full throttle [%]",          "pct_full_thr",              ".1f", False),
-    ("SR MAE",                     "sr_mae_global",             ".3f", True),
-    ("SR in band [%]",             "pct_all_in_band",           ".1f", False),
-    ("Any overslip [%]",           "pct_any_overslip",          ".1f", True),
+    ("Time [s]", "event_time_s", ".3f", True),
+    ("Peak vx [km/h]", "peak_vx_kmh", ".1f", False),
+    ("Mean ax [G]", "mean_ax_g", ".3f", False),
+    ("Peak ax [G]", "peak_ax_g", ".3f", False),
+    ("t 0–15 m [s]", "t_0_15m_s", ".3f", True),
+    ("t 15–45 m [s]", "t_15_45m_s", ".3f", True),
+    ("t 45–75 m [s]", "t_45_75m_s", ".3f", True),
+    ("t→30 km/h [s]", "t_to_30kmh_s", ".3f", True),
+    ("t→60 km/h [s]", "t_to_60kmh_s", ".3f", True),
+    ("t→100 km/h [s]", "t_to_100kmh_s", ".3f", True),
+    ("Launch ax 0–0.5 s [G]", "launch_ax_g_05s", ".3f", False),
+    ("Launch SR peak", "launch_sr_peak", ".3f", True),
+    ("Throttle rise 10→90 % [s]", "throttle_rise_time_s", ".3f", True),
+    ("Mean ax 0–30 m [G]", "mean_ax_g_traction", ".3f", False),
+    ("SR in band on throttle [%]", "pct_sr_in_band_on_throttle", ".1f", False),
+    ("Wheelspin events", "wheelspin_events", ".0f", True),
+    ("P_DC peak [kW]", "p_dc_peak_kw", ".1f", False),
+    ("P_DC mean [kW]", "p_dc_mean_kw", ".1f", False),
+    ("P_DC in 70–80 kW [%]", "pct_time_p_dc_70_80kw", ".1f", False),
+    ("P_DC > 80 kW [%]", "pct_time_p_dc_over_80kw", ".2f", True),
+    ("V_DC sag [%]", "v_dc_sag_pct", ".1f", True),
+    ("I_DC peak [A]", "i_dc_peak_a", ".0f", False),
+    ("Energy DC [kJ]", "energy_dc_kj", ".1f", True),
+    ("F/R torque split [%]", "fr_torque_split_pct", ".1f", False),
+    ("L/R imbalance front [%]", "lr_imbalance_front_pct", ".1f", True),
+    ("L/R imbalance rear [%]", "lr_imbalance_rear_pct", ".1f", True),
+    ("Full throttle [%]", "pct_full_thr", ".1f", False),
+    ("SR MAE", "sr_mae_global", ".3f", True),
+    ("SR in band [%]", "pct_all_in_band", ".1f", False),
+    ("Any overslip [%]", "pct_any_overslip", ".1f", True),
 ]
 
 # Hierarchy over the ~30 acceleration KPIs: a short headline set up front, the
 # rest grouped into drill-down expanders so the summary no longer dumps as one
 # flat 30-metric block. union(headline, all groups) covers every KPI key.
 _ACCEL_HEADLINE_KEYS: tuple[str, ...] = (
-    "event_time_s", "peak_vx_kmh", "t_to_100kmh_s",
-    "mean_ax_g", "pct_sr_in_band_on_throttle", "p_dc_peak_kw",
+    "event_time_s",
+    "peak_vx_kmh",
+    "t_to_100kmh_s",
+    "mean_ax_g",
+    "pct_sr_in_band_on_throttle",
+    "p_dc_peak_kw",
 )
 _ACCEL_KPI_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("Phase splits", (
-        "t_0_15m_s", "t_15_45m_s", "t_45_75m_s",
-        "t_to_30kmh_s", "t_to_60kmh_s", "t_to_100kmh_s",
-    )),
-    ("Launch", (
-        "launch_ax_g_05s", "launch_sr_peak", "throttle_rise_time_s",
-    )),
-    ("Traction & TC", (
-        "mean_ax_g_traction", "pct_sr_in_band_on_throttle", "wheelspin_events",
-        "sr_mae_global", "pct_all_in_band", "pct_any_overslip",
-    )),
-    ("Power (DC bus)", (
-        "p_dc_peak_kw", "p_dc_mean_kw", "pct_time_p_dc_70_80kw",
-        "pct_time_p_dc_over_80kw", "v_dc_sag_pct", "i_dc_peak_a", "energy_dc_kj",
-    )),
-    ("Drivetrain & misc", (
-        "peak_ax_g", "fr_torque_split_pct", "lr_imbalance_front_pct",
-        "lr_imbalance_rear_pct", "pct_full_thr",
-    )),
+    (
+        "Phase splits",
+        (
+            "t_0_15m_s",
+            "t_15_45m_s",
+            "t_45_75m_s",
+            "t_to_30kmh_s",
+            "t_to_60kmh_s",
+            "t_to_100kmh_s",
+        ),
+    ),
+    (
+        "Launch",
+        (
+            "launch_ax_g_05s",
+            "launch_sr_peak",
+            "throttle_rise_time_s",
+        ),
+    ),
+    (
+        "Traction & TC",
+        (
+            "mean_ax_g_traction",
+            "pct_sr_in_band_on_throttle",
+            "wheelspin_events",
+            "sr_mae_global",
+            "pct_all_in_band",
+            "pct_any_overslip",
+        ),
+    ),
+    (
+        "Power (DC bus)",
+        (
+            "p_dc_peak_kw",
+            "p_dc_mean_kw",
+            "pct_time_p_dc_70_80kw",
+            "pct_time_p_dc_over_80kw",
+            "v_dc_sag_pct",
+            "i_dc_peak_a",
+            "energy_dc_kj",
+        ),
+    ),
+    (
+        "Drivetrain & misc",
+        (
+            "peak_ax_g",
+            "fr_torque_split_pct",
+            "lr_imbalance_front_pct",
+            "lr_imbalance_rear_pct",
+            "pct_full_thr",
+        ),
+    ),
 )
 _ACCEL_SPEC_BY_KEY: dict[str, tuple[str, str, bool]] = {
     key: (display, fmt, lb) for display, key, fmt, lb in _ACCEL_KPI_SPEC
@@ -3087,7 +3167,7 @@ def _accel_kpi_cards(k: dict, keys: tuple[str, ...]) -> None:
     items = [key for key in keys if key in _ACCEL_SPEC_BY_KEY]
     for i in range(0, len(items), 4):
         cols = st.columns(4)
-        for col, key in zip(cols, items[i:i + 4]):
+        for col, key in zip(cols, items[i : i + 4]):
             display, fmt, _lb = _ACCEL_SPEC_BY_KEY[key]
             value = k.get(key)
             if isinstance(value, (int, float)) and np.isfinite(float(value)):
@@ -3109,7 +3189,8 @@ def _accel_kpi_table(kpis_by_run: dict[str, dict], keys: tuple[str, ...]) -> Non
         for rn in run_keys:
             val = kpis_by_run[rn].get(key)
             row[Path(rn).stem] = (
-                float(val) if isinstance(val, (int, float)) and np.isfinite(float(val))
+                float(val)
+                if isinstance(val, (int, float)) and np.isfinite(float(val))
                 else float("nan")
             )
         table_rows.append(row)
@@ -3157,10 +3238,7 @@ def _render_events_acceleration(dfs: dict[str, pl.DataFrame]) -> None:
     if not kpis_by_run:
         return
 
-    st.caption(
-        "Headline metrics first; the full breakdown by category is in the "
-        "expanders below."
-    )
+    st.caption("Headline metrics first; the full breakdown by category is in the expanders below.")
     if len(kpis_by_run) == 1:
         run_name = next(iter(kpis_by_run))
         k = kpis_by_run[run_name]
@@ -3179,11 +3257,11 @@ def _render_events_acceleration(dfs: dict[str, pl.DataFrame]) -> None:
 
     # ── Diagnostic scatter figures ────────────────────────────────────────────
     _ACCEL_FIGURES = [
-        ("power_vx",      "DC Power vs Speed  ·  80 kW regulatory limit"),
-        ("ax_vx",         "Acceleration Envelope  ·  Longitudinal G vs Speed"),
-        ("motor_tq_rpm",  "Powertrain Operating Cloud  ·  Motor Torque vs Wheel Speed"),
+        ("power_vx", "DC Power vs Speed  ·  80 kW regulatory limit"),
+        ("ax_vx", "Acceleration Envelope  ·  Longitudinal G vs Speed"),
+        ("motor_tq_rpm", "Powertrain Operating Cloud  ·  Motor Torque vs Wheel Speed"),
         ("sr_fr_balance", "Traction Balance  ·  Front vs Rear Slip Ratio"),
-        ("sr_fx_wheel",   "TC Operating Point  ·  SR vs Fx per Wheel"),
+        ("sr_fx_wheel", "TC Operating Point  ·  SR vs Fx per Wheel"),
     ]
     for metric, title in _ACCEL_FIGURES:
         st.divider()
@@ -3346,20 +3424,26 @@ def _render_ideal_braking_curve(dfs: dict[str, pl.DataFrame]) -> None:
             c1.metric("Front bias", f"{_fmt(vals.get('front_bias_mean', np.nan) * 100.0, '.1f')} %")
             c2.metric("Bias std", f"{_fmt(vals.get('front_bias_std', np.nan) * 100.0, '.1f')} pp")
             c3.metric("RMS to ideal", f"{_fmt(vals.get('rms_dist_to_ideal_N', np.nan), '.0f')} N")
-            c4.metric("Rear overbiased", f"{_fmt(vals.get('pct_time_rear_overbiased', np.nan), '.1f')} %")
+            c4.metric(
+                "Rear overbiased", f"{_fmt(vals.get('pct_time_rear_overbiased', np.nan), '.1f')} %"
+            )
             c5.metric("Peak brake", f"{_fmt(vals.get('peak_combined_brake_g', np.nan), '.2f')} g")
         elif len(run_kpis) > 1:
             rows = []
             for run_name, vals in run_kpis.items():
-                rows.append({
-                    "Run": run_name,
-                    "Front bias [%]": round(vals.get("front_bias_mean", np.nan) * 100.0, 2),
-                    "Bias std [pp]": round(vals.get("front_bias_std", np.nan) * 100.0, 2),
-                    "RMS to ideal [N]": round(vals.get("rms_dist_to_ideal_N", np.nan), 1),
-                    "Rear overbiased [%]": round(vals.get("pct_time_rear_overbiased", np.nan), 2),
-                    "Peak brake [g]": round(vals.get("peak_combined_brake_g", np.nan), 3),
-                    "Samples": int(vals.get("samples", 0)),
-                })
+                rows.append(
+                    {
+                        "Run": run_name,
+                        "Front bias [%]": round(vals.get("front_bias_mean", np.nan) * 100.0, 2),
+                        "Bias std [pp]": round(vals.get("front_bias_std", np.nan) * 100.0, 2),
+                        "RMS to ideal [N]": round(vals.get("rms_dist_to_ideal_N", np.nan), 1),
+                        "Rear overbiased [%]": round(
+                            vals.get("pct_time_rear_overbiased", np.nan), 2
+                        ),
+                        "Peak brake [g]": round(vals.get("peak_combined_brake_g", np.nan), 3),
+                        "Samples": int(vals.get("samples", 0)),
+                    }
+                )
             st.dataframe(pl.DataFrame(rows), use_container_width=True, hide_index=True)
 
         _plotly_chart(fig, use_container_width=True, theme=None)
@@ -3388,14 +3472,26 @@ def _render_dynamics_overview(dfs: dict[str, pl.DataFrame]) -> None:
             gk = kpis.get("runs", {}).get(rn, {})
             if not k.get("warnings"):
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Grip envelope", f"{k['envelope_g']:.2f} G",
-                          help="P95 of combined |G| — the car's grip ceiling on this circuit.")
-                c2.metric("Peak combined", f"{_fmt(gk.get('peak_combined_g'), '.2f')} G",
-                          help="P99.5 of combined |G|.")
-                c3.metric("Utilisation", f"{k['utilization_pct']:.1f} %",
-                          help="Mean combined |G| as a % of the envelope.")
-                c4.metric("Time at limit", f"{k['time_at_limit_pct']:.1f} %",
-                          help=f"Share of samples ≥ {int(gf.LIMIT_FRAC * 100)}% of the envelope.")
+                c1.metric(
+                    "Grip envelope",
+                    f"{k['envelope_g']:.2f} G",
+                    help="P95 of combined |G| — the car's grip ceiling on this circuit.",
+                )
+                c2.metric(
+                    "Peak combined",
+                    f"{_fmt(gk.get('peak_combined_g'), '.2f')} G",
+                    help="P99.5 of combined |G|.",
+                )
+                c3.metric(
+                    "Utilisation",
+                    f"{k['utilization_pct']:.1f} %",
+                    help="Mean combined |G| as a % of the envelope.",
+                )
+                c4.metric(
+                    "Time at limit",
+                    f"{k['time_at_limit_pct']:.1f} %",
+                    help=f"Share of samples ≥ {int(gf.LIMIT_FRAC * 100)}% of the envelope.",
+                )
         else:
             rows = [
                 {
@@ -3405,7 +3501,8 @@ def _render_dynamics_overview(dfs: dict[str, pl.DataFrame]) -> None:
                     "Utilisation [%]": k["utilization_pct"],
                     "Time at limit [%]": k["time_at_limit_pct"],
                 }
-                for rn, k in util_by_run.items() if not k.get("warnings")
+                for rn, k in util_by_run.items()
+                if not k.get("warnings")
             ]
             if rows:
                 _show_summary_table(rows)
@@ -3504,11 +3601,27 @@ def _render_dynamics_acceleration(dfs: dict[str, pl.DataFrame]) -> None:
 
 def _render_setup_calibration_banner(df: pl.DataFrame) -> None:
     damp_cols = [c for c in ("DampFL", "DampFR", "DampRL", "DampRR") if c in df.columns]
-    status = str(df["Pot_Calibration_Status"][0]) if "Pot_Calibration_Status" in df.columns else "failed"
-    convention = str(df["Pot_Calibration_Convention"][0]) if "Pot_Calibration_Convention" in df.columns else "raw"
-    r_roll = float(df["Pot_Calibration_r_roll"][0]) if "Pot_Calibration_r_roll" in df.columns else np.nan
-    r_pitch = float(df["Pot_Calibration_r_pitch"][0]) if "Pot_Calibration_r_pitch" in df.columns else np.nan
-    message = str(df["Pot_Calibration_Message"][0]) if "Pot_Calibration_Message" in df.columns else "Calibration failed - T1 metrics disabled."
+    status = (
+        str(df["Pot_Calibration_Status"][0]) if "Pot_Calibration_Status" in df.columns else "failed"
+    )
+    convention = (
+        str(df["Pot_Calibration_Convention"][0])
+        if "Pot_Calibration_Convention" in df.columns
+        else "raw"
+    )
+    r_roll = (
+        float(df["Pot_Calibration_r_roll"][0]) if "Pot_Calibration_r_roll" in df.columns else np.nan
+    )
+    r_pitch = (
+        float(df["Pot_Calibration_r_pitch"][0])
+        if "Pot_Calibration_r_pitch" in df.columns
+        else np.nan
+    )
+    message = (
+        str(df["Pot_Calibration_Message"][0])
+        if "Pot_Calibration_Message" in df.columns
+        else "Calibration failed - T1 metrics disabled."
+    )
     details = (
         f"{message} Convention: {convention}. "
         f"r_roll={_fmt(r_roll, '.2f')}, r_pitch={_fmt(r_pitch, '.2f')}. "
@@ -3564,12 +3677,14 @@ def _render_dynamics_setup_signatures(dfs: dict[str, pl.DataFrame]) -> None:
         if table is not None and not table.is_empty():
             with st.expander("Per-lap LLTD data"):
                 st.dataframe(
-                    table.with_columns([
-                        pl.col("LapTime [s]").round(3),
-                        pl.col("LLTD mid-corner avg [%]").round(4),
-                        pl.col("LLTD mid-corner median [%]").round(4),
-                        pl.col("LLTD mid-corner span [pp]").round(5),
-                    ]),
+                    table.with_columns(
+                        [
+                            pl.col("LapTime [s]").round(3),
+                            pl.col("LLTD mid-corner avg [%]").round(4),
+                            pl.col("LLTD mid-corner median [%]").round(4),
+                            pl.col("LLTD mid-corner span [pp]").round(5),
+                        ]
+                    ),
                     use_container_width=True,
                     hide_index=True,
                 )
@@ -3602,7 +3717,9 @@ def _render_dynamics_setup_signatures(dfs: dict[str, pl.DataFrame]) -> None:
                 "If the orange line stays below zero, the rear axle is taking more transfer than target."
             )
             if np.isfinite(kpis.get("geom_ltd_front_mean", np.nan)):
-                st.caption(f"Roll-spring geometry cross-check: {_fmt(kpis.get('geom_ltd_front_mean') * 100.0, '.1f')}% front LTD.")
+                st.caption(
+                    f"Roll-spring geometry cross-check: {_fmt(kpis.get('geom_ltd_front_mean') * 100.0, '.1f')}% front LTD."
+                )
             _plotly_chart(fig, use_container_width=True, theme=None)
         except Exception as exc:
             st.warning(f"LTD unavailable: {exc}")
@@ -3618,16 +3735,22 @@ def _render_dynamics_setup_signatures(dfs: dict[str, pl.DataFrame]) -> None:
             for rn, (_f, kpis) in ltd_results.items():
                 for w in kpis.get("warnings", []):
                     st.warning(f"{Path(rn).stem}: {w}")
-            _show_summary_table([
-                {
-                    "Run": Path(rn).stem,
-                    "Median front LTD [%]": _fmt(kpis.get("ltd_front_median", float("nan")) * 100.0, ".1f"),
-                    "Theoretical [%]": _fmt(kpis.get("ltd_theoretical", float("nan")) * 100.0, ".1f"),
-                    "Deviation [%]": _fmt(kpis.get("deviation_pct"), "+.1f"),
-                    "Samples": kpis.get("samples", 0),
-                }
-                for rn, (_f, kpis) in ltd_results.items()
-            ])
+            _show_summary_table(
+                [
+                    {
+                        "Run": Path(rn).stem,
+                        "Median front LTD [%]": _fmt(
+                            kpis.get("ltd_front_median", float("nan")) * 100.0, ".1f"
+                        ),
+                        "Theoretical [%]": _fmt(
+                            kpis.get("ltd_theoretical", float("nan")) * 100.0, ".1f"
+                        ),
+                        "Deviation [%]": _fmt(kpis.get("deviation_pct"), "+.1f"),
+                        "Samples": kpis.get("samples", 0),
+                    }
+                    for rn, (_f, kpis) in ltd_results.items()
+                ]
+            )
             merged = _overlay_figures({rn: [f] for rn, (f, _k) in ltd_results.items()})
             fig_ltd = merged[0]
             fig_ltd.update_xaxes(autorange=True)
@@ -3653,7 +3776,9 @@ def _render_dynamics_setup_signatures(dfs: dict[str, pl.DataFrame]) -> None:
             if kpis.get("calibrated"):
                 c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric("Theory", f"{_fmt(kpis.get('theoretical_deg_per_g'), '.2f')} deg/g")
-                c2.metric("Front grad", f"{_fmt(kpis.get('front_gradient_deg_per_g'), '+.2f')} deg/g")
+                c2.metric(
+                    "Front grad", f"{_fmt(kpis.get('front_gradient_deg_per_g'), '+.2f')} deg/g"
+                )
                 c3.metric("Front dev", f"{_fmt(kpis.get('front_deviation_pct'), '+.1f')} %")
                 c4.metric("Rear grad", f"{_fmt(kpis.get('rear_gradient_deg_per_g'), '+.2f')} deg/g")
                 c5.metric("Rear dev", f"{_fmt(kpis.get('rear_deviation_pct'), '+.1f')} %")
@@ -3663,7 +3788,9 @@ def _render_dynamics_setup_signatures(dfs: dict[str, pl.DataFrame]) -> None:
                 # rear especially collapses). Show theory + shape only.
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Theory", f"{_fmt(kpis.get('theoretical_deg_per_g'), '.2f')} deg/g")
-                c2.metric("Front grad", f"{_fmt(kpis.get('front_gradient_deg_per_g'), '+.2f')} deg/g")
+                c2.metric(
+                    "Front grad", f"{_fmt(kpis.get('front_gradient_deg_per_g'), '+.2f')} deg/g"
+                )
                 c3.metric("Rear grad", f"{_fmt(kpis.get('rear_gradient_deg_per_g'), '+.2f')} deg/g")
                 st.caption(
                     "Uncalibrated — roll is derived from raw damper counts, so only "
@@ -3678,14 +3805,20 @@ def _render_dynamics_setup_signatures(dfs: dict[str, pl.DataFrame]) -> None:
         st.divider()
 
         st.subheader("Pitch Gradient  ·  Braking vs Acceleration")
-        st.caption("Pitch comparison only; CAT17x pitch stiffness is not documented for a theoretical line.")
+        st.caption(
+            "Pitch comparison only; CAT17x pitch stiffness is not documented for a theoretical line."
+        )
         try:
             fig, kpis = dyn.pitch_gradient_fig(df)
             for w in kpis.get("warnings", []):
                 st.warning(w)
             c1, c2, c3 = st.columns(3)
-            c1.metric("Brake gradient", f"{_fmt(kpis.get('brake_gradient_deg_per_g'), '+.2f')} deg/g")
-            c2.metric("Accel gradient", f"{_fmt(kpis.get('accel_gradient_deg_per_g'), '+.2f')} deg/g")
+            c1.metric(
+                "Brake gradient", f"{_fmt(kpis.get('brake_gradient_deg_per_g'), '+.2f')} deg/g"
+            )
+            c2.metric(
+                "Accel gradient", f"{_fmt(kpis.get('accel_gradient_deg_per_g'), '+.2f')} deg/g"
+            )
             c3.metric("Calibrated", "yes" if kpis.get("calibrated") else "no")
             _plotly_chart(fig, use_container_width=True, theme=None)
         except Exception as exc:
@@ -3732,9 +3865,9 @@ def _render_dynamics_setup_signatures(dfs: dict[str, pl.DataFrame]) -> None:
             fig, kpis = dyn.static_fz_reference_fig(df)
             for w in kpis.get("warnings", []):
                 st.warning(w)
-            corners_data = kpis.get('corners', {})
+            corners_data = kpis.get("corners", {})
             c1, c2, c3, c4 = st.columns(4)
-            for col, corner in zip([c1, c2, c3, c4], ['FL', 'FR', 'RL', 'RR']):
+            for col, corner in zip([c1, c2, c3, c4], ["FL", "FR", "RL", "RR"]):
                 cd = corners_data.get(corner, {})
                 col.metric(
                     corner,
@@ -3742,7 +3875,7 @@ def _render_dynamics_setup_signatures(dfs: dict[str, pl.DataFrame]) -> None:
                     f"{_fmt(cd.get('deviation_pct', float('nan')), '+.1f')} % vs design",
                 )
             c1, c2 = st.columns(2)
-            fs = kpis.get('front_share_pct', float('nan'))
+            fs = kpis.get("front_share_pct", float("nan"))
             c1.metric("Front share", f"{_fmt(fs, '.1f')} %", f"{_fmt(fs - 50.0, '+.1f')} % vs 50%")
             c2.metric("Samples", str(kpis.get("samples", 0)))
             st.caption(
@@ -3757,7 +3890,9 @@ def _render_dynamics_setup_signatures(dfs: dict[str, pl.DataFrame]) -> None:
 
         try:
             fig, _kpis = dyn.aero_load_heave_fig(df)
-            st.caption("Add k_heave_F and k_heave_R to cat17x_parameters.md to overlay theoretical aero deflection.")
+            st.caption(
+                "Add k_heave_F and k_heave_R to cat17x_parameters.md to overlay theoretical aero deflection."
+            )
             _plotly_chart(fig, use_container_width=True, theme=None)
         except Exception:
             pass
@@ -3855,8 +3990,14 @@ def _render_dynamics_cornering(dfs: dict[str, pl.DataFrame]) -> None:
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Valid laps", str(kpis["valid_laps"]))
                 c2.metric("Mean understeer", f"{_fmt(kpis['mean_understeer'], '.2f')} deg")
-                c3.metric("Min / Max", f"{_fmt(kpis['min_understeer'], '.2f')} / {_fmt(kpis['max_understeer'], '.2f')} deg")
-                c4.metric("Fastest valid lap", f"L{kpis['fastest_lap']} - {_fmt(kpis['fastest_lt'], '.2f')} s")
+                c3.metric(
+                    "Min / Max",
+                    f"{_fmt(kpis['min_understeer'], '.2f')} / {_fmt(kpis['max_understeer'], '.2f')} deg",
+                )
+                c4.metric(
+                    "Fastest valid lap",
+                    f"L{kpis['fastest_lap']} - {_fmt(kpis['fastest_lt'], '.2f')} s",
+                )
             fig = dyn.understeer_angle_fig(df, x_mode=understeer_x_mode)
             _plotly_chart(fig, use_container_width=True, theme=None)
             if not kpis.get("warnings"):
@@ -3871,31 +4012,37 @@ def _render_dynamics_cornering(dfs: dict[str, pl.DataFrame]) -> None:
                 )
                 for w in run_results[run_name][1].get("warnings", []):
                     st.warning(f"{run_name}: {w}")
-            _show_summary_table([
-                {
-                    "Run": run_name,
-                    "Valid laps": kpis["valid_laps"],
-                    "Mean understeer [deg]": round(kpis["mean_understeer"], 2),
-                    "Min [deg]": round(kpis["min_understeer"], 2),
-                    "Max [deg]": round(kpis["max_understeer"], 2),
-                    "Fastest lap": int(kpis["fastest_lap"]),
-                    "Fastest lt [s]": round(kpis["fastest_lt"], 2),
-                }
-                for run_name, (_figs, kpis) in run_results.items()
-                if not kpis.get("warnings")
-            ])
+            _show_summary_table(
+                [
+                    {
+                        "Run": run_name,
+                        "Valid laps": kpis["valid_laps"],
+                        "Mean understeer [deg]": round(kpis["mean_understeer"], 2),
+                        "Min [deg]": round(kpis["min_understeer"], 2),
+                        "Max [deg]": round(kpis["max_understeer"], 2),
+                        "Fastest lap": int(kpis["fastest_lap"]),
+                        "Fastest lt [s]": round(kpis["fastest_lt"], 2),
+                    }
+                    for run_name, (_figs, kpis) in run_results.items()
+                    if not kpis.get("warnings")
+                ]
+            )
             _plotly_chart(
-                _overlay_figures({run_name: figs for run_name, (figs, _kpis) in run_results.items()})[0],
+                _overlay_figures(
+                    {run_name: figs for run_name, (figs, _kpis) in run_results.items()}
+                )[0],
                 use_container_width=True,
                 theme=None,
             )
             with st.expander("Per-lap data"):
                 st.dataframe(
-                    _concat_run_tables({
-                        run_name: kpis["table"]
-                        for run_name, (_figs, kpis) in run_results.items()
-                        if not kpis.get("warnings")
-                    }),
+                    _concat_run_tables(
+                        {
+                            run_name: kpis["table"]
+                            for run_name, (_figs, kpis) in run_results.items()
+                            if not kpis.get("warnings")
+                        }
+                    ),
                     use_container_width=True,
                     hide_index=True,
                 )
@@ -3918,7 +4065,9 @@ def _render_dynamics_cornering(dfs: dict[str, pl.DataFrame]) -> None:
             for w in kpis.get("warnings", []):
                 st.warning(w)
             c1, c2, c3 = st.columns(3)
-            c1.metric("US gradient", f"{_fmt(kpis.get('understeer_gradient_deg_per_g'), '+.2f')} deg/g")
+            c1.metric(
+                "US gradient", f"{_fmt(kpis.get('understeer_gradient_deg_per_g'), '+.2f')} deg/g"
+            )
             c2.metric("Median vx", f"{_fmt(kpis.get('vx_median_mps'), '.1f')} m/s")
             c3.metric("Samples", str(kpis.get("samples", 0)))
             _plotly_chart(fig, use_container_width=True, theme=None)
@@ -3936,15 +4085,19 @@ def _render_dynamics_cornering(dfs: dict[str, pl.DataFrame]) -> None:
             for rn, (_f, kpis) in steer_results.items():
                 for w in kpis.get("warnings", []):
                     st.warning(f"{Path(rn).stem}: {w}")
-            _show_summary_table([
-                {
-                    "Run": Path(rn).stem,
-                    "US gradient [deg/g]": _fmt(kpis.get("understeer_gradient_deg_per_g"), "+.2f"),
-                    "Median vx [m/s]": _fmt(kpis.get("vx_median_mps"), ".1f"),
-                    "Samples": kpis.get("samples", 0),
-                }
-                for rn, (_f, kpis) in steer_results.items()
-            ])
+            _show_summary_table(
+                [
+                    {
+                        "Run": Path(rn).stem,
+                        "US gradient [deg/g]": _fmt(
+                            kpis.get("understeer_gradient_deg_per_g"), "+.2f"
+                        ),
+                        "Median vx [m/s]": _fmt(kpis.get("vx_median_mps"), ".1f"),
+                        "Samples": kpis.get("samples", 0),
+                    }
+                    for rn, (_f, kpis) in steer_results.items()
+                ]
+            )
             merged = _overlay_figures({rn: [f] for rn, (f, _k) in steer_results.items()})
             _plotly_chart(merged[0], use_container_width=True, theme=None)
 
@@ -3988,57 +4141,70 @@ def _render_dynamics_grip_factors(dfs: dict[str, pl.DataFrame]) -> None:
         bc1, bc2 = st.columns(2)
         with bc1:
             st.markdown(
-                '<b style="color:#FFD700">Overall</b> '
-                "— grip-limited combined acceleration",
+                '<b style="color:#FFD700">Overall</b> — grip-limited combined acceleration',
                 unsafe_allow_html=True,
             )
             overall = st.number_input(
                 "Combined G >=",
-                min_value=0.20, max_value=2.00, step=0.05,
-                key="gf_overall", format="%.2f",
+                min_value=0.20,
+                max_value=2.00,
+                step=0.05,
+                key="gf_overall",
+                format="%.2f",
             )
         with bc2:
             st.markdown(
-                '<b style="color:#D94F4F">Braking</b> '
-                "— hard deceleration / trail-braking",
+                '<b style="color:#D94F4F">Braking</b> — hard deceleration / trail-braking',
                 unsafe_allow_html=True,
             )
             braking = st.number_input(
                 "Deceleration G >=",
-                min_value=0.20, max_value=2.00, step=0.05,
-                key="gf_braking", format="%.2f",
+                min_value=0.20,
+                max_value=2.00,
+                step=0.05,
+                key="gf_braking",
+                format="%.2f",
             )
         bc3, bc4 = st.columns(2)
         with bc3:
             st.markdown(
-                '<b style="color:#00BFBF">Cornering</b> '
-                "— sustained lateral load",
+                '<b style="color:#00BFBF">Cornering</b> — sustained lateral load',
                 unsafe_allow_html=True,
             )
             cornering = st.number_input(
                 "Lateral G >=",
-                min_value=0.10, max_value=2.00, step=0.05,
-                key="gf_corner_ay", format="%.2f",
+                min_value=0.10,
+                max_value=2.00,
+                step=0.05,
+                key="gf_corner_ay",
+                format="%.2f",
             )
         with bc4:
             st.markdown(
-                '<b style="color:#73D973">Traction</b> '
-                "— corner exit under power",
+                '<b style="color:#73D973">Traction</b> — corner exit under power',
                 unsafe_allow_html=True,
             )
             traction_ax = st.number_input(
                 "Acceleration G >=",
-                min_value=0.10, max_value=2.00, step=0.05,
-                key="gf_traction_ax", format="%.2f",
+                min_value=0.10,
+                max_value=2.00,
+                step=0.05,
+                key="gf_traction_ax",
+                format="%.2f",
             )
             traction_ay = st.number_input(
                 "Lateral G >=",
-                min_value=0.10, max_value=2.00, step=0.05,
-                key="gf_traction_ay", format="%.2f",
+                min_value=0.10,
+                max_value=2.00,
+                step=0.05,
+                key="gf_traction_ay",
+                format="%.2f",
             )
         min_samples = st.number_input(
             "Min. samples per category per lap",
-            min_value=5, max_value=500, step=5,
+            min_value=5,
+            max_value=500,
+            step=5,
             key="gf_min_samples",
         )
 
@@ -4070,28 +4236,36 @@ def _render_dynamics_grip_factors(dfs: dict[str, pl.DataFrame]) -> None:
             ph = k["phase_time_at_limit_pct"]
             u1, u2, u3, u4 = st.columns(4)
             u1.metric("Grip envelope", f"{k['envelope_g']:.2f} G")
-            u2.metric("Utilisation", f"{k['utilization_pct']:.1f}%",
-                      help="Mean combined |G| as a % of the grip envelope.")
-            u3.metric("Time at limit", f"{k['time_at_limit_pct']:.1f}%",
-                      help=f"Share of samples ≥ {int(gf.LIMIT_FRAC * 100)}% of the envelope.")
+            u2.metric(
+                "Utilisation",
+                f"{k['utilization_pct']:.1f}%",
+                help="Mean combined |G| as a % of the grip envelope.",
+            )
+            u3.metric(
+                "Time at limit",
+                f"{k['time_at_limit_pct']:.1f}%",
+                help=f"Share of samples ≥ {int(gf.LIMIT_FRAC * 100)}% of the envelope.",
+            )
             u4.metric(
                 "Brake / Corner / Traction TAL",
                 f"{_fmt(ph.get('Braking'), '.0f')} / {_fmt(ph.get('Cornering'), '.0f')} / "
                 f"{_fmt(ph.get('Traction'), '.0f')} %",
             )
         else:
-            _show_summary_table([
-                {
-                    "Run": Path(rn).stem,
-                    "Envelope [G]": round(k["envelope_g"], 2),
-                    "Utilisation [%]": k["utilization_pct"],
-                    "Time at limit [%]": k["time_at_limit_pct"],
-                    "Braking TAL [%]": k["phase_time_at_limit_pct"].get("Braking"),
-                    "Cornering TAL [%]": k["phase_time_at_limit_pct"].get("Cornering"),
-                    "Traction TAL [%]": k["phase_time_at_limit_pct"].get("Traction"),
-                }
-                for rn, k in valid_util.items()
-            ])
+            _show_summary_table(
+                [
+                    {
+                        "Run": Path(rn).stem,
+                        "Envelope [G]": round(k["envelope_g"], 2),
+                        "Utilisation [%]": k["utilization_pct"],
+                        "Time at limit [%]": k["time_at_limit_pct"],
+                        "Braking TAL [%]": k["phase_time_at_limit_pct"].get("Braking"),
+                        "Cornering TAL [%]": k["phase_time_at_limit_pct"].get("Cornering"),
+                        "Traction TAL [%]": k["phase_time_at_limit_pct"].get("Traction"),
+                    }
+                    for rn, k in valid_util.items()
+                ]
+            )
         _plotly_chart(gf.grip_utilization_fig(dfs), use_container_width=True, theme=None)
     st.divider()
 
@@ -4119,7 +4293,9 @@ def _render_dynamics_grip_factors(dfs: dict[str, pl.DataFrame]) -> None:
                     key="dyn_gf_map_lap",
                 )
                 map_fig = gf.grip_factor_track_maps_fig(
-                    df, int(selected_lap), thresholds,
+                    df,
+                    int(selected_lap),
+                    thresholds,
                 )
                 _plotly_chart(map_fig, use_container_width=True, theme=None)
 
@@ -4127,10 +4303,10 @@ def _render_dynamics_grip_factors(dfs: dict[str, pl.DataFrame]) -> None:
             if not kpis.get("warnings"):
                 m = kpis["means"]
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Overall",   f"{_fmt(m['Overall'],   '.2f')} G")
+                c1.metric("Overall", f"{_fmt(m['Overall'], '.2f')} G")
                 c2.metric("Cornering", f"{_fmt(m['Cornering'], '.2f')} G")
-                c3.metric("Braking",   f"{_fmt(m['Braking'],   '.2f')} G")
-                c4.metric("Traction",  f"{_fmt(m['Traction'],  '.2f')} G")
+                c3.metric("Braking", f"{_fmt(m['Braking'], '.2f')} G")
+                c4.metric("Traction", f"{_fmt(m['Traction'], '.2f')} G")
                 c5, c6 = st.columns(2)
                 c5.metric("Valid laps", str(kpis["valid_laps"]))
                 if kpis["fastest_lap"] is not None:
@@ -4142,7 +4318,8 @@ def _render_dynamics_grip_factors(dfs: dict[str, pl.DataFrame]) -> None:
             # ── Evolution chart ──────────────────────────────────────
             gf_x_mode = _select_per_lap_axis("dyn_gf_axis", default="laps")
             evo_fig = gf.grip_factor_evolution_fig(
-                kpis["table"], x_mode=gf_x_mode,
+                kpis["table"],
+                x_mode=gf_x_mode,
             )
             _plotly_chart(evo_fig, use_container_width=True, theme=None)
 
@@ -4161,18 +4338,12 @@ def _render_dynamics_grip_factors(dfs: dict[str, pl.DataFrame]) -> None:
                 run_results[run_name] = gf.grip_factor_kpis(df, thresholds)
                 for w in run_results[run_name].get("warnings", []):
                     st.warning(f"{run_name}: {w}")
-            valid_results = {
-                rn: k for rn, k in run_results.items()
-                if not k.get("warnings")
-            }
+            valid_results = {rn: k for rn, k in run_results.items() if not k.get("warnings")}
             if not valid_results:
                 return
 
             # ── Track maps (top) ─────────────────────────────────────
-            map_runs = [
-                rn for rn, k in valid_results.items()
-                if not k["table"].is_empty()
-            ]
+            map_runs = [rn for rn, k in valid_results.items() if not k["table"].is_empty()]
             if map_runs:
                 mc1, mc2 = st.columns([2, 1])
                 with mc1:
@@ -4198,27 +4369,30 @@ def _render_dynamics_grip_factors(dfs: dict[str, pl.DataFrame]) -> None:
                         key="dyn_gf_map_lap_multi",
                     )
                 map_fig = gf.grip_factor_track_maps_fig(
-                    dfs[map_run], int(map_lap), thresholds,
+                    dfs[map_run],
+                    int(map_lap),
+                    thresholds,
                 )
                 _plotly_chart(map_fig, use_container_width=True, theme=None)
 
             # ── Summary table ────────────────────────────────────────
-            _show_summary_table([
-                {
-                    "Run": rn,
-                    "Valid laps": k["valid_laps"],
-                    "Overall [G]":   round(k["means"]["Overall"],   3),
-                    "Cornering [G]": round(k["means"]["Cornering"], 3),
-                    "Braking [G]":   round(k["means"]["Braking"],   3),
-                    "Traction [G]":  round(k["means"]["Traction"],  3),
-                    "Fastest lap": k["fastest_lap"],
-                    "Fastest lt [s]": (
-                        round(k["fastest_lt"], 2)
-                        if np.isfinite(k["fastest_lt"]) else None
-                    ),
-                }
-                for rn, k in valid_results.items()
-            ])
+            _show_summary_table(
+                [
+                    {
+                        "Run": rn,
+                        "Valid laps": k["valid_laps"],
+                        "Overall [G]": round(k["means"]["Overall"], 3),
+                        "Cornering [G]": round(k["means"]["Cornering"], 3),
+                        "Braking [G]": round(k["means"]["Braking"], 3),
+                        "Traction [G]": round(k["means"]["Traction"], 3),
+                        "Fastest lap": k["fastest_lap"],
+                        "Fastest lt [s]": (
+                            round(k["fastest_lt"], 2) if np.isfinite(k["fastest_lt"]) else None
+                        ),
+                    }
+                    for rn, k in valid_results.items()
+                ]
+            )
 
             # ── Evolution chart (category colours) ───────────────────
             gf_x_mode = _select_per_lap_axis("dyn_gf_axis", default="laps")
@@ -4229,16 +4403,14 @@ def _render_dynamics_grip_factors(dfs: dict[str, pl.DataFrame]) -> None:
             _plotly_chart(evo_fig, use_container_width=True, theme=None)
 
             # ── Radar ────────────────────────────────────────────────
-            radar_fig = gf.grip_factor_radar_fig({
-                rn: k["table"] for rn, k in valid_results.items()
-            })
+            radar_fig = gf.grip_factor_radar_fig(
+                {rn: k["table"] for rn, k in valid_results.items()}
+            )
             _plotly_chart(radar_fig, use_container_width=True, theme=None)
 
             with st.expander("Per-lap grip factors"):
                 st.dataframe(
-                    _concat_run_tables({
-                        rn: k["table"] for rn, k in valid_results.items()
-                    }),
+                    _concat_run_tables({rn: k["table"] for rn, k in valid_results.items()}),
                     use_container_width=True,
                     hide_index=True,
                 )
@@ -4252,10 +4424,7 @@ def _tab_tc(dfs: dict[str, pl.DataFrame]) -> None:
 
 def _tab_tv(dfs: dict[str, pl.DataFrame]) -> None:
     st.subheader("TV — Yaw Rate & Mz Tracking")
-    st.caption(
-        "Does TV track the target yaw rate and Mz? "
-        "Low RMSE and bias = good tracking."
-    )
+    st.caption("Does TV track the target yaw rate and Mz? Low RMSE and bias = good tracking.")
     tv_x_mode = _select_per_lap_axis("tv_axis", default="laps")
     try:
         if len(dfs) == 1:
@@ -4275,8 +4444,10 @@ def _tab_tv(dfs: dict[str, pl.DataFrame]) -> None:
                 c7.metric("FB / FF ratio", _fmt(kpis["mean_ratio"], ".3f"))
                 c8.metric("FB share", _fmt(kpis["mean_fb_share"], ".3f"))
             filtered_figs = [
-                fig for fig in figs
-                if (fig.layout.title.text or "") not in {
+                fig
+                for fig in figs
+                if (fig.layout.title.text or "")
+                not in {
                     f"Yaw Rate Tracking Error vs {'Lap Time' if tv_x_mode == 'laptime' else 'Lap'}",
                     f"Mz Tracking Error vs {'Lap Time' if tv_x_mode == 'laptime' else 'Lap'}",
                     f"Feedback to Feedforward Ratio vs {'Lap Time' if tv_x_mode == 'laptime' else 'Lap'}",
@@ -4288,27 +4459,34 @@ def _tab_tv(dfs: dict[str, pl.DataFrame]) -> None:
                 with st.expander("Per-lap data"):
                     st.dataframe(kpis["table"], use_container_width=True, hide_index=True)
         else:
-            run_results = {run_name: tv.tv_figs_kpis(df, x_mode=tv_x_mode) for run_name, df in dfs.items()}
+            run_results = {
+                run_name: tv.tv_figs_kpis(df, x_mode=tv_x_mode) for run_name, df in dfs.items()
+            }
             for run_name, (_figs, kpis) in run_results.items():
                 for w in kpis.get("warnings", []):
                     st.warning(f"{run_name}: {w}")
-            _show_summary_table([
-                {
-                    "Run": run_name,
-                    "Valid laps": kpis["valid_laps"],
-                    "Yaw RMSE": round(kpis["mean_yaw_rmse"], 4),
-                    "Yaw bias": round(kpis["mean_yaw_bias"], 4),
-                    "Mz RMSE [Nm]": round(kpis["mean_mz_rmse"], 2),
-                    "Mz bias [Nm]": round(kpis["mean_mz_bias"], 2),
-                    "FB / FF ratio": round(kpis["mean_ratio"], 3),
-                    "FB share": round(kpis["mean_fb_share"], 3),
-                }
-                for run_name, (_figs, kpis) in run_results.items()
-                if not kpis.get("warnings")
-            ])
-            overlay_figs = _overlay_figures({run_name: figs for run_name, (figs, _kpis) in run_results.items()})
+            _show_summary_table(
+                [
+                    {
+                        "Run": run_name,
+                        "Valid laps": kpis["valid_laps"],
+                        "Yaw RMSE": round(kpis["mean_yaw_rmse"], 4),
+                        "Yaw bias": round(kpis["mean_yaw_bias"], 4),
+                        "Mz RMSE [Nm]": round(kpis["mean_mz_rmse"], 2),
+                        "Mz bias [Nm]": round(kpis["mean_mz_bias"], 2),
+                        "FB / FF ratio": round(kpis["mean_ratio"], 3),
+                        "FB share": round(kpis["mean_fb_share"], 3),
+                    }
+                    for run_name, (_figs, kpis) in run_results.items()
+                    if not kpis.get("warnings")
+                ]
+            )
+            overlay_figs = _overlay_figures(
+                {run_name: figs for run_name, (figs, _kpis) in run_results.items()}
+            )
             filtered_figs = [
-                fig for fig in overlay_figs
+                fig
+                for fig in overlay_figs
                 if not any(
                     blocked in (fig.layout.title.text or "")
                     for blocked in (
@@ -4322,11 +4500,13 @@ def _tab_tv(dfs: dict[str, pl.DataFrame]) -> None:
                 _plotly_chart(fig, use_container_width=True, theme=None)
             with st.expander("Per-lap data"):
                 st.dataframe(
-                    _concat_run_tables({
-                        run_name: kpis["table"]
-                        for run_name, (_figs, kpis) in run_results.items()
-                        if not kpis.get("warnings")
-                    }),
+                    _concat_run_tables(
+                        {
+                            run_name: kpis["table"]
+                            for run_name, (_figs, kpis) in run_results.items()
+                            if not kpis.get("warnings")
+                        }
+                    ),
                     use_container_width=True,
                     hide_index=True,
                 )
@@ -4443,9 +4623,7 @@ def _render_driver_throttle_subtab(
 
     st.divider()
     st.subheader("Full Throttle Time per Lap")
-    st.caption(
-        "Seconds per lap with throttle above the full-throttle threshold."
-    )
+    st.caption("Seconds per lap with throttle above the full-throttle threshold.")
     full_x_mode = _select_per_lap_axis("driver_full_axis", default="laps")
     try:
         fig = _driver_full_throttle_time_fig_cached(dfs, driver_run_tokens, full_x_mode)
@@ -4455,9 +4633,7 @@ def _render_driver_throttle_subtab(
 
     st.divider()
     st.subheader("Throttle Speed per Lap")
-    st.caption(
-        "Median and peak |dTP/dt| per lap. Higher = more aggressive pedal work."
-    )
+    st.caption("Median and peak |dTP/dt| per lap. Higher = more aggressive pedal work.")
     speed_x_mode = _select_per_lap_axis("driver_speed_axis", default="laps")
     try:
         fig = _driver_throttle_speed_fig_cached(dfs, driver_run_tokens, speed_x_mode)
@@ -4483,11 +4659,13 @@ def _driver_brake_zone_turns(
         if fastest_lap is None:
             continue
         lap_time_s = _lap_laptimes(df).get(int(fastest_lap), np.nan)
-        brake_candidates.append((
-            float(lap_time_s) if np.isfinite(lap_time_s) else np.inf,
-            run_name,
-            int(fastest_lap),
-        ))
+        brake_candidates.append(
+            (
+                float(lap_time_s) if np.isfinite(lap_time_s) else np.inf,
+                run_name,
+                int(fastest_lap),
+            )
+        )
     if not brake_candidates:
         return (), ""
     _best_time_s, brake_ref_run, brake_ref_lap = min(
@@ -4518,10 +4696,7 @@ def _render_driver_brake_subtab(
     driver_run_tokens: tuple[tuple[str, FileSignature, str], ...],
 ) -> None:
     st.subheader("Driver Brake Summary")
-    st.caption(
-        "Per-run aggressiveness (|dBrake/dt| up) and release smoothness "
-        "(|dBrake/dt| down)."
-    )
+    st.caption("Per-run aggressiveness (|dBrake/dt| up) and release smoothness (|dBrake/dt| down).")
     brake_rows = [
         {
             "Run": run_name,
@@ -4551,11 +4726,13 @@ def _render_driver_brake_subtab(
             st.caption(f"{Path(run_name).stem}: {w}")
         if k.get("warnings"):
             continue
-        trail_rows.append({
-            "Run": run_name,
-            "Trail-braking overlap [%]": k["trail_overlap_pct"],
-            "Coasting [%]": k["coasting_pct"],
-        })
+        trail_rows.append(
+            {
+                "Run": run_name,
+                "Trail-braking overlap [%]": k["trail_overlap_pct"],
+                "Coasting [%]": k["coasting_pct"],
+            }
+        )
     if trail_rows:
         _render_summary_df(pl.DataFrame(trail_rows))
 
@@ -4567,7 +4744,9 @@ def _render_driver_brake_subtab(
     combined_bs_x_mode = _select_per_lap_axis("driver_brake_steer_axis", default="laps")
     try:
         fig = _driver_combined_brake_steer_fig_cached(
-            dfs, driver_run_tokens, combined_bs_x_mode,
+            dfs,
+            driver_run_tokens,
+            combined_bs_x_mode,
         )
         _plotly_chart(fig, use_container_width=True, theme=None)
     except Exception as exc:
@@ -4575,9 +4754,7 @@ def _render_driver_brake_subtab(
 
     st.divider()
     st.subheader("Braking Effort")
-    st.caption(
-        "Brake position distribution per lap. Wider box = more modulation."
-    )
+    st.caption("Brake position distribution per lap. Wider box = more modulation.")
     try:
         fig = _driver_braking_effort_fig_cached(dfs, driver_run_tokens)
         _plotly_chart(fig, use_container_width=True, theme=None)
@@ -4593,7 +4770,8 @@ def _render_driver_brake_subtab(
     )
     try:
         brake_turns_signature, turn_ref_label = _driver_brake_zone_turns(
-            dfs, driver_run_tokens,
+            dfs,
+            driver_run_tokens,
         )
         if turn_ref_label:
             st.caption(turn_ref_label)
@@ -4608,13 +4786,13 @@ def _render_driver_brake_subtab(
 
     st.divider()
     st.subheader("Braking Aggressiveness per Lap")
-    st.caption(
-        "Median and peak |dBrake/dt| up per lap. Higher = sharper application."
-    )
+    st.caption("Median and peak |dBrake/dt| up per lap. Higher = sharper application.")
     brake_aggr_x_mode = _select_per_lap_axis("driver_brake_aggr_axis", default="laps")
     try:
         fig = _driver_braking_aggressiveness_fig_cached(
-            dfs, driver_run_tokens, brake_aggr_x_mode,
+            dfs,
+            driver_run_tokens,
+            brake_aggr_x_mode,
         )
         _plotly_chart(fig, use_container_width=True, theme=None)
     except Exception as exc:
@@ -4622,13 +4800,13 @@ def _render_driver_brake_subtab(
 
     st.divider()
     st.subheader("Brake Release Smoothness per Lap")
-    st.caption(
-        "Median and peak |dBrake/dt| down per lap. Higher = abrupt release."
-    )
+    st.caption("Median and peak |dBrake/dt| down per lap. Higher = abrupt release.")
     brake_release_x_mode = _select_per_lap_axis("driver_brake_release_axis", default="laps")
     try:
         fig = _driver_brake_release_smoothness_fig_cached(
-            dfs, driver_run_tokens, brake_release_x_mode,
+            dfs,
+            driver_run_tokens,
+            brake_release_x_mode,
         )
         _plotly_chart(fig, use_container_width=True, theme=None)
     except Exception as exc:
@@ -4642,8 +4820,7 @@ def _render_driver_steering_subtab(
 ) -> None:
     st.subheader("Driver Steering Summary")
     st.caption(
-        "Per-run steering smoothness, integral and curvature. "
-        "High integral = high steering demand."
+        "Per-run steering smoothness, integral and curvature. High integral = high steering demand."
     )
     steering_rows = [
         {
@@ -4668,11 +4845,14 @@ def _render_driver_steering_subtab(
         "more total steering demand, often a sign of understeer or a tighter line."
     )
     steering_integral_x_mode = _select_per_lap_axis(
-        "driver_steering_integral_axis", default="laps",
+        "driver_steering_integral_axis",
+        default="laps",
     )
     try:
         fig = _driver_steering_integral_fig_cached(
-            dfs, driver_run_tokens, steering_integral_x_mode,
+            dfs,
+            driver_run_tokens,
+            steering_integral_x_mode,
         )
         _plotly_chart(fig, use_container_width=True, theme=None)
     except Exception as exc:
@@ -4687,7 +4867,9 @@ def _render_driver_steering_subtab(
     steering_x_mode = _select_per_lap_axis("driver_steering_axis", default="laps")
     try:
         fig = _driver_steering_smoothness_fig_cached(
-            dfs, driver_run_tokens, steering_x_mode,
+            dfs,
+            driver_run_tokens,
+            steering_x_mode,
         )
         _plotly_chart(fig, use_container_width=True, theme=None)
     except Exception as exc:
@@ -4703,12 +4885,15 @@ def _render_driver_steering_subtab(
     )
     try:
         steer_turns_signature, steer_turn_label = _driver_brake_zone_turns(
-            dfs, driver_run_tokens,
+            dfs,
+            driver_run_tokens,
         )
         if steer_turn_label:
             st.caption(steer_turn_label)
         fig = _driver_steering_stability_fig_cached(
-            dfs, driver_run_tokens, steer_turns_signature,
+            dfs,
+            driver_run_tokens,
+            steer_turns_signature,
         )
         _plotly_chart(fig, use_container_width=True, theme=None)
     except Exception as exc:
@@ -4716,14 +4901,13 @@ def _render_driver_steering_subtab(
 
     st.divider()
     st.subheader("Corner Curvature per Lap")
-    st.caption(
-        "Mean |1/R| per lap measured from GPS path. "
-        "Tracks driven line tightness."
-    )
+    st.caption("Mean |1/R| per lap measured from GPS path. Tracks driven line tightness.")
     curvature_x_mode = _select_per_lap_axis("driver_curvature_axis", default="laps")
     try:
         fig = _driver_corner_curvature_fig_cached(
-            dfs, driver_run_tokens, curvature_x_mode,
+            dfs,
+            driver_run_tokens,
+            curvature_x_mode,
         )
         _plotly_chart(fig, use_container_width=True, theme=None)
     except Exception as exc:
@@ -4926,10 +5110,7 @@ def _render_driver_overview_subtab(
     try:
         laps_by_run: dict[str, dict[int, float]] = {}
         for run_name, df in dfs.items():
-            clean = {
-                lap: lt for lap, lt in _lap_laptimes(df).items()
-                if np.isfinite(lt)
-            }
+            clean = {lap: lt for lap, lt in _lap_laptimes(df).items() if np.isfinite(lt)}
             if clean:
                 clean.pop(max(clean), None)  # drop the incomplete final lap
             laps_by_run[run_name] = clean
@@ -4941,8 +5122,7 @@ def _render_driver_overview_subtab(
                 for run_name, clean in laps_by_run.items():
                     val = clean.get(lap_id)
                     row[f"{Path(run_name).stem} [s]"] = (
-                        round(float(val), 3) if val is not None and np.isfinite(val)
-                        else None
+                        round(float(val), 3) if val is not None and np.isfinite(val) else None
                     )
                 rows.append(row)
             st.dataframe(pl.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -5012,11 +5192,13 @@ def _render_driver_lap_analysis_subtab(
         if fastest_lap is None:
             continue
         lap_time_s = _lap_laptimes(df).get(int(fastest_lap), np.nan)
-        potential_candidates.append((
-            float(lap_time_s) if np.isfinite(lap_time_s) else np.inf,
-            run_name,
-            int(fastest_lap),
-        ))
+        potential_candidates.append(
+            (
+                float(lap_time_s) if np.isfinite(lap_time_s) else np.inf,
+                run_name,
+                int(fastest_lap),
+            )
+        )
     if potential_candidates:
         _best_time_s, potential_geometry_run, potential_geometry_lap = min(
             potential_candidates,
@@ -5045,8 +5227,7 @@ def _render_driver_lap_analysis_subtab(
             driver_run_tokens,
             potential_geometry_run,
             _cornering_turns_signature(potential_turns),
-            round(float(potential_lap_end_m), 1)
-            if np.isfinite(potential_lap_end_m) else np.nan,
+            round(float(potential_lap_end_m), 1) if np.isfinite(potential_lap_end_m) else np.nan,
         )
         potential_sectors_token = tuple(
             (
@@ -5118,12 +5299,23 @@ def _render_driver_lap_analysis_subtab(
         return
 
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Reference", summary["ref_label"], f"{summary['ref_lap_time_s']:.3f} s",
-              help="Baseline lap the comparison is measured against (often the synthetic potential lap).")
-    k2.metric("Compared", summary["cmp_label"], f"{summary['cmp_lap_time_s']:.3f} s",
-              help="Lap being analysed against the reference.")
-    k3.metric("Net Δt", f"{summary['total_delta_s']:+.3f} s",
-              help="Net time difference vs reference over the lap. Positive = slower than reference.")
+    k1.metric(
+        "Reference",
+        summary["ref_label"],
+        f"{summary['ref_lap_time_s']:.3f} s",
+        help="Baseline lap the comparison is measured against (often the synthetic potential lap).",
+    )
+    k2.metric(
+        "Compared",
+        summary["cmp_label"],
+        f"{summary['cmp_lap_time_s']:.3f} s",
+        help="Lap being analysed against the reference.",
+    )
+    k3.metric(
+        "Net Δt",
+        f"{summary['total_delta_s']:+.3f} s",
+        help="Net time difference vs reference over the lap. Positive = slower than reference.",
+    )
     k4.metric(
         "Lost / Gained",
         f"{summary['gross_lost_s']:.3f} / {summary['gross_gained_s']:.3f} s",
@@ -5185,12 +5377,10 @@ def _render_driver_lap_analysis_subtab(
                 for turn in turns
             )
             included_turns_key = (
-                f"drv_lap_included_turns_{corner_run}_{int(corner_lap)}_"
-                f"{detected_turn_token}"
+                f"drv_lap_included_turns_{corner_run}_{int(corner_lap)}_{detected_turn_token}"
             )
             click_event_key = (
-                f"drv_lap_turn_click_event_{corner_run}_{int(corner_lap)}_"
-                f"{detected_turn_token}"
+                f"drv_lap_turn_click_event_{corner_run}_{int(corner_lap)}_{detected_turn_token}"
             )
             if included_turns_key not in st.session_state:
                 st.session_state[included_turns_key] = turn_ids
@@ -5200,9 +5390,7 @@ def _render_driver_lap_analysis_subtab(
                 if int(turn_id) in set(turn_ids)
             }
             with st.expander("Curves included in Lap Analysis", expanded=True):
-                st.caption(
-                    "Click a highlighted curve on the map to include/exclude it."
-                )
+                st.caption("Click a highlighted curve on the map to include/exclude it.")
                 if st.button(
                     "Include all curves",
                     key=f"drv_lap_include_all_{corner_run}_{int(corner_lap)}_{detected_turn_token}",
@@ -5215,16 +5403,12 @@ def _render_driver_lap_analysis_subtab(
                     for turn_id in turn_ids
                     if turn_id in selected_turn_set
                 ]
-                st.caption(
-                    f"{len(selected_turn_set)} / {len(turn_ids)} detected curves included"
-                )
+                st.caption(f"{len(selected_turn_set)} / {len(turn_ids)} detected curves included")
                 if included_names:
                     st.write(", ".join(included_names))
                 else:
                     st.write("No curves selected.")
-            active_turns = [
-                turn for turn in turns if int(turn.turn_id) in selected_turn_set
-            ]
+            active_turns = [turn for turn in turns if int(turn.turn_id) in selected_turn_set]
             if not active_turns:
                 st.warning("Select at least one curve to run Lap Analysis.")
     except Exception as exc:
@@ -5242,7 +5426,11 @@ def _render_driver_lap_analysis_subtab(
     if active_turns:
         try:
             phase_table, phase_bounds = drv.corner_phase_delta_table(
-                analysis_dfs, ref_run, int(ref_lap), cmp_run, int(cmp_lap),
+                analysis_dfs,
+                ref_run,
+                int(ref_lap),
+                cmp_run,
+                int(cmp_lap),
                 turns=active_turns,
                 apex_half_window_m=5.0,
                 brake_threshold_pct=brake_thr,
@@ -5277,10 +5465,7 @@ def _render_driver_lap_analysis_subtab(
             int(fastest_lap),
         )
         if turns:
-            run_turns = [
-                turn for turn in run_turns
-                if int(turn.turn_id) in selected_turn_set
-            ]
+            run_turns = [turn for turn in run_turns if int(turn.turn_id) in selected_turn_set]
         turns_signature = _cornering_turns_signature(run_turns)
         lap_end_m = lsec.lap_end_distance(dfs[run_name], int(fastest_lap))
         sectors = _driver_lap_sectors_cached(
@@ -5312,7 +5497,9 @@ def _render_driver_lap_analysis_subtab(
         if map_phase_bounds:
             try:
                 gate_ui_rev = f"{ref_run}_{ref_lap}_{cmp_run}_{cmp_lap}"
-                manual_gate_line, open_fullscreen = _render_manual_gate_editor(f"driver_{gate_ui_rev}")
+                manual_gate_line, open_fullscreen = _render_manual_gate_editor(
+                    f"driver_{gate_ui_rev}"
+                )
                 if manual_gate_line is not None:
                     st.caption(
                         "Manual line: "
@@ -5424,8 +5611,7 @@ def _render_driver_lap_analysis_subtab(
         phase_by_id = {int(p.turn_id): p for p in phase_bounds}
         turn_by_id = {int(t.turn_id): t for t in active_turns}
         total_by_id = {
-            int(row["Turn"]): float(row["Total [s]"])
-            for row in phase_table.iter_rows(named=True)
+            int(row["Turn"]): float(row["Total [s]"]) for row in phase_table.iter_rows(named=True)
         }
         corner_options = sorted(
             phase_by_id.keys(),
@@ -5434,9 +5620,7 @@ def _render_driver_lap_analysis_subtab(
         sel_corner = st.selectbox(
             "Inspect corner",
             options=corner_options,
-            format_func=lambda tid: (
-                f"T{int(tid)}   Δt {total_by_id.get(int(tid), 0.0):+.3f} s"
-            ),
+            format_func=lambda tid: f"T{int(tid)}   Δt {total_by_id.get(int(tid), 0.0):+.3f} s",
             key=f"drv_corner_detail_sel_{ref_run}_{ref_lap}_{cmp_run}_{cmp_lap}",
         )
         detail_ref_run, detail_ref_lap = ref_run, int(ref_lap)
@@ -5518,7 +5702,11 @@ def _render_driver_lap_analysis_subtab(
 
             try:
                 detail_fig = drv.corner_detail_fig(
-                    analysis_dfs, detail_ref_run, int(detail_ref_lap), cmp_run, int(cmp_lap),
+                    analysis_dfs,
+                    detail_ref_run,
+                    int(detail_ref_lap),
+                    cmp_run,
+                    int(cmp_lap),
                     turn_by_id[int(sel_corner)],
                     phases=phase_by_id[int(sel_corner)],
                     signal_keys=selected_signal_keys,
@@ -5655,11 +5843,7 @@ def _render_driver_video_subtab(
         key="driver_video_compare_enabled",
     )
     if compare_enabled:
-        default_compare_idx = (
-            csv_files.index(selected_run)
-            if selected_run in csv_files
-            else 0
-        )
+        default_compare_idx = csv_files.index(selected_run) if selected_run in csv_files else 0
         vc1, vc2 = st.columns([2, 1])
         with vc1:
             compare_file = st.selectbox(
@@ -5678,9 +5862,7 @@ def _render_driver_video_subtab(
                 else load_run(str(DATA_DIR / compare_file), compare_sig)
             )
             compare_token = (compare_file, compare_sig)
-            compare_lap_options = list(
-                _available_laps_cached(compare_raw_df, compare_token)
-            )
+            compare_lap_options = list(_available_laps_cached(compare_raw_df, compare_token))
             if len(compare_lap_options) > 1:
                 compare_lap_options = compare_lap_options[:-1]
             compare_lap_times = _lap_laptimes_cached(compare_raw_df, compare_token)
@@ -5689,12 +5871,16 @@ def _render_driver_video_subtab(
         else:
             if compare_lap_options:
                 with vc2:
-                    compare_lap_id = int(st.selectbox(
-                        "Comparison lap",
-                        options=compare_lap_options,
-                        key=f"driver_video_compare_lap_{compare_file}",
-                        format_func=lambda lap, times=compare_lap_times: _format_lap_with_laptime(lap, times),
-                    ))
+                    compare_lap_id = int(
+                        st.selectbox(
+                            "Comparison lap",
+                            options=compare_lap_options,
+                            key=f"driver_video_compare_lap_{compare_file}",
+                            format_func=lambda lap, times=compare_lap_times: (
+                                _format_lap_with_laptime(lap, times)
+                            ),
+                        )
+                    )
                 try:
                     compare_payload = _video_payload_cached(compare_raw_df, compare_token)
                 except Exception as exc:
@@ -5747,10 +5933,7 @@ def _render_driver_video_subtab(
 
 def _tab_rb(dfs: dict[str, pl.DataFrame]) -> None:
     st.subheader("RB — Braking & Regeneration Behaviour")
-    st.caption(
-        "Recovery efficiency, decel response and lockup behaviour under "
-        "braking."
-    )
+    st.caption("Recovery efficiency, decel response and lockup behaviour under braking.")
     rb_x_mode = _select_per_lap_axis("rb_axis", default="laps")
     try:
         if len(dfs) == 1:
@@ -5768,14 +5951,18 @@ def _tab_rb(dfs: dict[str, pl.DataFrame]) -> None:
                 c4.metric("Recovery efficiency", f"{_fmt(kpis['recovery_efficiency_pct'], '.1f')}%")
                 c5, c6, c7, c8 = st.columns(4)
                 c5.metric("Brake → decel gain", f"{_fmt(kpis['brake_decel_gain'], '.4f')} m/s²/%")
-                c6.metric("Torque → decel gain", f"{_fmt(kpis['torque_decel_gain'], '.4f')} m/s²/Nm")
+                c6.metric(
+                    "Torque → decel gain", f"{_fmt(kpis['torque_decel_gain'], '.4f')} m/s²/Nm"
+                )
                 c7.metric("Current delay", f"{_fmt(kpis['delay_current_ms'], '.0f')} ms")
                 c8.metric("Current near target", f"{_fmt(kpis['current_near_target_pct'], '.1f')}%")
                 c9, c10, c11, c12 = st.columns(4)
                 c9.metric("Wh / s braking", f"{_fmt(kpis['regen_density_wh_s'], '.3f')}")
                 c10.metric("Wh / m braking", f"{_fmt(kpis['regen_density_wh_m'], '.4f')}")
                 c11.metric("Front regen share", f"{_fmt(kpis['front_regen_share_pct'], '.1f')}%")
-                c12.metric("Yaw disturbance P95", f"{_fmt(kpis['yaw_disturbance_p95_radps'], '.3f')} rad/s")
+                c12.metric(
+                    "Yaw disturbance P95", f"{_fmt(kpis['yaw_disturbance_p95_radps'], '.3f')} rad/s"
+                )
                 c13, c14, c15, c16 = st.columns(4)
                 c13.metric("Yaw event P95", f"{_fmt(kpis['yaw_event_max_p95_radps'], '.3f')} rad/s")
                 c14.metric("β peak P95", f"{_fmt(kpis['beta_peak_p95_deg'], '.2f')} deg")
@@ -5791,57 +5978,69 @@ def _tab_rb(dfs: dict[str, pl.DataFrame]) -> None:
                 with st.expander("Braking events"):
                     st.dataframe(kpis["table"], use_container_width=True, hide_index=True)
                 with st.expander("Wheel locking per lap"):
-                    st.dataframe(kpis["lockup_per_lap_table"], use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        kpis["lockup_per_lap_table"], use_container_width=True, hide_index=True
+                    )
         else:
-            run_results = {run_name: rb.rb_figs_kpis(df, x_mode=rb_x_mode) for run_name, df in dfs.items()}
+            run_results = {
+                run_name: rb.rb_figs_kpis(df, x_mode=rb_x_mode) for run_name, df in dfs.items()
+            }
             for run_name, (_figs, kpis) in run_results.items():
                 for note in kpis.get("notes", []):
                     st.info(f"{run_name}: {note}")
                 for w in kpis.get("warnings", []):
                     st.warning(f"{run_name}: {w}")
-            _show_summary_table([
-                {
-                    "Run": run_name,
-                    "Brake events": kpis["event_count"],
-                    "Mean decel [m/s²]": round(kpis["mean_decel_ms2"], 3),
-                    "Peak decel [m/s²]": round(kpis["peak_decel_ms2"], 3),
-                    "Recovered [Wh]": round(kpis["total_recovered_wh"], 2),
-                    "Recovery [%]": round(kpis["recovery_efficiency_pct"], 2),
-                    "Brake-decel gain": round(kpis["brake_decel_gain"], 5),
-                    "Torque-decel gain": round(kpis["torque_decel_gain"], 5),
-                    "Current delay [ms]": round(kpis["delay_current_ms"], 1),
-                    "Front share [%]": round(kpis["front_regen_share_pct"], 1),
-                    "Yaw P95 [rad/s]": round(kpis["yaw_disturbance_p95_radps"], 3),
-                    "Yaw event P95 [rad/s]": round(kpis["yaw_event_max_p95_radps"], 3),
-                    "Beta peak P95 [deg]": round(kpis["beta_peak_p95_deg"], 3),
-                    "Lockup events": kpis["lockup_events_total"],
-                    "Lockup time [s]": round(kpis["lockup_total_time_s"], 3),
-                    "SR osc P95": round(kpis["sr_steady_oscillation_p95"], 4),
-                    "Bias vs Fz MAE [%]": round(kpis["bias_vs_fz_mae_mean_pct"], 2),
-                    "Pitch peak P95 [rad/s]": round(kpis["pitch_peak_p95_radps"], 3),
-                }
-                for run_name, (_figs, kpis) in run_results.items()
-                if not kpis.get("warnings")
-            ])
-            for fig in _overlay_figures({run_name: figs for run_name, (figs, _kpis) in run_results.items()}):
+            _show_summary_table(
+                [
+                    {
+                        "Run": run_name,
+                        "Brake events": kpis["event_count"],
+                        "Mean decel [m/s²]": round(kpis["mean_decel_ms2"], 3),
+                        "Peak decel [m/s²]": round(kpis["peak_decel_ms2"], 3),
+                        "Recovered [Wh]": round(kpis["total_recovered_wh"], 2),
+                        "Recovery [%]": round(kpis["recovery_efficiency_pct"], 2),
+                        "Brake-decel gain": round(kpis["brake_decel_gain"], 5),
+                        "Torque-decel gain": round(kpis["torque_decel_gain"], 5),
+                        "Current delay [ms]": round(kpis["delay_current_ms"], 1),
+                        "Front share [%]": round(kpis["front_regen_share_pct"], 1),
+                        "Yaw P95 [rad/s]": round(kpis["yaw_disturbance_p95_radps"], 3),
+                        "Yaw event P95 [rad/s]": round(kpis["yaw_event_max_p95_radps"], 3),
+                        "Beta peak P95 [deg]": round(kpis["beta_peak_p95_deg"], 3),
+                        "Lockup events": kpis["lockup_events_total"],
+                        "Lockup time [s]": round(kpis["lockup_total_time_s"], 3),
+                        "SR osc P95": round(kpis["sr_steady_oscillation_p95"], 4),
+                        "Bias vs Fz MAE [%]": round(kpis["bias_vs_fz_mae_mean_pct"], 2),
+                        "Pitch peak P95 [rad/s]": round(kpis["pitch_peak_p95_radps"], 3),
+                    }
+                    for run_name, (_figs, kpis) in run_results.items()
+                    if not kpis.get("warnings")
+                ]
+            )
+            for fig in _overlay_figures(
+                {run_name: figs for run_name, (figs, _kpis) in run_results.items()}
+            ):
                 _plotly_chart(fig, use_container_width=True, theme=None)
             with st.expander("Braking events"):
                 st.dataframe(
-                    _concat_run_tables({
-                        run_name: kpis["table"]
-                        for run_name, (_figs, kpis) in run_results.items()
-                        if not kpis.get("warnings")
-                    }),
+                    _concat_run_tables(
+                        {
+                            run_name: kpis["table"]
+                            for run_name, (_figs, kpis) in run_results.items()
+                            if not kpis.get("warnings")
+                        }
+                    ),
                     use_container_width=True,
                     hide_index=True,
                 )
             with st.expander("Wheel locking per lap"):
                 st.dataframe(
-                    _concat_run_tables({
-                        run_name: kpis["lockup_per_lap_table"]
-                        for run_name, (_figs, kpis) in run_results.items()
-                        if not kpis.get("warnings")
-                    }),
+                    _concat_run_tables(
+                        {
+                            run_name: kpis["lockup_per_lap_table"]
+                            for run_name, (_figs, kpis) in run_results.items()
+                            if not kpis.get("warnings")
+                        }
+                    ),
                     use_container_width=True,
                     hide_index=True,
                 )
@@ -5873,6 +6072,7 @@ def _tab_controls(dfs: dict[str, pl.DataFrame]) -> None:
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
 
 @st.cache_data(show_spinner=False)
 def _logo_data_uri(path: str, file_signature: FileSignature) -> str | None:
@@ -5952,8 +6152,7 @@ _GLOBAL_STYLE_CSS = """
 def _render_dashboard_header() -> None:
     """Render the dashboard brand and author credit."""
     st.markdown(
-        _GLOBAL_STYLE_CSS
-        .replace("__BODY__", FONT_FAMILY)
+        _GLOBAL_STYLE_CSS.replace("__BODY__", FONT_FAMILY)
         .replace("__DISPLAY__", FONT_DISPLAY)
         .replace("__MONO__", FONT_MONO)
         .replace("__SURFACE__", _SURFACE)
@@ -6018,10 +6217,7 @@ def _render_dashboard_header() -> None:
         else None
     )
     if logo_uri is not None:
-        logo_html = (
-            f'<img class="cat17x-topbar__logo" src="{logo_uri}" '
-            'alt="BCN eMotorsport">'
-        )
+        logo_html = f'<img class="cat17x-topbar__logo" src="{logo_uri}" alt="BCN eMotorsport">'
     else:
         logo_html = '<div class="cat17x-topbar__credit">BCN eMotorsport</div>'
     st.markdown(
@@ -6080,10 +6276,7 @@ def main() -> None:
         st.sidebar.warning("Select at least one run.")
         return
 
-    file_signatures = {
-        fname: _file_signature(DATA_DIR / fname)
-        for fname in selected_files
-    }
+    file_signatures = {fname: _file_signature(DATA_DIR / fname) for fname in selected_files}
 
     raw_dfs: dict[str, pl.DataFrame] = {}
     for fname in selected_files:

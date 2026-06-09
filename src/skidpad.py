@@ -4,6 +4,7 @@ The functions in this module are pure dashboard helpers: they accept a
 ``polars.DataFrame`` already loaded by ``utils.load_data`` and return a Plotly
 figure plus a KPI dictionary. Rendering belongs in ``src/dashboard.py``.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -136,7 +137,8 @@ def classify_circles(df: pl.DataFrame) -> dict[int, dict[str, Any]]:
         for idx, lap_id in enumerate(side_laps):
             rows[lap_id]["role"] = "timed" if idx >= 1 else "warmup"
         timed_laps = [
-            lap for lap in side_laps
+            lap
+            for lap in side_laps
             if rows[lap]["role"] == "timed" and np.isfinite(rows[lap]["laptime_s"])
         ]
         if timed_laps:
@@ -245,14 +247,16 @@ def lateral_g_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[str, An
             "ay_p95_g": _safe_percentile(ay_g, 95),
             "ay_std_g": _safe_std(ay_g),
         }
-        rows.append({
-            "Run": label,
-            "ay_mean_g": _round(_safe_mean(ay_g), 3),
-            "ay_max_g": _round(_safe_max(ay_g), 3),
-            "ay_p95_g": _round(_safe_percentile(ay_g, 95), 3),
-            "ay_std_g": _round(_safe_std(ay_g), 3),
-            "Samples": int(ay_g.size),
-        })
+        rows.append(
+            {
+                "Run": label,
+                "ay_mean_g": _round(_safe_mean(ay_g), 3),
+                "ay_max_g": _round(_safe_max(ay_g), 3),
+                "ay_p95_g": _round(_safe_percentile(ay_g, 95), 3),
+                "ay_std_g": _round(_safe_std(ay_g), 3),
+                "Samples": int(ay_g.size),
+            }
+        )
 
     fig.update_layout(barmode="overlay", height=440)
     fig.update_xaxes(range=[0.0, 2.4])
@@ -323,14 +327,16 @@ def driven_radius_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[str
             "pct_time_in_band_pct": pct_band,
             "radius_error_m": r_mean - SKIDPAD_IDEAL_RADIUS_M if np.isfinite(r_mean) else np.nan,
         }
-        rows.append({
-            "Run": label,
-            "R_mean_m": _round(r_mean, 3),
-            "R_std_m": _round(_safe_std(values), 3),
-            "pct_time_in_band_pct": _round(pct_band, 1),
-            "radius_error_m": _round(r_mean - SKIDPAD_IDEAL_RADIUS_M, 3),
-            "Samples": int(values.size),
-        })
+        rows.append(
+            {
+                "Run": label,
+                "R_mean_m": _round(r_mean, 3),
+                "R_std_m": _round(_safe_std(values), 3),
+                "pct_time_in_band_pct": _round(pct_band, 1),
+                "radius_error_m": _round(r_mean - SKIDPAD_IDEAL_RADIUS_M, 3),
+                "Samples": int(values.size),
+            }
+        )
 
     fig.update_layout(barmode="overlay", height=460)
     fig.update_xaxes(range=[2.0, 20.0])
@@ -366,9 +372,7 @@ def balance_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[str, Any]
         # Skidpad: a whole timed circle is steady-state, so average slip angles
         # over the full timed lap (only dropping non-finite samples).
         good = (
-            _lap_mask(arr["laps"], circles)
-            & np.isfinite(front_sa_deg)
-            & np.isfinite(rear_sa_deg)
+            _lap_mask(arr["laps"], circles) & np.isfinite(front_sa_deg) & np.isfinite(rear_sa_deg)
         )
         try:
             us_mean = _steady_state_understeer(df, circles)["mean_deg"]
@@ -383,8 +387,11 @@ def balance_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[str, Any]
         # Positive = understeer: the front axle works at a higher slip angle.
         bal = front_mean - rear_mean
         fig.add_trace(
-            go.Bar(x=["Front SA", "Rear SA"], y=[front_mean, rear_mean], name=label, marker_color=color),
-            row=1, col=1,
+            go.Bar(
+                x=["Front SA", "Rear SA"], y=[front_mean, rear_mean], name=label, marker_color=color
+            ),
+            row=1,
+            col=1,
         )
         fig.add_trace(
             go.Bar(
@@ -394,24 +401,29 @@ def balance_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[str, Any]
                 marker_color=color,
                 showlegend=False,
             ),
-            row=2, col=1,
+            row=2,
+            col=1,
         )
         runs[run_name] = {
             "balance_index_deg": bal,
             "understeer_angle_mean_deg": us_mean,
         }
-        rows.append({
-            "Run": label,
-            "SA_F_mean_deg": _round(front_mean, 3),
-            "SA_R_mean_deg": _round(rear_mean, 3),
-            "SA_F_p95_deg": _round(_safe_percentile(front_sa_deg[good], 95), 3),
-            "SA_R_p95_deg": _round(_safe_percentile(rear_sa_deg[good], 95), 3),
-            "balance_index_deg": _round(bal, 3),
-            "understeer_angle_mean_deg": _round(us_mean, 3),
-            "Samples": int(good.sum()),
-        })
+        rows.append(
+            {
+                "Run": label,
+                "SA_F_mean_deg": _round(front_mean, 3),
+                "SA_R_mean_deg": _round(rear_mean, 3),
+                "SA_F_p95_deg": _round(_safe_percentile(front_sa_deg[good], 95), 3),
+                "SA_R_p95_deg": _round(_safe_percentile(rear_sa_deg[good], 95), 3),
+                "balance_index_deg": _round(bal, 3),
+                "understeer_angle_mean_deg": _round(us_mean, 3),
+                "Samples": int(good.sum()),
+            }
+        )
 
-    fig.add_hline(y=0.0, line=dict(color="rgba(235,235,235,0.45)", dash="dash", width=1), row=2, col=1)
+    fig.add_hline(
+        y=0.0, line=dict(color="rgba(235,235,235,0.45)", dash="dash", width=1), row=2, col=1
+    )
     _apply_dark_layout(fig, "Skidpad balance", height=620)
     fig.update_yaxes(title_text="Slip angle [deg]", row=1, col=1)
     fig.update_yaxes(title_text="Angle [deg]", row=2, col=1)
@@ -479,13 +491,15 @@ def understeer_gradient_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, di
             "understeer_angle_L_deg": us["L_deg"],
             "samples": int(us["n"]),
         }
-        rows.append({
-            "Run": label,
-            "understeer_R_deg": _round(us["R_deg"], 3),
-            "understeer_L_deg": _round(us["L_deg"], 3),
-            "understeer_mean_deg": _round(us["mean_deg"], 3),
-            "Samples": int(us["n"]),
-        })
+        rows.append(
+            {
+                "Run": label,
+                "understeer_R_deg": _round(us["R_deg"], 3),
+                "understeer_L_deg": _round(us["L_deg"], 3),
+                "understeer_mean_deg": _round(us["mean_deg"], 3),
+                "Samples": int(us["n"]),
+            }
+        )
 
     fig.update_layout(height=460, barmode="group")
     return fig, {
@@ -519,7 +533,9 @@ def tv_intervention_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[s
         mz_applied = _tv_yaw_moment_from_torque(arr)
         yaw_err = arr["TV_errorYawRate"]
         ay_g = arr["Filtering_VN_ay"] / G_MPS2
-        sustained = _sustained_balance_mask(arr["VN_vx"], arr["Filtering_VN_ay"]) & _lap_mask(arr["laps"], circles)
+        sustained = _sustained_balance_mask(arr["VN_vx"], arr["Filtering_VN_ay"]) & _lap_mask(
+            arr["laps"], circles
+        )
 
         good_mz = sustained & np.isfinite(mz_applied) & np.isfinite(ay_g)
         if good_mz.any():
@@ -538,7 +554,9 @@ def tv_intervention_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[s
         yaw_good = sustained & np.isfinite(yaw_err)
         side_mz: dict[str, float] = {}
         for side in ("R", "L"):
-            side_mask = good_mz & np.isin(arr["laps"], np.asarray(_circle_laps_for_side(circles, side), dtype=float))
+            side_mask = good_mz & np.isin(
+                arr["laps"], np.asarray(_circle_laps_for_side(circles, side), dtype=float)
+            )
             side_mz[side] = _safe_mean(mz_applied[side_mask])
         runs[run_name] = {
             "Mz_mean_Nm": _safe_mean(mz_applied[good_mz]),
@@ -546,13 +564,15 @@ def tv_intervention_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[s
             "Mz_R_mean_Nm": side_mz["R"],
             "Mz_L_mean_Nm": side_mz["L"],
         }
-        rows.append({
-            "Run": label,
-            "Mz_mean_Nm": _round(_safe_mean(mz_applied[good_mz]), 2),
-            "Mz_abs_mean_Nm": _round(_safe_mean(np.abs(mz_applied[good_mz])), 2),
-            "yaw_err_rms_rad_s": _round(_rms(yaw_err[yaw_good]), 4),
-            "Samples": int(good_mz.sum()),
-        })
+        rows.append(
+            {
+                "Run": label,
+                "Mz_mean_Nm": _round(_safe_mean(mz_applied[good_mz]), 2),
+                "Mz_abs_mean_Nm": _round(_safe_mean(np.abs(mz_applied[good_mz])), 2),
+                "yaw_err_rms_rad_s": _round(_rms(yaw_err[yaw_good]), 4),
+                "Samples": int(good_mz.sum()),
+            }
+        )
 
     fig.update_layout(height=480)
     return fig, {
@@ -584,7 +604,9 @@ def lateral_load_dist_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict
 
         run_lltd: list[np.ndarray] = []
         for side in ("R", "L"):
-            side_mask = np.isin(arr["laps"], np.asarray(_circle_laps_for_side(circles, side), dtype=float))
+            side_mask = np.isin(
+                arr["laps"], np.asarray(_circle_laps_for_side(circles, side), dtype=float)
+            )
             front_transfer, rear_transfer = _axle_load_transfer(side, arr, side_mask)
             denom = front_transfer + rear_transfer
             good = (
@@ -610,13 +632,15 @@ def lateral_load_dist_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict
             "LLTD_theory_pct": 100.0 * LLTD_THEORY,
             "delta_pct": mean_lltd - 100.0 * LLTD_THEORY if np.isfinite(mean_lltd) else np.nan,
         }
-        rows.append({
-            "Run": label,
-            "LLTD_meas_pct": _round(mean_lltd, 2),
-            "LLTD_theory_pct": _round(100.0 * LLTD_THEORY, 2),
-            "delta_pct": _round(mean_lltd - 100.0 * LLTD_THEORY, 2),
-            "Samples": int(lltd_all.size),
-        })
+        rows.append(
+            {
+                "Run": label,
+                "LLTD_meas_pct": _round(mean_lltd, 2),
+                "LLTD_theory_pct": _round(100.0 * LLTD_THEORY, 2),
+                "delta_pct": _round(mean_lltd - 100.0 * LLTD_THEORY, 2),
+                "Samples": int(lltd_all.size),
+            }
+        )
 
     fig.add_trace(
         go.Bar(
@@ -645,20 +669,24 @@ def lateral_load_dist_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict
     }
 
 
-def _lr_asymmetry_rows(df: pl.DataFrame, circles: dict[int, dict[str, Any]]) -> tuple[list[dict[str, object]], list[str]]:
+def _lr_asymmetry_rows(
+    df: pl.DataFrame, circles: dict[int, dict[str, Any]]
+) -> tuple[list[dict[str, object]], list[str]]:
     """Right-minus-left asymmetry metric rows for a single run."""
     warnings: list[str] = []
     rows: list[dict[str, object]] = []
 
     def add_metric(name: str, right: float, left: float, unit: str, decimals: int = 3) -> None:
         delta = right - left if np.isfinite(right) and np.isfinite(left) else np.nan
-        rows.append({
-            "Metric": name,
-            "R": _round(right, decimals),
-            "L": _round(left, decimals),
-            "R-L": _round(delta, decimals),
-            "Unit": unit,
-        })
+        rows.append(
+            {
+                "Metric": name,
+                "R": _round(right, decimals),
+                "L": _round(left, decimals),
+                "R-L": _round(delta, decimals),
+                "Unit": unit,
+            }
+        )
 
     timed = _official_timed_times(circles)
     add_metric("laptime_timed", timed.get("R", np.nan), timed.get("L", np.nan), "s", 3)
@@ -671,7 +699,9 @@ def _lr_asymmetry_rows(df: pl.DataFrame, circles: dict[int, dict[str, Any]]) -> 
             for side, laps in side_laps.items()
         }
         steer_side = {
-            side: _side_mean_abs(np.rad2deg(arr_core["Steering"]), arr_core["laps"], laps)  # Steering-pot [rad]→deg; no STEERING_RATIO
+            side: _side_mean_abs(
+                np.rad2deg(arr_core["Steering"]), arr_core["laps"], laps
+            )  # Steering-pot [rad]→deg; no STEERING_RATIO
             for side, laps in side_laps.items()
         }
         radius = _driven_radius_m(
@@ -789,7 +819,9 @@ def gps_figure8_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[str, 
             runs[run_name] = {"gps_samples": int(gps_valid.sum()), "centers": {}}
             continue
 
-        x_valid, y_valid = gps_to_local_xy(arr["VN_latitude"][gps_valid], arr["VN_longitude"][gps_valid])
+        x_valid, y_valid = gps_to_local_xy(
+            arr["VN_latitude"][gps_valid], arr["VN_longitude"][gps_valid]
+        )
         x = np.full(len(df), np.nan, dtype=float)
         y = np.full(len(df), np.nan, dtype=float)
         x[gps_valid] = x_valid
@@ -861,7 +893,9 @@ def yaw_rate_vs_ay_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict[st
         required = ["laps", "Filtering_VN_ay", "VN_vx", yaw_col]
         _require_columns(df, required)
         arr = cols_to_numpy(df, required)
-        mask = _sustained_balance_mask(arr["VN_vx"], arr["Filtering_VN_ay"]) & _lap_mask(arr["laps"], circles)
+        mask = _sustained_balance_mask(arr["VN_vx"], arr["Filtering_VN_ay"]) & _lap_mask(
+            arr["laps"], circles
+        )
         if not mask.any():
             continue
         fig.add_trace(
@@ -905,13 +939,15 @@ def _lap_time_s(arr: dict[str, np.ndarray], mask: np.ndarray) -> float:
 def _circle_summary_rows(circles: dict[int, dict[str, Any]]) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for lap_id, info in circles.items():
-        rows.append({
-            "Lap": int(lap_id),
-            "Side": str(info["side"]),
-            "Official": "yes" if info.get("official_timed", False) else "",
-            "Laptime [s]": _round(float(info["laptime_s"]), 3),
-            "Samples": int(info["n_samples"]),
-        })
+        rows.append(
+            {
+                "Lap": int(lap_id),
+                "Side": str(info["side"]),
+                "Official": "yes" if info.get("official_timed", False) else "",
+                "Laptime [s]": _round(float(info["laptime_s"]), 3),
+                "Samples": int(info["n_samples"]),
+            }
+        )
     return rows
 
 
@@ -924,8 +960,12 @@ def _add_table_trace(fig: go.Figure, rows: list[dict[str, object]], *, row: int,
         values = [[""] for _ in headers]
     fig.add_trace(
         go.Table(
-            header=dict(values=headers, fill_color="#22252B", font=dict(color=_TEXT, size=11), align="left"),
-            cells=dict(values=values, fill_color="#171A1F", font=dict(color=_TEXT, size=10), align="left"),
+            header=dict(
+                values=headers, fill_color="#22252B", font=dict(color=_TEXT, size=11), align="left"
+            ),
+            cells=dict(
+                values=values, fill_color="#171A1F", font=dict(color=_TEXT, size=10), align="left"
+            ),
         ),
         row=row,
         col=col,
@@ -959,9 +999,13 @@ def _classification_warnings(circles: dict[int, dict[str, Any]]) -> list[str]:
         warnings.append(
             f"Expected at least 1 timed circle per side, got {n_total} ({n_r} R, {n_l} L)."
         )
-    if not any(info.get("official_timed", False) and info["side"] == "R" for info in circles.values()):
+    if not any(
+        info.get("official_timed", False) and info["side"] == "R" for info in circles.values()
+    ):
         warnings.append("No official timed right-hand circle could be identified.")
-    if not any(info.get("official_timed", False) and info["side"] == "L" for info in circles.values()):
+    if not any(
+        info.get("official_timed", False) and info["side"] == "L" for info in circles.values()
+    ):
         warnings.append("No official timed left-hand circle could be identified.")
     return warnings
 
@@ -981,12 +1025,17 @@ def _official_timed_times(circles: dict[int, dict[str, Any]]) -> dict[str, float
 
 def _side_eval_laps(circles: dict[int, dict[str, Any]], side: str) -> list[int]:
     official = [
-        lap_id for lap_id, info in circles.items()
+        lap_id
+        for lap_id, info in circles.items()
         if info["side"] == side and info.get("official_timed", False)
     ]
     if official:
         return official
-    timed = [lap_id for lap_id, info in circles.items() if info["side"] == side and info["role"] == "timed"]
+    timed = [
+        lap_id
+        for lap_id, info in circles.items()
+        if info["side"] == side and info["role"] == "timed"
+    ]
     if timed:
         return timed
     return [lap_id for lap_id, info in circles.items() if info["side"] == side]
@@ -1015,7 +1064,7 @@ def _driven_radius_m(time_s: np.ndarray, vx_mps: np.ndarray, ay_mps2: np.ndarray
     vx = np.asarray(vx_mps, dtype=float)
     ay_abs = np.abs(np.asarray(ay_mps2, dtype=float))
     radius = np.divide(
-        vx ** 2,
+        vx**2,
         ay_abs,
         out=np.full_like(vx, np.nan, dtype=float),
         where=np.isfinite(vx) & np.isfinite(ay_abs) & (ay_abs > 0.2),
@@ -1029,7 +1078,9 @@ def _driven_radius_m(time_s: np.ndarray, vx_mps: np.ndarray, ay_mps2: np.ndarray
     return radius
 
 
-def _sustained_radius_mask(vx_mps: np.ndarray, ay_mps2: np.ndarray, radius_m: np.ndarray) -> np.ndarray:
+def _sustained_radius_mask(
+    vx_mps: np.ndarray, ay_mps2: np.ndarray, radius_m: np.ndarray
+) -> np.ndarray:
     return (
         np.isfinite(vx_mps)
         & np.isfinite(ay_mps2)
@@ -1051,16 +1102,14 @@ def _sustained_balance_mask(vx_mps: np.ndarray, ay_mps2: np.ndarray) -> np.ndarr
 
 
 def _front_rear_sa_deg(arr: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    front_sa_deg = 0.5 * (
-        np.rad2deg(np.abs(arr["Est_SAFL"])) + np.rad2deg(np.abs(arr["Est_SAFR"]))
-    )
-    rear_sa_deg = 0.5 * (
-        np.rad2deg(np.abs(arr["Est_SARL"])) + np.rad2deg(np.abs(arr["Est_SARR"]))
-    )
+    front_sa_deg = 0.5 * (np.rad2deg(np.abs(arr["Est_SAFL"])) + np.rad2deg(np.abs(arr["Est_SAFR"])))
+    rear_sa_deg = 0.5 * (np.rad2deg(np.abs(arr["Est_SARL"])) + np.rad2deg(np.abs(arr["Est_SARR"])))
     return front_sa_deg, rear_sa_deg
 
 
-def _understeer_angle_deg(steering_rad: np.ndarray, ay_mps2: np.ndarray, vx_mps: np.ndarray) -> np.ndarray:
+def _understeer_angle_deg(
+    steering_rad: np.ndarray, ay_mps2: np.ndarray, vx_mps: np.ndarray
+) -> np.ndarray:
     """Steady-state understeer angle [deg]: ``|Steering| - |delta_ackermann|``.
 
     ``Steering`` is the steering-potentiometer value in radians; the team's
@@ -1072,7 +1121,7 @@ def _understeer_angle_deg(steering_rad: np.ndarray, ay_mps2: np.ndarray, vx_mps:
     vx = np.asarray(vx_mps, dtype=float)
     ideal_rad = np.divide(
         WHEELBASE_EQ * np.asarray(ay_mps2, dtype=float),
-        vx ** 2,
+        vx**2,
         out=np.full_like(vx, np.nan, dtype=float),
         where=np.isfinite(vx) & (np.abs(vx) > 0.5),
     )
@@ -1100,9 +1149,11 @@ def _steady_state_understeer(
     arr = cols_to_numpy(df, required)
     understeer_deg = _understeer_angle_deg(arr["Steering"], arr["Filtering_VN_ay"], arr[vx_col])
 
-    source = side_laps if side_laps is not None else {
-        side: _circle_laps_for_side(circles, side) for side in ("R", "L")
-    }
+    source = (
+        side_laps
+        if side_laps is not None
+        else {side: _circle_laps_for_side(circles, side) for side in ("R", "L")}
+    )
     out: dict[str, float] = {"mean_deg": np.nan, "R_deg": np.nan, "L_deg": np.nan, "n": 0}
     total = 0
     for side in ("R", "L"):
@@ -1176,7 +1227,7 @@ def _fit_circle_center(x: np.ndarray, y: np.ndarray) -> tuple[float, float] | No
     if x.size < 10:
         return None
     a = np.column_stack((2.0 * x, 2.0 * y, np.ones_like(x)))
-    b = x ** 2 + y ** 2
+    b = x**2 + y**2
     try:
         solution, *_ = np.linalg.lstsq(a, b, rcond=None)
     except np.linalg.LinAlgError:
@@ -1249,7 +1300,7 @@ def _abs_diff(a: float, b: float) -> float:
 def _rms(values: np.ndarray | list[float]) -> float:
     arr = np.asarray(values, dtype=float)
     arr = arr[np.isfinite(arr)]
-    return float(np.sqrt(np.nanmean(arr ** 2))) if arr.size else np.nan
+    return float(np.sqrt(np.nanmean(arr**2))) if arr.size else np.nan
 
 
 def _round(value: float, decimals: int) -> float:

@@ -243,11 +243,9 @@ def potential_lap(
     if not per_lap:
         return _metric_nan_dict()
 
-    sector_indices = sorted({
-        int(stat.sector_index)
-        for lap_stats in per_lap.values()
-        for stat in lap_stats
-    })
+    sector_indices = sorted(
+        {int(stat.sector_index) for lap_stats in per_lap.values() for stat in lap_stats}
+    )
     for sector_index in sector_indices:
         candidates = [
             stat
@@ -274,9 +272,7 @@ def potential_lap(
         throttle_weighted_s += duration_s * float(stat.n_throttle) / float(stat.samples)
         braking_weighted_s += duration_s * float(stat.n_braking) / float(stat.samples)
         coasting_weighted_s += duration_s * float(stat.n_coasting) / float(stat.samples)
-        plausibility_weighted_s += (
-            duration_s * float(stat.n_plausibility) / float(stat.samples)
-        )
+        plausibility_weighted_s += duration_s * float(stat.n_plausibility) / float(stat.samples)
 
     return {
         "lap_time_s": total_duration_s,
@@ -309,9 +305,7 @@ def whole_lap_metrics(df: pl.DataFrame, lap_id: int) -> dict[str, float] | None:
     phase = _classify_phases(throttle[valid], brake[valid])
     samples = int(valid.sum())
     lap_time_s = (
-        float(np.nanmax(laptime[lap_mask]))
-        if np.any(np.isfinite(laptime[lap_mask]))
-        else np.nan
+        float(np.nanmax(laptime[lap_mask])) if np.any(np.isfinite(laptime[lap_mask])) else np.nan
     )
     return {
         "lap_time_s": lap_time_s,
@@ -322,7 +316,9 @@ def whole_lap_metrics(df: pl.DataFrame, lap_id: int) -> dict[str, float] | None:
     }
 
 
-def csv_metrics_summary(df: pl.DataFrame, sectors: list[Sector]) -> dict[str, dict[str, float] | None]:
+def csv_metrics_summary(
+    df: pl.DataFrame, sectors: list[Sector]
+) -> dict[str, dict[str, float] | None]:
     metrics_by_lap = whole_lap_metrics_by_lap(df)
     if not metrics_by_lap:
         return {"best": None, "avg": None, "potential": None}
@@ -371,17 +367,13 @@ def build_metrics_table(
             "Avg P1": _display_value(p1_summary.get("avg"), metric_key, decimals),
         }
         if p2_label is not None:
-            row["Pot P2"] = _display_value(
-                p2_summary.get("potential"), metric_key, decimals
-            )
+            row["Pot P2"] = _display_value(p2_summary.get("potential"), metric_key, decimals)
             row["Best P2"] = _display_value(p2_summary.get("best"), metric_key, decimals)
             row["Avg P2"] = _display_value(p2_summary.get("avg"), metric_key, decimals)
         rows.append(row)
 
     if p2_label is None:
-        return pl.DataFrame(rows).select(
-            ["Metric", "Ref", "Cmp", "Pot P1", "Best P1", "Avg P1"]
-        )
+        return pl.DataFrame(rows).select(["Metric", "Ref", "Cmp", "Pot P1", "Best P1", "Avg P1"])
 
     return pl.DataFrame(rows).select(
         ["Metric", "Ref", "Cmp", "Pot P1", "Pot P2", "Best P1", "Best P2", "Avg P1", "Avg P2"]

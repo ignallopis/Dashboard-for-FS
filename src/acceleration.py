@@ -23,6 +23,7 @@ Scatter figures show operating points (not signal traces):
 All public functions accept polars.DataFrame(s) pre-filtered to
 acceleration-mode samples and return (go.Figure, dict). No Streamlit calls.
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -32,18 +33,26 @@ from plotly.subplots import make_subplots
 
 from utils import FONT_FAMILY, driver_color, make_dark_figure
 from dynamics import (
-    WHEEL_RADIUS_M, GEAR_RATIO, T_MOTOR_MAX_NM, N_MOTORS, MAX_POWER_W, MASS_KG,
-    CD_AERO, CL_AERO, A_AERO_M2, RHO_AIR_KGM3,
+    WHEEL_RADIUS_M,
+    GEAR_RATIO,
+    T_MOTOR_MAX_NM,
+    N_MOTORS,
+    MAX_POWER_W,
+    MASS_KG,
+    CD_AERO,
+    CL_AERO,
+    A_AERO_M2,
+    RHO_AIR_KGM3,
 )
 
-RPM_PER_RADS = 60.0 / (2.0 * np.pi)   # rad/s → rpm
-DRIVELINE_EFF = 0.85                  # motor+inverter+driveline efficiency (DC → wheel)
-CRR_TIRE = 0.015                      # rolling resistance coeff (matches powertrain.CRR_TIRE)
+RPM_PER_RADS = 60.0 / (2.0 * np.pi)  # rad/s → rpm
+DRIVELINE_EFF = 0.85  # motor+inverter+driveline efficiency (DC → wheel)
+CRR_TIRE = 0.015  # rolling resistance coeff (matches powertrain.CRR_TIRE)
 
 # ── Event constants ────────────────────────────────────────────────────────────
 ACCEL_DISTANCE_M = 75.0
-POWER_LIMIT_KW = 80.0     # FS-E regulation
-POWER_TARGET_LO = 70.0    # Aprovechamiento del límite reglamentario
+POWER_LIMIT_KW = 80.0  # FS-E regulation
+POWER_TARGET_LO = 70.0  # Aprovechamiento del límite reglamentario
 SR_TARGET = 0.20
 SR_BAND_LO = 0.15
 SR_BAND_HI = 0.25
@@ -58,8 +67,14 @@ G_MPS2 = 9.81
 
 WHEELS = ("FL", "FR", "RL", "RR")
 _SR_COLS: dict[str, str] = dict(zip(WHEELS, ("Est_SRFL", "Est_SRFR", "Est_SRRL", "Est_SRRR")))
-_ACTUAL_TRQ_COLS: dict[str, str] = dict(zip(WHEELS, ("FL_actualTorque", "FR_actualTorque", "RL_actualTorque", "RR_actualTorque")))
-_ACTUAL_VEL_COLS: dict[str, str] = dict(zip(WHEELS, ("FL_actualVelocity", "FR_actualVelocity", "RL_actualVelocity", "RR_actualVelocity")))
+_ACTUAL_TRQ_COLS: dict[str, str] = dict(
+    zip(WHEELS, ("FL_actualTorque", "FR_actualTorque", "RL_actualTorque", "RR_actualTorque"))
+)
+_ACTUAL_VEL_COLS: dict[str, str] = dict(
+    zip(
+        WHEELS, ("FL_actualVelocity", "FR_actualVelocity", "RL_actualVelocity", "RR_actualVelocity")
+    )
+)
 _THROTTLE_ALIASES = ("APPS", "pedals_throttle", "Throttle", "APPS1")
 
 _BG = "#141417"
@@ -70,6 +85,7 @@ _REF = "#F2D44D"
 
 
 # ── Signal selection helpers ──────────────────────────────────────────────────
+
 
 def is_acceleration_run(df: pl.DataFrame) -> bool:
     """True if the majority of samples are tagged as acceleration by lapcount."""
@@ -129,21 +145,22 @@ def _short_name(run_name: str) -> str:
 
 
 def _apply_dark_layout(fig: go.Figure) -> None:
-    fig.update_layout(paper_bgcolor=_BG, plot_bgcolor=_BG, font=dict(color=_TEXT, family=FONT_FAMILY))
+    fig.update_layout(
+        paper_bgcolor=_BG, plot_bgcolor=_BG, font=dict(color=_TEXT, family=FONT_FAMILY)
+    )
     fig.update_xaxes(gridcolor=_GRID, color=_AXIS, zerolinecolor=_GRID, linecolor=_AXIS)
     fig.update_yaxes(gridcolor=_GRID, color=_AXIS, zerolinecolor=_GRID, linecolor=_AXIS)
 
 
 # ── KPI helpers ───────────────────────────────────────────────────────────────
 
+
 def _all_sr_stacked(df_lap: pl.DataFrame) -> np.ndarray | None:
     """Stack 4-wheel SR into (4, N) array, or None if any column is missing."""
     cols = df_lap.columns
     if not all(_SR_COLS[w] in cols for w in WHEELS):
         return None
-    return np.stack(
-        [df_lap[_SR_COLS[w]].to_numpy().astype(float) for w in WHEELS], axis=0
-    )
+    return np.stack([df_lap[_SR_COLS[w]].to_numpy().astype(float) for w in WHEELS], axis=0)
 
 
 def _count_wheelspin_events(max_sr: np.ndarray, dt_s: float) -> int:
@@ -186,6 +203,7 @@ def _time_at_speed(vx_mps: np.ndarray, t_rel: np.ndarray, target_kmh: float) -> 
 
 # ── Summary KPIs ──────────────────────────────────────────────────────────────
 
+
 def summary_kpis(df: pl.DataFrame) -> dict:
     """
     Return scalar diagnostic KPIs for one acceleration run.
@@ -225,9 +243,7 @@ def summary_kpis(df: pl.DataFrame) -> dict:
     if "laptime" in cols:
         lt = lap["laptime"].to_numpy().astype(float)
         lt_valid = lt[np.isfinite(lt)]
-        out["event_time_s"] = (
-            float(np.nanmean(lt_valid)) if len(lt_valid) > 0 else float(t_rel[-1])
-        )
+        out["event_time_s"] = float(np.nanmean(lt_valid)) if len(lt_valid) > 0 else float(t_rel[-1])
     else:
         out["event_time_s"] = float(t_rel[-1])
 
@@ -330,8 +346,13 @@ def summary_kpis(df: pl.DataFrame) -> dict:
         out["energy_dc_kj"] = float(np.trapezoid(p_dc, t_abs))  # kW·s = kJ
     else:
         for k in (
-            "p_dc_peak_kw", "p_dc_mean_kw", "pct_time_p_dc_70_80kw",
-            "pct_time_p_dc_over_80kw", "v_dc_sag_pct", "i_dc_peak_a", "energy_dc_kj",
+            "p_dc_peak_kw",
+            "p_dc_mean_kw",
+            "pct_time_p_dc_70_80kw",
+            "pct_time_p_dc_over_80kw",
+            "v_dc_sag_pct",
+            "i_dc_peak_a",
+            "energy_dc_kj",
         ):
             out[k] = float("nan")
         warnings.append("Vbat / Current not found — power KPIs unavailable.")
@@ -349,11 +370,13 @@ def summary_kpis(df: pl.DataFrame) -> dict:
         )
         out["lr_imbalance_front_pct"] = (
             float(np.mean(np.abs(trqs["FL"] - trqs["FR"])) / max(abs(front_mean), 1e-3) * 100)
-            if abs(front_mean) > 1e-3 else float("nan")
+            if abs(front_mean) > 1e-3
+            else float("nan")
         )
         out["lr_imbalance_rear_pct"] = (
             float(np.mean(np.abs(trqs["RL"] - trqs["RR"])) / max(abs(rear_mean), 1e-3) * 100)
-            if abs(rear_mean) > 1e-3 else float("nan")
+            if abs(rear_mean) > 1e-3
+            else float("nan")
         )
     else:
         out["fr_torque_split_pct"] = float("nan")
@@ -376,9 +399,7 @@ def summary_kpis(df: pl.DataFrame) -> dict:
             out["pct_all_in_band"] = float(
                 np.mean(np.all((sr_moving >= SR_BAND_LO) & (sr_moving <= SR_BAND_HI), axis=0)) * 100
             )
-            out["pct_any_overslip"] = float(
-                np.mean(np.any(sr_moving > SR_OVERSLIP, axis=0)) * 100
-            )
+            out["pct_any_overslip"] = float(np.mean(np.any(sr_moving > SR_OVERSLIP, axis=0)) * 100)
         else:
             out["pct_all_in_band"] = float("nan")
             out["pct_any_overslip"] = float("nan")
@@ -393,6 +414,7 @@ def summary_kpis(df: pl.DataFrame) -> dict:
 
 
 # ── Figure 1 — DC Power vs Speed (80 kW regulatory limit) ─────────────────────
+
 
 def power_dc_vs_vx_scatter_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     """
@@ -410,14 +432,18 @@ def power_dc_vs_vx_scatter_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure,
     warnings: list[str] = []
 
     fig.add_hrect(
-        y0=POWER_TARGET_LO, y1=POWER_LIMIT_KW,
-        fillcolor="rgba(100,200,100,0.10)", line_width=0,
+        y0=POWER_TARGET_LO,
+        y1=POWER_LIMIT_KW,
+        fillcolor="rgba(100,200,100,0.10)",
+        line_width=0,
         annotation_text="target zone  70–80 kW",
         annotation_position="bottom left",
         annotation_font_color="rgba(180,255,180,0.65)",
     )
     fig.add_hline(
-        y=POWER_LIMIT_KW, line_color="#F25050", line_width=2,
+        y=POWER_LIMIT_KW,
+        line_color="#F25050",
+        line_width=2,
         annotation_text=f"{POWER_LIMIT_KW:.0f} kW limit",
         annotation_position="top left",
         annotation_font_color="#F25050",
@@ -445,13 +471,17 @@ def power_dc_vs_vx_scatter_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure,
                 continue
             y_max_seen = max(y_max_seen, float(np.max(p[mask])))
             label = short if len(laps) == 1 else f"{short} L{lap_id}"
-            fig.add_trace(go.Scatter(
-                x=vx[mask] * 3.6, y=p[mask],
-                mode="markers",
-                marker=dict(color=color, size=4, opacity=0.55),
-                name=label, legendgroup=label,
-                showlegend=(i_lap == 0),
-            ))
+            fig.add_trace(
+                go.Scatter(
+                    x=vx[mask] * 3.6,
+                    y=p[mask],
+                    mode="markers",
+                    marker=dict(color=color, size=4, opacity=0.55),
+                    name=label,
+                    legendgroup=label,
+                    showlegend=(i_lap == 0),
+                )
+            )
 
     fig.update_yaxes(range=[0, max(POWER_LIMIT_KW * 1.15, y_max_seen + 5)])
     fig.update_layout(legend=dict(orientation="h", y=-0.15), height=460)
@@ -459,6 +489,7 @@ def power_dc_vs_vx_scatter_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure,
 
 
 # ── Figure 2 — Traction Balance (Front vs Rear SR) ───────────────────────────
+
 
 def sr_front_rear_scatter_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     """
@@ -477,15 +508,24 @@ def sr_front_rear_scatter_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, 
 
     fig.add_shape(
         type="rect",
-        x0=SR_BAND_LO, x1=SR_BAND_HI, y0=SR_BAND_LO, y1=SR_BAND_HI,
-        line=dict(width=0), fillcolor="rgba(100,200,100,0.10)", layer="below",
+        x0=SR_BAND_LO,
+        x1=SR_BAND_HI,
+        y0=SR_BAND_LO,
+        y1=SR_BAND_HI,
+        line=dict(width=0),
+        fillcolor="rgba(100,200,100,0.10)",
+        layer="below",
     )
-    fig.add_trace(go.Scatter(
-        x=[-0.05, 0.55], y=[-0.05, 0.55],
-        mode="lines",
-        line=dict(color="rgba(255,255,255,0.30)", dash="dash", width=1),
-        name="balanced (F = R)", showlegend=True,
-    ))
+    fig.add_trace(
+        go.Scatter(
+            x=[-0.05, 0.55],
+            y=[-0.05, 0.55],
+            mode="lines",
+            line=dict(color="rgba(255,255,255,0.30)", dash="dash", width=1),
+            name="balanced (F = R)",
+            showlegend=True,
+        )
+    )
     fig.add_vline(x=SR_TARGET, line_color=_REF, line_dash="dot", line_width=1)
     fig.add_hline(y=SR_TARGET, line_color=_REF, line_dash="dot", line_width=1)
 
@@ -508,21 +548,29 @@ def sr_front_rear_scatter_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, 
             lap = _lap_df(df, lap_id)
             vx = lap[_vx_col(cols)].to_numpy().astype(float)
             apps = lap[thr_col].to_numpy().astype(float)
-            sr_f = (lap[_SR_COLS["FL"]].to_numpy().astype(float)
-                    + lap[_SR_COLS["FR"]].to_numpy().astype(float)) / 2.0
-            sr_r = (lap[_SR_COLS["RL"]].to_numpy().astype(float)
-                    + lap[_SR_COLS["RR"]].to_numpy().astype(float)) / 2.0
+            sr_f = (
+                lap[_SR_COLS["FL"]].to_numpy().astype(float)
+                + lap[_SR_COLS["FR"]].to_numpy().astype(float)
+            ) / 2.0
+            sr_r = (
+                lap[_SR_COLS["RL"]].to_numpy().astype(float)
+                + lap[_SR_COLS["RR"]].to_numpy().astype(float)
+            ) / 2.0
             mask = (apps > THROTTLE_ON_PCT) & (vx > MIN_SPEED_MPS)
             if not mask.any():
                 continue
             label = short if len(laps) == 1 else f"{short} L{lap_id}"
-            fig.add_trace(go.Scatter(
-                x=sr_f[mask], y=sr_r[mask],
-                mode="markers",
-                marker=dict(color=color, size=5, opacity=0.55),
-                name=label, legendgroup=label,
-                showlegend=(i_lap == 0),
-            ))
+            fig.add_trace(
+                go.Scatter(
+                    x=sr_f[mask],
+                    y=sr_r[mask],
+                    mode="markers",
+                    marker=dict(color=color, size=5, opacity=0.55),
+                    name=label,
+                    legendgroup=label,
+                    showlegend=(i_lap == 0),
+                )
+            )
 
     fig.update_xaxes(range=[-0.05, 0.55])
     fig.update_yaxes(range=[-0.05, 0.55])
@@ -531,6 +579,7 @@ def sr_front_rear_scatter_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, 
 
 
 # ── Figure 3 — Acceleration Envelope (ax vs vx) ──────────────────────────────
+
 
 def ax_vs_vx_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     """
@@ -576,13 +625,17 @@ def ax_vs_vx_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict
             peak_ax_seen = max(peak_ax_seen, float(np.max(ax_g[mask])))
             vx_max_kmh = max(vx_max_kmh, float(np.max(vx[mask])) * 3.6)
             label = short if len(laps) == 1 else f"{short} L{lap_id}"
-            fig.add_trace(go.Scatter(
-                x=vx[mask] * 3.6, y=ax_g[mask],
-                mode="markers",
-                marker=dict(color=color, size=4, opacity=0.5),
-                name=label, legendgroup=label,
-                showlegend=(i_lap == 0),
-            ))
+            fig.add_trace(
+                go.Scatter(
+                    x=vx[mask] * 3.6,
+                    y=ax_g[mask],
+                    mode="markers",
+                    marker=dict(color=color, size=4, opacity=0.5),
+                    name=label,
+                    legendgroup=label,
+                    showlegend=(i_lap == 0),
+                )
+            )
 
     # Achievable power-limited bound, net of driveline losses, drag and rolling:
     #   F_down = ½ρ·|CL|·A·v² ; a = (η·P/v − ½ρ·Cd·A·v² − Crr·(m·g + F_down)) / m
@@ -593,17 +646,25 @@ def ax_vs_vx_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict
     f_down = 0.5 * RHO_AIR_KGM3 * abs(CL_AERO) * A_AERO_M2 * v_mps**2
     f_roll = CRR_TIRE * (MASS_KG * G_MPS2 + f_down)
     a_power_g = (f_tract - f_drag - f_roll) / MASS_KG / G_MPS2
-    fig.add_trace(go.Scatter(
-        x=v_kmh, y=a_power_g,
-        mode="lines",
-        line=dict(color=_REF, dash="dash", width=1.5),
-        name=f"power-limited  ·  {DRIVELINE_EFF*MAX_POWER_W/1000:.0f} kW mech − drag − roll",
-        legendgroup="ref", showlegend=True, hoverinfo="skip",
-    ))
+    fig.add_trace(
+        go.Scatter(
+            x=v_kmh,
+            y=a_power_g,
+            mode="lines",
+            line=dict(color=_REF, dash="dash", width=1.5),
+            name=f"power-limited  ·  {DRIVELINE_EFF * MAX_POWER_W / 1000:.0f} kW mech − drag − roll",
+            legendgroup="ref",
+            showlegend=True,
+            hoverinfo="skip",
+        )
+    )
 
     if peak_ax_seen > 0:
         fig.add_hline(
-            y=peak_ax_seen, line_color="rgba(255,255,255,0.30)", line_dash="dot", line_width=1,
+            y=peak_ax_seen,
+            line_color="rgba(255,255,255,0.30)",
+            line_dash="dot",
+            line_width=1,
             annotation_text=f"peak ax  {peak_ax_seen:.2f} G",
             annotation_position="top right",
             annotation_font_color="rgba(235,235,235,0.7)",
@@ -614,6 +675,7 @@ def ax_vs_vx_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict
 
 
 # ── Figure 4 — Motor Torque-Speed Operating Cloud ────────────────────────────
+
 
 def motor_torque_vs_wheel_speed_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     """
@@ -678,17 +740,24 @@ def motor_torque_vs_wheel_speed_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Fi
             y = np.concatenate(trq_all)
             rpm_max_seen = max(rpm_max_seen, float(np.max(x)))
             label = short if len(laps) == 1 else f"{short} L{lap_id}"
-            fig.add_trace(go.Scatter(
-                x=x, y=y,
-                mode="markers",
-                marker=dict(color=color, size=3, opacity=0.45),
-                name=label, legendgroup=label,
-                showlegend=(i_lap == 0),
-            ))
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=y,
+                    mode="markers",
+                    marker=dict(color=color, size=3, opacity=0.45),
+                    name=label,
+                    legendgroup=label,
+                    showlegend=(i_lap == 0),
+                )
+            )
 
     # Constant-torque ceiling
     fig.add_hline(
-        y=T_MOTOR_MAX_NM, line_color="#F25050", line_dash="dash", line_width=1.5,
+        y=T_MOTOR_MAX_NM,
+        line_color="#F25050",
+        line_dash="dash",
+        line_width=1.5,
         annotation_text=f"{T_MOTOR_MAX_NM:.1f} Nm  max torque",
         annotation_position="top right",
         annotation_font_color="#F25050",
@@ -699,13 +768,18 @@ def motor_torque_vs_wheel_speed_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Fi
     rpm_grid = np.linspace(1.0, rpm_max_seen * 1.02, 300)
     omega_motor_grid = rpm_grid / RPM_PER_RADS * GEAR_RATIO  # wheel rpm → motor rad/s
     tau_grid = np.minimum(p_motor_w / np.maximum(omega_motor_grid, 1e-3), T_MOTOR_MAX_NM * 1.5)
-    fig.add_trace(go.Scatter(
-        x=rpm_grid, y=tau_grid,
-        mode="lines",
-        line=dict(color=_REF, dash="dot", width=1.5),
-        name=f"{p_motor_w/1000:.0f} kW/motor mech  (η·80 kW ÷ 4)",
-        legendgroup="ref", showlegend=True, hoverinfo="skip",
-    ))
+    fig.add_trace(
+        go.Scatter(
+            x=rpm_grid,
+            y=tau_grid,
+            mode="lines",
+            line=dict(color=_REF, dash="dot", width=1.5),
+            name=f"{p_motor_w / 1000:.0f} kW/motor mech  (η·80 kW ÷ 4)",
+            legendgroup="ref",
+            showlegend=True,
+            hoverinfo="skip",
+        )
+    )
 
     fig.update_yaxes(range=[0, T_MOTOR_MAX_NM * 1.25])
     fig.update_xaxes(range=[0, rpm_max_seen * 1.05])
@@ -714,6 +788,7 @@ def motor_torque_vs_wheel_speed_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Fi
 
 
 # ── Figure 4 — TC Operating Point (SR vs Fx per Wheel) ───────────────────────
+
 
 def sr_vs_fx_per_wheel_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     """
@@ -726,9 +801,11 @@ def sr_vs_fx_per_wheel_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dic
     left on the table.
     """
     fig = make_subplots(
-        rows=2, cols=2,
+        rows=2,
+        cols=2,
         subplot_titles=list(WHEELS),
-        vertical_spacing=0.14, horizontal_spacing=0.08,
+        vertical_spacing=0.14,
+        horizontal_spacing=0.08,
         shared_yaxes=True,
     )
     warnings: list[str] = []
@@ -736,12 +813,22 @@ def sr_vs_fx_per_wheel_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dic
 
     for w, (r, c) in _pos.items():
         fig.add_vrect(
-            x0=SR_BAND_LO, x1=SR_BAND_HI,
-            fillcolor="rgba(100,200,100,0.10)", line_width=0,
-            row=r, col=c,
+            x0=SR_BAND_LO,
+            x1=SR_BAND_HI,
+            fillcolor="rgba(100,200,100,0.10)",
+            line_width=0,
+            row=r,
+            col=c,
         )
         fig.add_vline(x=SR_TARGET, line_color=_REF, line_dash="dash", line_width=1, row=r, col=c)
-        fig.add_vline(x=SR_OVERSLIP, line_color="rgba(255,80,80,0.5)", line_dash="dot", line_width=1, row=r, col=c)
+        fig.add_vline(
+            x=SR_OVERSLIP,
+            line_color="rgba(255,80,80,0.5)",
+            line_dash="dot",
+            line_width=1,
+            row=r,
+            col=c,
+        )
 
     for run_name, df in dfs.items():
         color = driver_color(run_name)
@@ -771,13 +858,19 @@ def sr_vs_fx_per_wheel_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dic
                 sr = lap[_SR_COLS[w]].to_numpy().astype(float)
                 trq = lap[_ACTUAL_TRQ_COLS[w]].to_numpy().astype(float)
                 fx = trq * GEAR_RATIO / WHEEL_RADIUS_M
-                fig.add_trace(go.Scatter(
-                    x=sr[mask], y=fx[mask],
-                    mode="markers",
-                    marker=dict(color=color, size=3, opacity=0.5),
-                    name=label, legendgroup=label,
-                    showlegend=(w == "FL" and i_lap == 0),
-                ), row=r, col=c)
+                fig.add_trace(
+                    go.Scatter(
+                        x=sr[mask],
+                        y=fx[mask],
+                        mode="markers",
+                        marker=dict(color=color, size=3, opacity=0.5),
+                        name=label,
+                        legendgroup=label,
+                        showlegend=(w == "FL" and i_lap == 0),
+                    ),
+                    row=r,
+                    col=c,
+                )
 
     fig.update_xaxes(range=[-0.05, 0.55], title_text="Slip Ratio", row=2)
     fig.update_yaxes(title_text="Fx [N]", col=1)

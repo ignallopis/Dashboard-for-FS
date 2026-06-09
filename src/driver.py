@@ -21,6 +21,7 @@ Metrics:
 All figure builders accept a `dfs: dict[str, pl.DataFrame]` so a single run
 or a multi-run comparison (driver A vs driver B) share the same code path.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -66,30 +67,33 @@ class LapAnalysisCornerPhase:
     s_apex_m: float
     s_exit_m: float
 
+
 CSV_PATH = "data/run4_2025-08-24.csv"
 
-FULL_THROTTLE_THRESHOLD = 95.0   # [%]  TP above this counts as full throttle
-OFF_THROTTLE_THRESHOLD  = 5.0    # [%]  TP below this counts as throttle off
-BRAKE_THRESHOLD         = 1.0    # [%]  Brake above this means driver is braking
-THROTTLE_BIN_WIDTH      = 5.0    # [%]  histogram bin width
-BRAKE_DERIV_THRESHOLD   = 5.0    # [%/s] threshold from the requested definition
-BRAKE_EFFORT_MIN        = 5.0    # [%]   avoid low-pedal noise in the effort cloud
-BRAKE_EFFORT_AX_MAX     = -0.5   # [m/s²] require actual longitudinal deceleration
-BRAKE_EVENT_MIN_TIME_S  = 0.10   # [s]   ignore isolated brake spikes
-BRAKE_EVENT_MAX_GAP_S   = 0.08   # [s]   bridge short drops inside one braking zone
-BRAKE_SMOOTH_WINDOW_S   = 0.31   # [s]   light smoothing before differentiation
-BRAKE_APPLICATION_MIN_PEAK_PCT = 15.0     # [%]    minimum peak demand for a real braking zone
+FULL_THROTTLE_THRESHOLD = 95.0  # [%]  TP above this counts as full throttle
+OFF_THROTTLE_THRESHOLD = 5.0  # [%]  TP below this counts as throttle off
+BRAKE_THRESHOLD = 1.0  # [%]  Brake above this means driver is braking
+THROTTLE_BIN_WIDTH = 5.0  # [%]  histogram bin width
+BRAKE_DERIV_THRESHOLD = 5.0  # [%/s] threshold from the requested definition
+BRAKE_EFFORT_MIN = 5.0  # [%]   avoid low-pedal noise in the effort cloud
+BRAKE_EFFORT_AX_MAX = -0.5  # [m/s²] require actual longitudinal deceleration
+BRAKE_EVENT_MIN_TIME_S = 0.10  # [s]   ignore isolated brake spikes
+BRAKE_EVENT_MAX_GAP_S = 0.08  # [s]   bridge short drops inside one braking zone
+BRAKE_SMOOTH_WINDOW_S = 0.31  # [s]   light smoothing before differentiation
+BRAKE_APPLICATION_MIN_PEAK_PCT = 15.0  # [%]    minimum peak demand for a real braking zone
 BRAKE_APPLICATION_MIN_DECEL_MPS2 = -0.75  # [m/s²] minimum achieved deceleration
-BRAKE_APPLICATION_MIN_DV_MPS = 2.0        # [m/s]  minimum speed drop across the event
-BRAKE_APPLICATION_ZONE_GAP_FRAC = 0.035   # [-]    max start-position gap inside one zone
+BRAKE_APPLICATION_MIN_DV_MPS = 2.0  # [m/s]  minimum speed drop across the event
+BRAKE_APPLICATION_ZONE_GAP_FRAC = 0.035  # [-]    max start-position gap inside one zone
 STEERING_SMOOTH_WINDOW_S = 0.21  # [s]   light smoothing before differentiating steering
 STEERING_SMOOTHNESS_WINDOW_S = 1.00  # [s]   baseline trend for steering-correction KPI
-CURVATURE_MIN_SPEED_MPS  = 3.0   # [m/s] avoid ay / vx² blow-ups near standstill
-STEERING_STAB_AY_LIMIT_MPS2     = 0.2 * 9.80665  # [m/s²] |ay| < 0.2 g for "straight-line" braking
-STEERING_STAB_MIN_STRAIGHT_FRAC = 0.10           # [-]    require enough straight-brake samples to avoid one-sample noise
-_LONG_ACCEL_CANDIDATES  = ("Filtering_VN_ax", "VN_ax")
-_LAT_ACCEL_CANDIDATES   = ("Filtering_VN_ay",)
-_SPEED_CANDIDATES       = ("VN_vx",)
+CURVATURE_MIN_SPEED_MPS = 3.0  # [m/s] avoid ay / vx² blow-ups near standstill
+STEERING_STAB_AY_LIMIT_MPS2 = 0.2 * 9.80665  # [m/s²] |ay| < 0.2 g for "straight-line" braking
+STEERING_STAB_MIN_STRAIGHT_FRAC = (
+    0.10  # [-]    require enough straight-brake samples to avoid one-sample noise
+)
+_LONG_ACCEL_CANDIDATES = ("Filtering_VN_ax", "VN_ax")
+_LAT_ACCEL_CANDIDATES = ("Filtering_VN_ay",)
+_SPEED_CANDIDATES = ("VN_vx",)
 
 POTENTIAL_LAP_RUN = "__potential_lap__"
 
@@ -98,14 +102,14 @@ _REQUIRED_COLS = ("TimeStamp", "laps", "laptime", "Throttle", "Brake")
 # ── Circuit map constants ─────────────────────────────────────────────────────
 
 
-THROTTLE_MAP_THRESHOLD = 5.0   # [%]  Coasting: Throttle < 5 %
-BRAKE_MAP_THRESHOLD    = 5.0   # [%]  Coasting: Brake    < 5 %
+THROTTLE_MAP_THRESHOLD = 5.0  # [%]  Coasting: Throttle < 5 %
+BRAKE_MAP_THRESHOLD = 5.0  # [%]  Coasting: Brake    < 5 %
 
 # Colours chosen for dark background (#141417)
 MAP_PHASE_COLORS: dict[str, str] = {
     "ACCELERATING": "#4CAF50",  # green
-    "BRAKING":      "#EF5350",  # red
-    "COASTING":     "#78909C",  # blue-grey (readable on dark bg)
+    "BRAKING": "#EF5350",  # red
+    "COASTING": "#78909C",  # blue-grey (readable on dark bg)
     "PLAUSIBILITY": "#FFFFFF",  # white — anomaly, needs to stand out
 }
 
@@ -154,11 +158,11 @@ LAP_SIGNAL_OPTIONS: dict[str, dict[str, str]] = {
     "dcurvature_1pm": {"label": "Curvature delta [1/m]", "ylabel": "Δ curvature [1/m]"},
 }
 
-_PHASE_ORDER  = ("ACCELERATING", "BRAKING", "COASTING", "PLAUSIBILITY")
+_PHASE_ORDER = ("ACCELERATING", "BRAKING", "COASTING", "PLAUSIBILITY")
 _PHASE_LABELS = {
     "ACCELERATING": "Accelerating",
-    "BRAKING":      "Braking",
-    "COASTING":     "Coasting",
+    "BRAKING": "Braking",
+    "COASTING": "Coasting",
     "PLAUSIBILITY": "Plausibility (both pedals)",
 }
 
@@ -173,6 +177,7 @@ def _driver_color(run_name: str, idx: int) -> str:
 
 # ── Circuit map helpers ───────────────────────────────────────────────────────
 
+
 def _classify_phases(thr: np.ndarray, brk: np.ndarray) -> np.ndarray:
     """Classify each sample into a driving phase (mutually exclusive).
 
@@ -183,16 +188,17 @@ def _classify_phases(thr: np.ndarray, brk: np.ndarray) -> np.ndarray:
     PLAUSIBILITY : both ≥ 5 %  AND  Throttle > Brake  (throttle dominant — true anomaly)
     """
     phase = np.full(len(thr), "COASTING", dtype=object)
-    phase[(thr >= THROTTLE_MAP_THRESHOLD) & (brk <  BRAKE_MAP_THRESHOLD)] = "ACCELERATING"
-    phase[(brk >= BRAKE_MAP_THRESHOLD)    & (thr <  THROTTLE_MAP_THRESHOLD)] = "BRAKING"
+    phase[(thr >= THROTTLE_MAP_THRESHOLD) & (brk < BRAKE_MAP_THRESHOLD)] = "ACCELERATING"
+    phase[(brk >= BRAKE_MAP_THRESHOLD) & (thr < THROTTLE_MAP_THRESHOLD)] = "BRAKING"
     # Both pedals ≥ threshold: dominant pedal decides
     both = (thr >= THROTTLE_MAP_THRESHOLD) & (brk >= BRAKE_MAP_THRESHOLD)
-    phase[both & (brk >= thr)] = "BRAKING"       # brake dominant → braking with residual throttle
-    phase[both & (thr >  brk)] = "PLAUSIBILITY"  # throttle dominant → real plausibility fault
+    phase[both & (brk >= thr)] = "BRAKING"  # brake dominant → braking with residual throttle
+    phase[both & (thr > brk)] = "PLAUSIBILITY"  # throttle dominant → real plausibility fault
     return phase
 
 
 # ── Data preparation ──────────────────────────────────────────────────────────
+
 
 def _prep(
     df: pl.DataFrame,
@@ -213,8 +219,7 @@ def _longitudinal_accel_col(df: pl.DataFrame) -> str:
         if col in df.columns:
             return col
     raise KeyError(
-        "Missing longitudinal acceleration column. Expected one of "
-        f"{list(_LONG_ACCEL_CANDIDATES)}."
+        f"Missing longitudinal acceleration column. Expected one of {list(_LONG_ACCEL_CANDIDATES)}."
     )
 
 
@@ -224,8 +229,7 @@ def _lateral_accel_col(df: pl.DataFrame) -> str:
         if col in df.columns:
             return col
     raise KeyError(
-        "Missing lateral acceleration column. Expected one of "
-        f"{list(_LAT_ACCEL_CANDIDATES)}."
+        f"Missing lateral acceleration column. Expected one of {list(_LAT_ACCEL_CANDIDATES)}."
     )
 
 
@@ -235,8 +239,7 @@ def _speed_col(df: pl.DataFrame) -> str:
         if col in df.columns:
             return col
     raise KeyError(
-        "Missing speed column for curvature. Expected one of "
-        f"{list(_SPEED_CANDIDATES)}."
+        f"Missing speed column for curvature. Expected one of {list(_SPEED_CANDIDATES)}."
     )
 
 
@@ -401,9 +404,7 @@ def _prep_brake_application(
 ) -> dict[str, np.ndarray]:
     """Prepare aligned arrays for distance-based brake-application analysis."""
     df = ensure_complete_laps_df(df)
-    required_cols = list(
-        dict.fromkeys([*_REQUIRED_COLS, accel_col, speed_col, *extra_cols])
-    )
+    required_cols = list(dict.fromkeys([*_REQUIRED_COLS, accel_col, speed_col, *extra_cols]))
     d = cols_to_numpy(df, required_cols)
     d["dist_m"] = lap_dist_from_gps(df)
     if COMPLETE_LAPS_MARKER in df.columns:
@@ -530,7 +531,10 @@ def _steering_stability_events(
     corrective steering while braking.
     """
     d = _prep_brake_application(
-        df, accel_col, speed_col, extra_cols=(lat_accel_col, "Steering"),
+        df,
+        accel_col,
+        speed_col,
+        extra_cols=(lat_accel_col, "Steering"),
     )
     # Same `valid` mask as _significant_brake_application_events — the brake-event
     # detection must be identical. NaNs in steering/ay are handled below.
@@ -569,7 +573,9 @@ def _steering_stability_events(
         finite_idx = np.flatnonzero(steering_finite)
         nan_idx = np.flatnonzero(~steering_finite)
         steering_for_smoothing[nan_idx] = np.interp(
-            nan_idx, finite_idx, steering_rad[finite_idx],
+            nan_idx,
+            finite_idx,
+            steering_rad[finite_idx],
         )
     steering_smooth = _smooth_steering_signal(steering_for_smoothing, dt_s)
     steer_rate_abs_degps = np.abs(np.rad2deg(np.gradient(steering_smooth, time_s)))
@@ -637,10 +643,7 @@ def _assign_brake_application_zones(events: list[dict]) -> list[dict]:
             clusters.append([idx])
         prev_progress = progress
 
-    selected_laps = {
-        (str(row["run"]), int(row["lap"]))
-        for row in events
-    }
+    selected_laps = {(str(row["run"]), int(row["lap"])) for row in events}
     min_zone_events = 1 if len(selected_laps) <= 1 else 2
 
     cluster_meta: list[tuple[float, list[int]]] = []
@@ -650,10 +653,7 @@ def _assign_brake_application_zones(events: list[dict]) -> list[dict]:
         progress_vals = np.asarray([float(events[idx]["progress"]) for idx in cluster])
         angles = 2.0 * np.pi * progress_vals
         center = float(
-            (
-                np.arctan2(np.sin(angles).mean(), np.cos(angles).mean())
-                / (2.0 * np.pi)
-            ) % 1.0
+            (np.arctan2(np.sin(angles).mean(), np.cos(angles).mean()) / (2.0 * np.pi)) % 1.0
         )
         cluster_meta.append((center, cluster))
 
@@ -681,7 +681,8 @@ def _braking_turn_label(
         return None, None
 
     candidates = [
-        turn for turn in turns
+        turn
+        for turn in turns
         if np.isfinite(float(turn.s_entry_m))
         and np.isfinite(float(turn.s_apex_m))
         and np.isfinite(float(turn.s_exit_m))
@@ -692,16 +693,12 @@ def _braking_turn_label(
 
     for turn in candidates:
         turn_id = int(turn.turn_id)
-        if (
-            float(turn.s_entry_m) <= start_dist_m <= float(turn.s_exit_m)
-            and start_dist_m <= float(turn.s_apex_m)
+        if float(turn.s_entry_m) <= start_dist_m <= float(turn.s_exit_m) and start_dist_m <= float(
+            turn.s_apex_m
         ):
             return f"T{turn_id} Braking", turn_id
 
-    ahead = [
-        turn for turn in candidates
-        if float(turn.s_entry_m) >= start_dist_m
-    ]
+    ahead = [turn for turn in candidates if float(turn.s_entry_m) >= start_dist_m]
     if ahead:
         turn = min(ahead, key=lambda item: float(item.s_entry_m))
     else:
@@ -731,9 +728,7 @@ def _label_brake_application_zones(
     used_labels: set[str] = set()
     for zone in zone_order:
         rows = [row for row in events if str(row["zone"]) == zone]
-        first_application_m = float(np.nanmin([
-            float(row["start_dist_m"]) for row in rows
-        ]))
+        first_application_m = float(np.nanmin([float(row["start_dist_m"]) for row in rows]))
         label, turn_id = _braking_turn_label(first_application_m, turns)
         if label is None:
             label = zone
@@ -797,8 +792,12 @@ def _steering_metrics_per_lap(
     vx_mps = np.abs(d[speed_col])
 
     curvature_inv_m = np.full(len(vx_mps), np.nan)
-    curvature_mask = np.isfinite(ay_mps2) & np.isfinite(vx_mps) & (vx_mps >= CURVATURE_MIN_SPEED_MPS)
-    curvature_inv_m[curvature_mask] = np.abs(ay_mps2[curvature_mask]) / np.square(vx_mps[curvature_mask])
+    curvature_mask = (
+        np.isfinite(ay_mps2) & np.isfinite(vx_mps) & (vx_mps >= CURVATURE_MIN_SPEED_MPS)
+    )
+    curvature_inv_m[curvature_mask] = np.abs(ay_mps2[curvature_mask]) / np.square(
+        vx_mps[curvature_mask]
+    )
 
     lap_list = unique_laps(laps)
     n = len(lap_list)
@@ -815,25 +814,30 @@ def _steering_metrics_per_lap(
         lap_steering = steering_rad[lm]
         lap_dt_s = robust_dt(time_s[lm])
         steering_baseline_rad = _smooth_steering_signal(
-            lap_steering, lap_dt_s, STEERING_SMOOTHNESS_WINDOW_S,
+            lap_steering,
+            lap_dt_s,
+            STEERING_SMOOTHNESS_WINDOW_S,
         )
         steering_smoothness_deg = np.abs(np.rad2deg(lap_steering - steering_baseline_rad))
         if np.isfinite(steering_smoothness_deg).any():
             mean_steering_smoothness[i] = float(np.nanmean(steering_smoothness_deg))
         if "dist_m" in d:
             steering_integral_degm[i] = _steering_integral_degm(
-                lap_steering, d["dist_m"][lm],
+                lap_steering,
+                d["dist_m"][lm],
             )
         cm = lm & np.isfinite(curvature_inv_m)
         if cm.any():
             mean_curvature[i] = float(np.nanmean(curvature_inv_m[cm]))
 
-    table = pl.DataFrame({
-        "Lap": lap_list.astype(int),
-        "Steering smoothness [deg]": np.round(mean_steering_smoothness, 4),
-        "Steering integral [deg*m]": np.round(steering_integral_degm, 1),
-        "Curvature [1/m]": np.round(mean_curvature, 5),
-    })
+    table = pl.DataFrame(
+        {
+            "Lap": lap_list.astype(int),
+            "Steering smoothness [deg]": np.round(mean_steering_smoothness, 4),
+            "Steering integral [deg*m]": np.round(steering_integral_degm, 1),
+            "Curvature [1/m]": np.round(mean_curvature, 5),
+        }
+    )
 
     return {
         "lap_list": lap_list,
@@ -847,51 +851,52 @@ def _steering_metrics_per_lap(
 
 def _per_lap(d: dict[str, np.ndarray]) -> dict:
     valid = np.all(
-        np.stack([np.isfinite(d[k]) for k in _REQUIRED_COLS], axis=1), axis=1,
+        np.stack([np.isfinite(d[k]) for k in _REQUIRED_COLS], axis=1),
+        axis=1,
     )
     d = {k: v[valid] for k, v in d.items()}
     d = exclude_lap0_and_last_lap(d)
 
-    dt      = robust_dt(d["time"])
-    laps    = d["laps"]
+    dt = robust_dt(d["time"])
+    laps = d["laps"]
     laptime = d["laptime"]
-    thr     = d["Throttle"]
-    brk     = d["Brake"]
+    thr = d["Throttle"]
+    brk = d["Brake"]
     _, brake_rate, brake_event = _brake_rate_arrays(d["time"], brk)
 
     # Throttle speed: dTP/dt; ignore saturation and braking transitions.
     # Per-lap aggregate is the median |dTP/dt| (robust against the long tail
     # from fast transitions, which would dominate the mean on 100 Hz data).
-    thr_speed  = np.gradient(thr, d["time"])
+    thr_speed = np.gradient(thr, d["time"])
     speed_mask = (thr < 100.0) & (brk < BRAKE_THRESHOLD) & np.isfinite(thr_speed)
 
     full_thr = thr > FULL_THROTTLE_THRESHOLD
-    off_thr  = thr < OFF_THROTTLE_THRESHOLD
+    off_thr = thr < OFF_THROTTLE_THRESHOLD
 
     lap_list = unique_laps(laps)
-    n        = len(lap_list)
-    lt_val      = np.full(n, np.nan)
-    full_t      = np.full(n, np.nan)   # [s]
-    full_pct    = np.full(n, np.nan)   # [%]
-    off_pct     = np.full(n, np.nan)   # [%]
-    mean_thr    = np.full(n, np.nan)   # [%]
-    mean_speed  = np.full(n, np.nan)   # [%/s]
-    mean_brake_aggr    = np.full(n, np.nan)   # [%/s]
-    mean_brake_release = np.full(n, np.nan)   # [%/s]
+    n = len(lap_list)
+    lt_val = np.full(n, np.nan)
+    full_t = np.full(n, np.nan)  # [s]
+    full_pct = np.full(n, np.nan)  # [%]
+    off_pct = np.full(n, np.nan)  # [%]
+    mean_thr = np.full(n, np.nan)  # [%]
+    mean_speed = np.full(n, np.nan)  # [%/s]
+    mean_brake_aggr = np.full(n, np.nan)  # [%/s]
+    mean_brake_release = np.full(n, np.nan)  # [%/s]
     n_speed_pts = np.zeros(n, dtype=int)
 
     for i, lap in enumerate(lap_list):
         lm = laps == lap
         if not lm.any():
             continue
-        lt_val[i]   = laptime[lm].max()
-        full_t[i]   = float(full_thr[lm].sum() * dt)
+        lt_val[i] = laptime[lm].max()
+        full_t[i] = float(full_thr[lm].sum() * dt)
         full_pct[i] = 100.0 * float(np.mean(full_thr[lm]))
-        off_pct[i]  = 100.0 * float(np.mean(off_thr[lm]))
+        off_pct[i] = 100.0 * float(np.mean(off_thr[lm]))
         mean_thr[i] = float(np.nanmean(thr[lm]))
         sm = lm & speed_mask
         if sm.any():
-            mean_speed[i]  = float(np.nanmedian(np.abs(thr_speed[sm])))
+            mean_speed[i] = float(np.nanmedian(np.abs(thr_speed[sm])))
             n_speed_pts[i] = int(sm.sum())
         am = lm & brake_event & np.isfinite(brake_rate) & (brake_rate > BRAKE_DERIV_THRESHOLD)
         if am.any():
@@ -900,37 +905,40 @@ def _per_lap(d: dict[str, np.ndarray]) -> dict:
         if rm.any():
             mean_brake_release[i] = float(np.nanmean(np.abs(brake_rate[rm])))
 
-    table = pl.DataFrame({
-        "Lap":                    lap_list.astype(int),
-        "LapTime [s]":            np.round(lt_val, 3),
-        "Mean throttle [%]":      np.round(mean_thr, 1),
-        "Full throttle time [s]": np.round(full_t, 2),
-        "Full throttle [%]":      np.round(full_pct, 1),
-        "Off throttle [%]":       np.round(off_pct, 1),
-        "Median |dTP/dt| [%/s]":  np.round(mean_speed, 2),
-        "Brake aggressiveness [%/s]":     np.round(mean_brake_aggr, 2),
-        "Brake release smoothness [%/s]": np.round(mean_brake_release, 2),
-    })
+    table = pl.DataFrame(
+        {
+            "Lap": lap_list.astype(int),
+            "LapTime [s]": np.round(lt_val, 3),
+            "Mean throttle [%]": np.round(mean_thr, 1),
+            "Full throttle time [s]": np.round(full_t, 2),
+            "Full throttle [%]": np.round(full_pct, 1),
+            "Off throttle [%]": np.round(off_pct, 1),
+            "Median |dTP/dt| [%/s]": np.round(mean_speed, 2),
+            "Brake aggressiveness [%/s]": np.round(mean_brake_aggr, 2),
+            "Brake release smoothness [%/s]": np.round(mean_brake_release, 2),
+        }
+    )
 
     return {
-        "lap_list":   lap_list,
-        "lt_val":     lt_val,
-        "full_t":     full_t,
-        "full_pct":   full_pct,
-        "off_pct":    off_pct,
-        "mean_thr":   mean_thr,
+        "lap_list": lap_list,
+        "lt_val": lt_val,
+        "full_t": full_t,
+        "full_pct": full_pct,
+        "off_pct": off_pct,
+        "mean_thr": mean_thr,
         "mean_speed": mean_speed,
-        "mean_brake_aggr":    mean_brake_aggr,
+        "mean_brake_aggr": mean_brake_aggr,
         "mean_brake_release": mean_brake_release,
-        "table":      table,
+        "table": table,
     }
 
 
 # ── Public KPI helpers ────────────────────────────────────────────────────────
 
+
 def driver_summary(df: pl.DataFrame) -> dict:
     """Single-run driver summary stats and per-lap table."""
-    d   = _prep(df)
+    d = _prep(df)
     res = _per_lap(d)
     steer_res: dict | None = None
     if "Steering" in df.columns:
@@ -940,7 +948,7 @@ def driver_summary(df: pl.DataFrame) -> dict:
             res["table"] = res["table"].join(steer_res["table"], on="Lap", how="left")
         except KeyError:
             steer_res = None
-    ok  = np.isfinite(res["lt_val"]) & np.isfinite(res["mean_thr"])
+    ok = np.isfinite(res["lt_val"]) & np.isfinite(res["mean_thr"])
 
     if not ok.any():
         return {
@@ -949,16 +957,16 @@ def driver_summary(df: pl.DataFrame) -> dict:
         }
 
     fast_idx = int(np.nanargmin(np.where(ok, res["lt_val"], np.inf)))
-    full_t_ok      = res["full_t"][ok]
-    mean_thr_ok    = res["mean_thr"][ok]
-    full_pct_ok    = res["full_pct"][ok]
-    off_pct_ok     = res["off_pct"][ok]
-    speed_ok_mask  = ok & np.isfinite(res["mean_speed"])
-    speed_vals     = res["mean_speed"][speed_ok_mask]
+    full_t_ok = res["full_t"][ok]
+    mean_thr_ok = res["mean_thr"][ok]
+    full_pct_ok = res["full_pct"][ok]
+    off_pct_ok = res["off_pct"][ok]
+    speed_ok_mask = ok & np.isfinite(res["mean_speed"])
+    speed_vals = res["mean_speed"][speed_ok_mask]
     brake_aggr_ok_mask = ok & np.isfinite(res["mean_brake_aggr"])
-    brake_aggr_vals    = res["mean_brake_aggr"][brake_aggr_ok_mask]
+    brake_aggr_vals = res["mean_brake_aggr"][brake_aggr_ok_mask]
     brake_release_ok_mask = ok & np.isfinite(res["mean_brake_release"])
-    brake_release_vals    = res["mean_brake_release"][brake_release_ok_mask]
+    brake_release_vals = res["mean_brake_release"][brake_release_ok_mask]
     steering_vals = (
         steer_res["mean_steering_smoothness"][np.isfinite(steer_res["mean_steering_smoothness"])]
         if steer_res is not None
@@ -976,21 +984,17 @@ def driver_summary(df: pl.DataFrame) -> dict:
     )
 
     return {
-        "valid_laps":         int(ok.sum()),
-        "fastest_lap":        int(res["lap_list"][fast_idx]),
-        "fastest_lt":         float(res["lt_val"][fast_idx]),
-        "mean_throttle_pct":  float(np.nanmean(mean_thr_ok)),
-        "mean_full_t":        float(np.nanmean(full_t_ok)),
-        "mean_full_pct":      float(np.nanmean(full_pct_ok)),
-        "mean_off_pct":       float(np.nanmean(off_pct_ok)),
-        "mean_speed":         float(np.nanmean(speed_vals)) if speed_vals.size else np.nan,
-        "max_speed":          float(np.nanmax(speed_vals))  if speed_vals.size else np.nan,
-        "mean_brake_aggr": (
-            float(np.nanmean(brake_aggr_vals)) if brake_aggr_vals.size else np.nan
-        ),
-        "peak_brake_aggr": (
-            float(np.nanmax(brake_aggr_vals)) if brake_aggr_vals.size else np.nan
-        ),
+        "valid_laps": int(ok.sum()),
+        "fastest_lap": int(res["lap_list"][fast_idx]),
+        "fastest_lt": float(res["lt_val"][fast_idx]),
+        "mean_throttle_pct": float(np.nanmean(mean_thr_ok)),
+        "mean_full_t": float(np.nanmean(full_t_ok)),
+        "mean_full_pct": float(np.nanmean(full_pct_ok)),
+        "mean_off_pct": float(np.nanmean(off_pct_ok)),
+        "mean_speed": float(np.nanmean(speed_vals)) if speed_vals.size else np.nan,
+        "max_speed": float(np.nanmax(speed_vals)) if speed_vals.size else np.nan,
+        "mean_brake_aggr": (float(np.nanmean(brake_aggr_vals)) if brake_aggr_vals.size else np.nan),
+        "peak_brake_aggr": (float(np.nanmax(brake_aggr_vals)) if brake_aggr_vals.size else np.nan),
         "mean_brake_release": (
             float(np.nanmean(brake_release_vals)) if brake_release_vals.size else np.nan
         ),
@@ -1009,14 +1013,10 @@ def driver_summary(df: pl.DataFrame) -> dict:
         "max_steering_integral": (
             float(np.nanmax(steering_integral_vals)) if steering_integral_vals.size else np.nan
         ),
-        "mean_curvature": (
-            float(np.nanmean(curvature_vals)) if curvature_vals.size else np.nan
-        ),
-        "max_curvature": (
-            float(np.nanmax(curvature_vals)) if curvature_vals.size else np.nan
-        ),
-        "table":              res["table"],
-        "warnings":           [],
+        "mean_curvature": (float(np.nanmean(curvature_vals)) if curvature_vals.size else np.nan),
+        "max_curvature": (float(np.nanmax(curvature_vals)) if curvature_vals.size else np.nan),
+        "table": res["table"],
+        "warnings": [],
     }
 
 
@@ -1027,6 +1027,7 @@ def throttle_summary(df: pl.DataFrame) -> dict:
 
 # ── Figures ───────────────────────────────────────────────────────────────────
 
+
 def throttle_histogram_fig(dfs: dict[str, pl.DataFrame]) -> go.Figure:
     """Throttle position histogram (overlay when multiple runs are loaded)."""
     fig = make_dark_figure(
@@ -1034,23 +1035,27 @@ def throttle_histogram_fig(dfs: dict[str, pl.DataFrame]) -> go.Figure:
         xlabel="Throttle position [%]",
         ylabel="Percent of samples [%]",
     )
-    bins    = np.arange(0.0, 100.0 + THROTTLE_BIN_WIDTH, THROTTLE_BIN_WIDTH)
+    bins = np.arange(0.0, 100.0 + THROTTLE_BIN_WIDTH, THROTTLE_BIN_WIDTH)
     centers = (bins[:-1] + bins[1:]) * 0.5
 
     for i, (run_name, df) in enumerate(dfs.items()):
-        d    = _prep(df)
-        thr  = d["Throttle"][np.isfinite(d["Throttle"])]
+        d = _prep(df)
+        thr = d["Throttle"][np.isfinite(d["Throttle"])]
         if thr.size == 0:
             continue
         counts, _ = np.histogram(thr, bins=bins)
-        pct       = counts / counts.sum() * 100.0
-        color     = _driver_color(run_name, i)
-        fig.add_trace(go.Bar(
-            x=centers, y=pct, name=run_name,
-            marker=dict(color=color, line=dict(width=0)),
-            opacity=0.65 if len(dfs) > 1 else 1.0,
-            width=THROTTLE_BIN_WIDTH * 0.9,
-        ))
+        pct = counts / counts.sum() * 100.0
+        color = _driver_color(run_name, i)
+        fig.add_trace(
+            go.Bar(
+                x=centers,
+                y=pct,
+                name=run_name,
+                marker=dict(color=color, line=dict(width=0)),
+                opacity=0.65 if len(dfs) > 1 else 1.0,
+                width=THROTTLE_BIN_WIDTH * 0.9,
+            )
+        )
 
     fig.update_layout(
         barmode="overlay" if len(dfs) > 1 else "group",
@@ -1073,15 +1078,17 @@ def full_throttle_time_fig(
     all_laps: list[np.ndarray] = []
     for i, (run_name, df) in enumerate(dfs.items()):
         res = _per_lap(_prep(df))
-        ok  = np.isfinite(res["full_t"]) & np.isfinite(res["lt_val"])
+        ok = np.isfinite(res["full_t"]) & np.isfinite(res["lt_val"])
         if not ok.any():
             continue
         x_arr, order, _ = per_lap_axis(
-            res["lap_list"][ok], res["lt_val"][ok], x_mode,
+            res["lap_list"][ok],
+            res["lt_val"][ok],
+            x_mode,
         )
-        y_arr   = res["full_t"][ok][order]
+        y_arr = res["full_t"][ok][order]
         lap_ord = res["lap_list"][ok][order]
-        color   = _driver_color(run_name, i)
+        color = _driver_color(run_name, i)
         add_lap_scatter(fig, x_arr, y_arr, lap_ord, name=run_name, color=color)
         add_trend_line(fig, x_arr, y_arr, color=color)
         all_laps.append(res["lap_list"][ok])
@@ -1105,15 +1112,17 @@ def throttle_speed_fig(
     all_laps: list[np.ndarray] = []
     for i, (run_name, df) in enumerate(dfs.items()):
         res = _per_lap(_prep(df))
-        ok  = np.isfinite(res["mean_speed"]) & np.isfinite(res["lt_val"])
+        ok = np.isfinite(res["mean_speed"]) & np.isfinite(res["lt_val"])
         if not ok.any():
             continue
         x_arr, order, _ = per_lap_axis(
-            res["lap_list"][ok], res["lt_val"][ok], x_mode,
+            res["lap_list"][ok],
+            res["lt_val"][ok],
+            x_mode,
         )
-        y_arr   = res["mean_speed"][ok][order]
+        y_arr = res["mean_speed"][ok][order]
         lap_ord = res["lap_list"][ok][order]
-        color   = _driver_color(run_name, i)
+        color = _driver_color(run_name, i)
         add_lap_scatter(fig, x_arr, y_arr, lap_ord, name=run_name, color=color)
         add_trend_line(fig, x_arr, y_arr, color=color)
         all_laps.append(res["lap_list"][ok])
@@ -1145,11 +1154,7 @@ def braking_effort_fig(dfs: dict[str, pl.DataFrame]) -> go.Figure:
             fig.update_yaxes(title_text=accel_label)
         d = _prep(df, extra_cols=(accel_col,))
         lap_ids, x_arr, y_arr, duration_s = _braking_effort_events(d, accel_col)
-        valid = (
-            np.isfinite(x_arr)
-            & np.isfinite(y_arr)
-            & np.isfinite(duration_s)
-        )
+        valid = np.isfinite(x_arr) & np.isfinite(y_arr) & np.isfinite(duration_s)
         if not valid.any():
             continue
 
@@ -1163,46 +1168,52 @@ def braking_effort_fig(dfs: dict[str, pl.DataFrame]) -> go.Figure:
         accel_min = min(accel_min, float(np.nanmin(y_arr)))
         customdata = np.column_stack([lap_ids, duration_s])
 
-        fig.add_trace(go.Scattergl(
-            x=x_arr,
-            y=y_arr,
-            mode="markers",
-            name=run_name,
-            marker=dict(
-                color=color,
-                size=5 if len(dfs) == 1 else 4,
-                opacity=0.42 if len(dfs) == 1 else 0.28,
-                line=dict(width=0),
-            ),
-            customdata=customdata,
-            hovertemplate=(
-                "Lap: %{customdata[0]:.0f}<br>"
-                "Event duration: %{customdata[1]:.2f} s<br>"
-                "Brake: %{x:.1f}%<br>"
-                f"{accel_col}: " + "%{y:.2f} m/s²"
-                f"<extra>{run_name}</extra>"
-            ),
-        ))
+        fig.add_trace(
+            go.Scattergl(
+                x=x_arr,
+                y=y_arr,
+                mode="markers",
+                name=run_name,
+                marker=dict(
+                    color=color,
+                    size=5 if len(dfs) == 1 else 4,
+                    opacity=0.42 if len(dfs) == 1 else 0.28,
+                    line=dict(width=0),
+                ),
+                customdata=customdata,
+                hovertemplate=(
+                    "Lap: %{customdata[0]:.0f}<br>"
+                    "Event duration: %{customdata[1]:.2f} s<br>"
+                    "Brake: %{x:.1f}%<br>"
+                    f"{accel_col}: " + "%{y:.2f} m/s²"
+                    f"<extra>{run_name}</extra>"
+                ),
+            )
+        )
 
         brake_ref = float(np.nanmax(x_arr))
         accel_ref = float(np.nanmin(y_arr))
 
-        fig.add_trace(go.Scatter(
-            x=[0.0, brake_ref],
-            y=[accel_ref, accel_ref],
-            mode="lines",
-            line=dict(color=color, dash="dot", width=1.2),
-            showlegend=False,
-            hoverinfo="skip",
-        ))
-        fig.add_trace(go.Scatter(
-            x=[brake_ref, brake_ref],
-            y=[0.0, accel_ref],
-            mode="lines",
-            line=dict(color=color, dash="dot", width=1.2),
-            showlegend=False,
-            hoverinfo="skip",
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=[0.0, brake_ref],
+                y=[accel_ref, accel_ref],
+                mode="lines",
+                line=dict(color=color, dash="dot", width=1.2),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[brake_ref, brake_ref],
+                y=[0.0, accel_ref],
+                mode="lines",
+                line=dict(color=color, dash="dot", width=1.2),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
 
     if not any_trace:
         raise ValueError("No valid braking samples passed the Brake/ax filter.")
@@ -1246,10 +1257,7 @@ def brake_application_point_fig(
         )
 
     if turns:
-        zone_sort = {
-            str(row["zone"]): int(row.get("zone_order", 0))
-            for row in zoned_events
-        }
+        zone_sort = {str(row["zone"]): int(row.get("zone_order", 0)) for row in zoned_events}
         zone_order = sorted(
             {str(row["zone"]) for row in zoned_events},
             key=lambda label: zone_sort.get(label, 10_000),
@@ -1282,28 +1290,30 @@ def brake_application_point_fig(
         )
         color = _driver_color(run_name, run_idx)
         any_trace = True
-        fig.add_trace(go.Box(
-            x=x_vals,
-            y=y_vals,
-            name=run_name,
-            marker=dict(color=color, size=5, opacity=0.65),
-            line=dict(color=color, width=1.6),
-            boxmean=True,
-            boxpoints="all",
-            jitter=0.35,
-            pointpos=0.0,
-            customdata=customdata,
-            hovertemplate=(
-                "Turn/zone: %{x}<br>"
-                "Lap: %{customdata[0]:.0f}<br>"
-                "Application: %{y:.1f} m<br>"
-                "Duration: %{customdata[1]:.2f} s<br>"
-                "Peak Brake: %{customdata[2]:.1f} %<br>"
-                "Min ax: %{customdata[3]:.2f} m/s²<br>"
-                "Speed drop: %{customdata[4]:.1f} m/s"
-                f"<extra>{run_name}</extra>"
-            ),
-        ))
+        fig.add_trace(
+            go.Box(
+                x=x_vals,
+                y=y_vals,
+                name=run_name,
+                marker=dict(color=color, size=5, opacity=0.65),
+                line=dict(color=color, width=1.6),
+                boxmean=True,
+                boxpoints="all",
+                jitter=0.35,
+                pointpos=0.0,
+                customdata=customdata,
+                hovertemplate=(
+                    "Turn/zone: %{x}<br>"
+                    "Lap: %{customdata[0]:.0f}<br>"
+                    "Application: %{y:.1f} m<br>"
+                    "Duration: %{customdata[1]:.2f} s<br>"
+                    "Peak Brake: %{customdata[2]:.1f} %<br>"
+                    "Min ax: %{customdata[3]:.2f} m/s²<br>"
+                    "Speed drop: %{customdata[4]:.1f} m/s"
+                    f"<extra>{run_name}</extra>"
+                ),
+            )
+        )
 
     if not any_trace:
         raise ValueError("No valid brake-application points after zone grouping.")
@@ -1333,7 +1343,9 @@ def braking_aggressiveness_fig(
         if not ok.any():
             continue
         x_arr, order, _ = per_lap_axis(
-            res["lap_list"][ok], res["lt_val"][ok], x_mode,
+            res["lap_list"][ok],
+            res["lt_val"][ok],
+            x_mode,
         )
         y_arr = res["mean_brake_aggr"][ok][order]
         lap_ord = res["lap_list"][ok][order]
@@ -1365,7 +1377,9 @@ def brake_release_smoothness_fig(
         if not ok.any():
             continue
         x_arr, order, _ = per_lap_axis(
-            res["lap_list"][ok], res["lt_val"][ok], x_mode,
+            res["lap_list"][ok],
+            res["lt_val"][ok],
+            x_mode,
         )
         y_arr = res["mean_brake_release"][ok][order]
         lap_ord = res["lap_list"][ok][order]
@@ -1399,7 +1413,9 @@ def steering_smoothness_fig(
         if not ok.any():
             continue
         x_arr, order, _ = per_lap_axis(
-            res["lap_list"][ok], res["lt_val"][ok], x_mode,
+            res["lap_list"][ok],
+            res["lt_val"][ok],
+            x_mode,
         )
         y_arr = res["mean_steering_smoothness"][ok][order]
         lap_ord = res["lap_list"][ok][order]
@@ -1433,7 +1449,9 @@ def steering_integral_fig(
         if not ok.any():
             continue
         x_arr, order, _ = per_lap_axis(
-            res["lap_list"][ok], res["lt_val"][ok], x_mode,
+            res["lap_list"][ok],
+            res["lt_val"][ok],
+            x_mode,
         )
         y_arr = res["steering_integral_degm"][ok][order]
         lap_ord = res["lap_list"][ok][order]
@@ -1490,10 +1508,7 @@ def steering_stability_fig(
         )
 
     if turns:
-        zone_sort = {
-            str(row["zone"]): int(row.get("zone_order", 0))
-            for row in zoned_events
-        }
+        zone_sort = {str(row["zone"]): int(row.get("zone_order", 0)) for row in zoned_events}
         zone_order = sorted(
             {str(row["zone"]) for row in zoned_events},
             key=lambda label: zone_sort.get(label, 10_000),
@@ -1528,29 +1543,31 @@ def steering_stability_fig(
         )
         color = _driver_color(run_name, run_idx)
         any_trace = True
-        fig.add_trace(go.Box(
-            x=x_vals,
-            y=y_vals,
-            name=run_name,
-            marker=dict(color=color, size=5, opacity=0.65),
-            line=dict(color=color, width=1.6),
-            boxmean=True,
-            boxpoints="all",
-            jitter=0.35,
-            pointpos=0.0,
-            customdata=customdata,
-            hovertemplate=(
-                "Turn/zone: %{x}<br>"
-                "Lap: %{customdata[0]:.0f}<br>"
-                "Steering stability: %{y:.1f} deg<br>"
-                "Event duration: %{customdata[1]:.2f} s<br>"
-                "Straight-line samples: %{customdata[5]:.0f} %<br>"
-                "Peak Brake: %{customdata[2]:.1f} %<br>"
-                "Min ax: %{customdata[3]:.2f} m/s²<br>"
-                "Speed drop: %{customdata[4]:.1f} m/s"
-                f"<extra>{run_name}</extra>"
-            ),
-        ))
+        fig.add_trace(
+            go.Box(
+                x=x_vals,
+                y=y_vals,
+                name=run_name,
+                marker=dict(color=color, size=5, opacity=0.65),
+                line=dict(color=color, width=1.6),
+                boxmean=True,
+                boxpoints="all",
+                jitter=0.35,
+                pointpos=0.0,
+                customdata=customdata,
+                hovertemplate=(
+                    "Turn/zone: %{x}<br>"
+                    "Lap: %{customdata[0]:.0f}<br>"
+                    "Steering stability: %{y:.1f} deg<br>"
+                    "Event duration: %{customdata[1]:.2f} s<br>"
+                    "Straight-line samples: %{customdata[5]:.0f} %<br>"
+                    "Peak Brake: %{customdata[2]:.1f} %<br>"
+                    "Min ax: %{customdata[3]:.2f} m/s²<br>"
+                    "Speed drop: %{customdata[4]:.1f} m/s"
+                    f"<extra>{run_name}</extra>"
+                ),
+            )
+        )
 
     if not any_trace:
         raise ValueError("No valid steering-stability points after zone grouping.")
@@ -1564,6 +1581,7 @@ def steering_stability_fig(
 
 
 # ── Lap Analysis: progression and consistency ────────────────────────────────
+
 
 def _lap_times_per_run(df: pl.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     """Return (lap_ids, lap_times_s) sorted by lap id, only for valid laps."""
@@ -1605,25 +1623,31 @@ def lap_time_progression_fig(dfs: dict[str, pl.DataFrame]) -> go.Figure:
         cum_avg = np.cumsum(lt) / np.arange(1, len(lt) + 1)
         color = _driver_color(run_name, i)
 
-        fig.add_trace(go.Scatter(
-            x=lap_ids, y=lt,
-            mode="lines+markers",
-            name=f"{run_name} — Lap time",
-            legendgroup=run_name,
-            line=dict(color=color, width=1.6),
-            marker=dict(color=color, size=8, line=dict(width=0)),
-            hovertemplate="Lap %{x}<br>Lap time: %{y:.3f} s<extra>" + run_name + "</extra>",
-        ))
-        fig.add_trace(go.Scatter(
-            x=lap_ids, y=cum_avg,
-            mode="lines+markers",
-            name=f"{run_name} — Raising avg",
-            legendgroup=run_name,
-            line=dict(color=color, width=1.4, dash="dash"),
-            marker=dict(color=color, size=6, symbol="diamond"),
-            opacity=0.85,
-            hovertemplate="Lap %{x}<br>Raising avg: %{y:.3f} s<extra>" + run_name + "</extra>",
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=lap_ids,
+                y=lt,
+                mode="lines+markers",
+                name=f"{run_name} — Lap time",
+                legendgroup=run_name,
+                line=dict(color=color, width=1.6),
+                marker=dict(color=color, size=8, line=dict(width=0)),
+                hovertemplate="Lap %{x}<br>Lap time: %{y:.3f} s<extra>" + run_name + "</extra>",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=lap_ids,
+                y=cum_avg,
+                mode="lines+markers",
+                name=f"{run_name} — Raising avg",
+                legendgroup=run_name,
+                line=dict(color=color, width=1.4, dash="dash"),
+                marker=dict(color=color, size=6, symbol="diamond"),
+                opacity=0.85,
+                hovertemplate="Lap %{x}<br>Raising avg: %{y:.3f} s<extra>" + run_name + "</extra>",
+            )
+        )
         all_laps.append(lap_ids)
 
     if all_laps:
@@ -1657,26 +1681,26 @@ def lap_consistency_stats(dfs: dict[str, pl.DataFrame]) -> pl.DataFrame:
         if lt.size == 0:
             continue
 
-        best   = float(np.nanmin(lt))
-        mean   = float(np.nanmean(lt))
+        best = float(np.nanmin(lt))
+        mean = float(np.nanmean(lt))
         median = float(np.nanmedian(lt))
-        std    = float(np.nanstd(lt, ddof=1)) if lt.size >= 2 else 0.0
+        std = float(np.nanstd(lt, ddof=1)) if lt.size >= 2 else 0.0
         cv_pct = 100.0 * std / mean if mean > 0 else np.nan
-        mad    = float(np.nanmedian(np.abs(lt - median)))
-        rng    = float(np.nanmax(lt) - np.nanmin(lt))
-        gap    = mean - best
+        mad = float(np.nanmedian(np.abs(lt - median)))
+        rng = float(np.nanmax(lt) - np.nanmin(lt))
+        gap = mean - best
 
         row: dict = {}
         if multi_run:
             row["Run"] = run_name
-        row["Laps"]            = int(lt.size)
-        row["Best [s]"]        = round(best, 3)
-        row["Mean [s]"]        = round(mean, 3)
-        row["Median [s]"]      = round(median, 3)
-        row["Std [s]"]         = round(std, 3)
-        row["CV [%]"]          = round(cv_pct, 2)
-        row["MAD [s]"]         = round(mad, 3)
-        row["Range [s]"]       = round(rng, 3)
+        row["Laps"] = int(lt.size)
+        row["Best [s]"] = round(best, 3)
+        row["Mean [s]"] = round(mean, 3)
+        row["Median [s]"] = round(median, 3)
+        row["Std [s]"] = round(std, 3)
+        row["CV [%]"] = round(cv_pct, 2)
+        row["MAD [s]"] = round(mad, 3)
+        row["Range [s]"] = round(rng, 3)
         row["Gap to best [s]"] = round(gap, 3)
         rows.append(row)
 
@@ -1693,15 +1717,15 @@ def _run_display_name(run_name: str) -> str:
 #   source: "consistency" (lap_consistency_stats row) | "summary" (driver_summary)
 #   lower_is_better None  => descriptive style row (no winner / no colour)
 _SCORECARD_SPEC: tuple[tuple[str, str, str, bool | None], ...] = (
-    ("Best lap [s]",               "consistency", "Best [s]",                 True),
-    ("Mean lap [s]",               "consistency", "Mean [s]",                 True),
-    ("Consistency CV [%]",         "consistency", "CV [%]",                   True),
-    ("Gap to best [s]",            "consistency", "Gap to best [s]",          True),
-    ("Full throttle [%]",          "summary",     "mean_full_pct",            False),
-    ("Off throttle [%]",           "summary",     "mean_off_pct",             True),
-    ("Brake aggressiveness [%/s]", "summary",     "mean_brake_aggr",          None),
-    ("Brake release [%/s]",        "summary",     "mean_brake_release",       None),
-    ("Steering smoothness [deg]",  "summary",     "mean_steering_smoothness", None),
+    ("Best lap [s]", "consistency", "Best [s]", True),
+    ("Mean lap [s]", "consistency", "Mean [s]", True),
+    ("Consistency CV [%]", "consistency", "CV [%]", True),
+    ("Gap to best [s]", "consistency", "Gap to best [s]", True),
+    ("Full throttle [%]", "summary", "mean_full_pct", False),
+    ("Off throttle [%]", "summary", "mean_off_pct", True),
+    ("Brake aggressiveness [%/s]", "summary", "mean_brake_aggr", None),
+    ("Brake release [%/s]", "summary", "mean_brake_release", None),
+    ("Steering smoothness [deg]", "summary", "mean_steering_smoothness", None),
 )
 
 
@@ -1709,6 +1733,7 @@ def _scorecard_verdict(
     a: str, b: str, a_name: str, b_name: str, cons_by_run: dict[str, dict]
 ) -> str:
     """One-line A/B verdict from best-lap pace and consistency (CV)."""
+
     def _num(run_name: str, key: str) -> float:
         v = cons_by_run.get(run_name, {}).get(key)
         try:
@@ -1758,10 +1783,9 @@ def driver_scorecard(
         for row in consistency_df.iter_rows(named=True):
             cons_by_run[str(row["Run"])] = row
 
-    runs = [
-        rn for rn in summaries
-        if summaries[rn].get("valid_laps", 0) > 0 and rn in cons_by_run
-    ][:2]
+    runs = [rn for rn in summaries if summaries[rn].get("valid_laps", 0) > 0 and rn in cons_by_run][
+        :2
+    ]
     if len(runs) < 2:
         return pl.DataFrame(), {}, ""
 
@@ -1794,8 +1818,8 @@ _TRAIL_BRAKE_THR_PCT = 5.0
 _TRAIL_STEER_THR_DEG = 2.0
 _TRAIL_THROTTLE_THR_PCT = 5.0
 
-_COMBINED_BRAKE_THR_PCT = 5.0   # [%]   Brake/regen demand above this = braking
-_COMBINED_STEER_THR_DEG = 5.0   # [deg] |Steering| above this = steering (turning in)
+_COMBINED_BRAKE_THR_PCT = 5.0  # [%]   Brake/regen demand above this = braking
+_COMBINED_STEER_THR_DEG = 5.0  # [deg] |Steering| above this = steering (turning in)
 
 
 def trail_braking_kpis(
@@ -1847,7 +1871,9 @@ def trail_braking_kpis(
     coasting_pct = float(np.mean((~braking) & (~throttle_on)) * 100.0)
 
     return {
-        "trail_overlap_pct": round(trail_overlap, 1) if np.isfinite(trail_overlap) else float("nan"),
+        "trail_overlap_pct": round(trail_overlap, 1)
+        if np.isfinite(trail_overlap)
+        else float("nan"),
         "coasting_pct": round(coasting_pct, 1),
         "braking_samples": n_brake,
         "samples": int(brake.size),
@@ -1875,9 +1901,7 @@ def _combined_brake_steer_per_lap(
 
     laps = d["laps"]
     laptime = d["laptime"]
-    active = (d["Brake"] > brake_thr_pct) & (
-        np.rad2deg(np.abs(d["Steering"])) > steer_thr_deg
-    )
+    active = (d["Brake"] > brake_thr_pct) & (np.rad2deg(np.abs(d["Steering"])) > steer_thr_deg)
 
     lap_list = unique_laps(laps)
     n = len(lap_list)
@@ -1909,7 +1933,9 @@ def combined_brake_steer_fig(
         if not ok.any():
             continue
         x_arr, order, _ = per_lap_axis(
-            res["lap_list"][ok], res["lt_val"][ok], x_mode,
+            res["lap_list"][ok],
+            res["lt_val"][ok],
+            x_mode,
         )
         y_arr = res["combined_pct"][ok][order]
         lap_ord = res["lap_list"][ok][order]
@@ -1939,18 +1965,20 @@ def lap_time_distribution_fig(dfs: dict[str, pl.DataFrame]) -> go.Figure:
         if lt.size == 0:
             continue
         color = _driver_color(run_name, i)
-        fig.add_trace(go.Box(
-            y=lt,
-            name=run_name,
-            marker=dict(color=color),
-            line=dict(color=color),
-            fillcolor=color,
-            opacity=0.55,
-            boxmean="sd",
-            boxpoints="all",
-            jitter=0.4,
-            pointpos=0.0,
-        ))
+        fig.add_trace(
+            go.Box(
+                y=lt,
+                name=run_name,
+                marker=dict(color=color),
+                line=dict(color=color),
+                fillcolor=color,
+                opacity=0.55,
+                boxmean="sd",
+                boxpoints="all",
+                jitter=0.4,
+                pointpos=0.0,
+            )
+        )
     fig.update_layout(showlegend=False)
     return fig
 
@@ -1962,8 +1990,10 @@ def _lap_comparison_data(
     """Return distance-aligned telemetry arrays for one lap."""
     speed_col = "VN_vx"
     ay_col = "Filtering_VN_ay"
-    ax_col = "Filtering_VN_ax" if "Filtering_VN_ax" in df.columns else (
-        "VN_ax" if "VN_ax" in df.columns else None
+    ax_col = (
+        "Filtering_VN_ax"
+        if "Filtering_VN_ax" in df.columns
+        else ("VN_ax" if "VN_ax" in df.columns else None)
     )
     required = (
         "TimeStamp",
@@ -2170,7 +2200,8 @@ def potential_lap_from_sectors(
     Analysis code can consume it like any other lap.
     """
     valid_sectors = [
-        sector for sector in sectors
+        sector
+        for sector in sectors
         if (
             np.isfinite(float(sector.s_start_m))
             and np.isfinite(float(sector.s_end_m))
@@ -2220,30 +2251,29 @@ def potential_lap_from_sectors(
             "VN_longitude": _interp_on_grid(data, "longitude", s_grid),
         }
         segment_rows.append(rows)
-        segment_meta.append({
-            "sector_index": int(getattr(sector, "index", sector_idx)),
-            "kind": str(getattr(sector, "kind", "")),
-            "turn_id": (
-                None
-                if getattr(sector, "turn_id", None) is None
-                else int(getattr(sector, "turn_id"))
-            ),
-            "s_start_m": start_m,
-            "s_end_m": end_m,
-            "run": run_name,
-            "lap": lap_id,
-            "duration_s": duration_s,
-        })
+        segment_meta.append(
+            {
+                "sector_index": int(getattr(sector, "index", sector_idx)),
+                "kind": str(getattr(sector, "kind", "")),
+                "turn_id": (
+                    None
+                    if getattr(sector, "turn_id", None) is None
+                    else int(getattr(sector, "turn_id"))
+                ),
+                "s_start_m": start_m,
+                "s_end_m": end_m,
+                "run": run_name,
+                "lap": lap_id,
+                "duration_s": duration_s,
+            }
+        )
         elapsed_offset_s += duration_s
 
     if not segment_rows or not np.isfinite(elapsed_offset_s) or elapsed_offset_s <= 0.0:
         return None
 
     columns = list(segment_rows[0].keys())
-    stitched = {
-        col: np.concatenate([rows[col] for rows in segment_rows])
-        for col in columns
-    }
+    stitched = {col: np.concatenate([rows[col] for rows in segment_rows]) for col in columns}
     stitched["laptime"] = np.full(len(stitched["TimeStamp"]), elapsed_offset_s)
     out = pl.DataFrame(stitched)
     metadata: dict[str, object] = {
@@ -2279,14 +2309,16 @@ def lap_delta_fig(
     ref_label = _comparison_lap_label(ref_run, int(ref_lap))
     cmp_label = _comparison_lap_label(cmp_run, int(cmp_lap))
 
-    fig.add_trace(go.Scatter(
-        x=grid,
-        y=delta,
-        mode="lines",
-        name=f"{cmp_label} - {ref_label}",
-        line=dict(color="#F2C94C", width=2.2),
-        hovertemplate="Distance: %{x:.1f} m<br>Delta: %{y:+.3f} s<extra></extra>",
-    ))
+    fig.add_trace(
+        go.Scatter(
+            x=grid,
+            y=delta,
+            mode="lines",
+            name=f"{cmp_label} - {ref_label}",
+            line=dict(color="#F2C94C", width=2.2),
+            hovertemplate="Distance: %{x:.1f} m<br>Delta: %{y:+.3f} s<extra></extra>",
+        )
+    )
     fig.add_hline(y=0.0, line=dict(color="rgba(235,235,235,0.55)", dash="dash"))
     fig.update_layout(
         annotations=[
@@ -2421,9 +2453,7 @@ def lap_comparison_arrays(
         "ref_longitude": ref_lng,
         "cmp_latitude": cmp_lat,
         "cmp_longitude": cmp_lng,
-        "phase": _classify_comparison_phase(
-            ref_brake, cmp_brake, ref_thr, cmp_thr, ref_ay, cmp_ay
-        ),
+        "phase": _classify_comparison_phase(ref_brake, cmp_brake, ref_thr, cmp_thr, ref_ay, cmp_ay),
         "ref_label": _comparison_lap_label(ref_run, int(ref_lap)),
         "cmp_label": _comparison_lap_label(cmp_run, int(cmp_lap)),
         "ref_lap_time_s": float(ref["lap_time_s"]),
@@ -2489,12 +2519,12 @@ def _excluded_turn_mask_on_grid(
     return mask
 
 
-_AX_BRAKE_ON_MPS2 = 3.5     # ≈ 0.36 g — clear deceleration event
-_AX_BRAKE_OFF_MPS2 = 1.5    # ≈ 0.15 g — hysteresis release
-_AX_ACCEL_ON_MPS2 = 2.0     # ≈ 0.20 g — clear traction event
-_AX_ACCEL_OFF_MPS2 = 0.8    # ≈ 0.08 g — hysteresis release
-_APEX_PEAK_REL = 0.85       # apex band = curvature ≥ this fraction of peak
-_APEX_HALF_BAND_M = 8.0     # fallback half-width of apex band when curvature is unreliable
+_AX_BRAKE_ON_MPS2 = 3.5  # ≈ 0.36 g — clear deceleration event
+_AX_BRAKE_OFF_MPS2 = 1.5  # ≈ 0.15 g — hysteresis release
+_AX_ACCEL_ON_MPS2 = 2.0  # ≈ 0.20 g — clear traction event
+_AX_ACCEL_OFF_MPS2 = 0.8  # ≈ 0.08 g — hysteresis release
+_APEX_PEAK_REL = 0.85  # apex band = curvature ≥ this fraction of peak
+_APEX_HALF_BAND_M = 8.0  # fallback half-width of apex band when curvature is unreliable
 _APEX_MIN_HALF_BAND_M = 3.0
 _APEX_MAX_HALF_BAND_M = 18.0
 
@@ -2615,7 +2645,10 @@ def _clean_phase_segmented(
         seg_s = s_m[start:end]
         seg_phase = cleaned[start:end]
         cleaned[start:end] = _clean_phase_by_distance(
-            seg_s, seg_phase, min_zone_m=min_zone_m, merge_gap_m=merge_gap_m,
+            seg_s,
+            seg_phase,
+            min_zone_m=min_zone_m,
+            merge_gap_m=merge_gap_m,
         )
     return cleaned
 
@@ -2661,21 +2694,17 @@ def _lap_analysis_phase_array(
     brake_off_pct = max(0.0, brake_threshold_pct * 0.4)
     throttle_off_pct = max(0.0, throttle_threshold_pct * 0.6)
 
-    brake_high = (
-        (np.isfinite(max_brake) & (max_brake >= brake_threshold_pct))
-        | (np.isfinite(min_ax) & (min_ax <= -_AX_BRAKE_ON_MPS2))
+    brake_high = (np.isfinite(max_brake) & (max_brake >= brake_threshold_pct)) | (
+        np.isfinite(min_ax) & (min_ax <= -_AX_BRAKE_ON_MPS2)
     )
-    brake_low = (
-        (np.isfinite(max_brake) & (max_brake >= brake_off_pct))
-        | (np.isfinite(min_ax) & (min_ax <= -_AX_BRAKE_OFF_MPS2))
+    brake_low = (np.isfinite(max_brake) & (max_brake >= brake_off_pct)) | (
+        np.isfinite(min_ax) & (min_ax <= -_AX_BRAKE_OFF_MPS2)
     )
-    accel_high = (
-        (np.isfinite(max_throttle) & (max_throttle >= throttle_threshold_pct))
-        | (np.isfinite(max_ax) & (max_ax >= _AX_ACCEL_ON_MPS2))
+    accel_high = (np.isfinite(max_throttle) & (max_throttle >= throttle_threshold_pct)) | (
+        np.isfinite(max_ax) & (max_ax >= _AX_ACCEL_ON_MPS2)
     )
-    accel_low = (
-        (np.isfinite(max_throttle) & (max_throttle >= throttle_off_pct))
-        | (np.isfinite(max_ax) & (max_ax >= _AX_ACCEL_OFF_MPS2))
+    accel_low = (np.isfinite(max_throttle) & (max_throttle >= throttle_off_pct)) | (
+        np.isfinite(max_ax) & (max_ax >= _AX_ACCEL_OFF_MPS2)
     )
 
     brake_mask = _hysteresis_mask(brake_high, brake_low)
@@ -2700,7 +2729,11 @@ def _lap_analysis_phase_array(
                 continue
             apex_m = float(np.clip(apex_m, entry_m, exit_m))
             apex_lo, apex_hi = _apex_band_for_turn(
-                s_m, ref_curvature, entry_m, apex_m, exit_m,
+                s_m,
+                ref_curvature,
+                entry_m,
+                apex_m,
+                exit_m,
             )
             apex_lo = float(np.clip(apex_lo, entry_m, exit_m))
             apex_hi = float(np.clip(apex_hi, entry_m, exit_m))
@@ -2753,8 +2786,7 @@ def _nearest_turn_id_for_zone(
     if not turns:
         return None
     candidates = [
-        turn for turn in turns
-        if active_turn_ids is None or int(turn.turn_id) in active_turn_ids
+        turn for turn in turns if active_turn_ids is None or int(turn.turn_id) in active_turn_ids
     ]
     if not candidates:
         return None
@@ -2792,7 +2824,7 @@ def _clean_phase_by_distance(
             else:
                 replacement = prev_phase if prev_phase is not None else next_phase
             if replacement is not None:
-                clean[start:end + 1] = replacement
+                clean[start : end + 1] = replacement
 
     if merge_gap_m > 0.0:
         for _phase, start, end in _phase_segments(clean.copy()):
@@ -2802,7 +2834,7 @@ def _clean_phase_by_distance(
                 continue
             gap_m = float(s_m[end] - s_m[start])
             if np.isfinite(gap_m) and gap_m <= merge_gap_m:
-                clean[start:end + 1] = clean[start - 1]
+                clean[start : end + 1] = clean[start - 1]
     return clean
 
 
@@ -2829,13 +2861,18 @@ def _comparison_phase_zones_from_comp(
     if turns:
         turn_id_at = _turn_id_at_grid(s_m, turns, active_turn_ids)
         phase = _clean_phase_segmented(
-            s_m, phase, turn_id_at,
+            s_m,
+            phase,
+            turn_id_at,
             min_zone_m=min_zone_m,
             merge_gap_m=merge_gap_m,
         )
     else:
         phase = _clean_phase_by_distance(
-            s_m, phase, min_zone_m=min_zone_m, merge_gap_m=merge_gap_m,
+            s_m,
+            phase,
+            min_zone_m=min_zone_m,
+            merge_gap_m=merge_gap_m,
         )
     ignored_turn_mask = _excluded_turn_mask_on_grid(s_m, turns, active_turn_ids)
 
@@ -2887,7 +2924,10 @@ def _comparison_phase_zones_from_comp(
         turn_id = int(turn.turn_id) if turn is not None else None
         if turn_id is None and phase_str in {"Braking", "Acceleration"}:
             turn_id = _nearest_turn_id_for_zone(
-                phase_str, center_m, turns, active_turn_ids,
+                phase_str,
+                center_m,
+                turns,
+                active_turn_ids,
             )
 
         if phase_str in {"Entry", "Corner Entry"} and turn_id is not None:
@@ -2904,13 +2944,15 @@ def _comparison_phase_zones_from_comp(
             idx = counters.get(phase_str, 1)
             counters[phase_str] = idx + 1
             zone_name = f"{prefixes.get(phase_str, 'Z')}{idx}"
-        zones.append({
-            "zone": zone_name,
-            "type": phase_str,
-            "turn_id": turn_id,
-            "s0_m": s0,
-            "s1_m": s1,
-        })
+        zones.append(
+            {
+                "zone": zone_name,
+                "type": phase_str,
+                "turn_id": turn_id,
+                "s0_m": s0,
+                "s1_m": s1,
+            }
+        )
     return zones
 
 
@@ -3088,7 +3130,9 @@ def lap_delta_cumulative_fig(
     neg = np.where(delta < 0.0, delta, 0.0)
     fig.add_trace(
         go.Scatter(
-            x=s, y=pos, mode="lines",
+            x=s,
+            y=pos,
+            mode="lines",
             line=dict(width=0),
             fill="tozeroy",
             fillcolor="rgba(235,87,87,0.30)",
@@ -3098,7 +3142,9 @@ def lap_delta_cumulative_fig(
     )
     fig.add_trace(
         go.Scatter(
-            x=s, y=neg, mode="lines",
+            x=s,
+            y=neg,
+            mode="lines",
             line=dict(width=0),
             fill="tozeroy",
             fillcolor="rgba(39,174,96,0.30)",
@@ -3108,7 +3154,9 @@ def lap_delta_cumulative_fig(
     )
     fig.add_trace(
         go.Scatter(
-            x=s, y=delta, mode="lines",
+            x=s,
+            y=delta,
+            mode="lines",
             line=dict(color="#F2C94C", width=2.0),
             name=f"{comp['cmp_label']} − {comp['ref_label']}",
             hovertemplate="Distance %{x:.1f} m<br>Δt %{y:+.3f} s<extra></extra>",
@@ -3247,9 +3295,13 @@ def lap_pedal_distances_fig(
 
     if not active_turns:
         fig.add_annotation(
-            x=0.5, y=0.5, xref="paper", yref="paper",
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
             text="No corners selected.",
-            showarrow=False, font=dict(color="#EBEBEB"),
+            showarrow=False,
+            font=dict(color="#EBEBEB"),
         )
         fig.update_layout(height=300, showlegend=False)
         return fig
@@ -3282,9 +3334,7 @@ def lap_pedal_distances_fig(
             for lap_id in laps.tolist():
                 lap_mask = lap_cols["laps"] == float(lap_id)
                 if lap_mask.any() and np.any(np.isfinite(lap_cols["laptime"][lap_mask])):
-                    lap_times.append(
-                        (int(lap_id), float(np.nanmax(lap_cols["laptime"][lap_mask])))
-                    )
+                    lap_times.append((int(lap_id), float(np.nanmax(lap_cols["laptime"][lap_mask]))))
             if lap_times:
                 fastest_lap_id = min(lap_times, key=lambda item: item[1])[0]
         except Exception:
@@ -3302,7 +3352,8 @@ def lap_pedal_distances_fig(
             is_fastest = fastest_lap_id is not None and int(lap_id) == fastest_lap_id
             for ci, turn in enumerate(active_turns):
                 _, rt_m = _pedal_distances_for_lap(
-                    data, turn,
+                    data,
+                    turn,
                     brake_thr_pct=brake_thr_pct,
                     throttle_thr_pct=throttle_thr_pct,
                 )
@@ -3323,10 +3374,15 @@ def lap_pedal_distances_fig(
         if bg_x:
             fig.add_trace(
                 go.Scatter(
-                    x=bg_x, y=bg_y, mode="markers",
-                    name=run_name, legendgroup=run_name,
+                    x=bg_x,
+                    y=bg_y,
+                    mode="markers",
+                    name=run_name,
+                    legendgroup=run_name,
                     marker=dict(
-                        color=bg_color, size=6, opacity=0.55,
+                        color=bg_color,
+                        size=6,
+                        opacity=0.55,
                         line=dict(width=0.5, color="#1A1F2A"),
                     ),
                     hovertext=bg_h,
@@ -3336,14 +3392,20 @@ def lap_pedal_distances_fig(
         if highlight_x:
             fastest_label = (
                 f"{run_name} fastest L{int(fastest_lap_id)}"
-                if fastest_lap_id is not None else f"{run_name} fastest"
+                if fastest_lap_id is not None
+                else f"{run_name} fastest"
             )
             fig.add_trace(
                 go.Scatter(
-                    x=highlight_x, y=highlight_y, mode="markers",
-                    name=fastest_label, legendgroup=f"{run_name}_fastest",
+                    x=highlight_x,
+                    y=highlight_y,
+                    mode="markers",
+                    name=fastest_label,
+                    legendgroup=f"{run_name}_fastest",
                     marker=dict(
-                        color=fastest_color, size=11, opacity=1.0,
+                        color=fastest_color,
+                        size=11,
+                        opacity=1.0,
                         line=dict(width=1.5, color=bg_color),
                         symbol="circle",
                     ),
@@ -3358,7 +3420,9 @@ def lap_pedal_distances_fig(
         margin=dict(l=60, r=20, t=60, b=40),
     )
     fig.update_xaxes(
-        tickmode="array", tickvals=x_pos, ticktext=x_ticktext,
+        tickmode="array",
+        tickvals=x_pos,
+        ticktext=x_ticktext,
         range=[-0.5, n_corners - 0.5],
     )
     if all_y:
@@ -3442,29 +3506,41 @@ def lap_phase_track_fig(
     # the reference lap. Falls back silently if the run lacks GPS columns.
     full_lat, full_lng = _full_session_gps(dfs.get(ref_run))
     if full_lat.size > 0:
-        fig.add_trace(go.Scattergl(
-            x=full_lng, y=full_lat,
-            mode="lines",
-            line=dict(color="rgba(160,160,160,0.18)", width=2),
-            showlegend=False, hoverinfo="skip",
-        ))
+        fig.add_trace(
+            go.Scattergl(
+                x=full_lng,
+                y=full_lat,
+                mode="lines",
+                line=dict(color="rgba(160,160,160,0.18)", width=2),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
 
     if not ok.any():
         if full_lat.size == 0:
             fig.add_annotation(
-                x=0.5, y=0.5, xref="paper", yref="paper",
-                text="GPS not available", showarrow=False,
+                x=0.5,
+                y=0.5,
+                xref="paper",
+                yref="paper",
+                text="GPS not available",
+                showarrow=False,
                 font=dict(color="#EBEBEB"),
             )
         return fig
 
     # Brighter outline for the reference lap on top of the session context.
-    fig.add_trace(go.Scattergl(
-        x=lng[ok], y=lat[ok],
-        mode="lines",
-        line=dict(color="rgba(160,160,160,0.45)", width=4),
-        showlegend=False, hoverinfo="skip",
-    ))
+    fig.add_trace(
+        go.Scattergl(
+            x=lng[ok],
+            y=lat[ok],
+            mode="lines",
+            line=dict(color="rgba(160,160,160,0.45)", width=4),
+            showlegend=False,
+            hoverinfo="skip",
+        )
+    )
 
     # Straight is the only global phase trace. Entry/Exit are drawn per turn so
     # the visible blue/orange segments themselves carry the clicked turn_id.
@@ -3488,13 +3564,16 @@ def lap_phase_track_fig(
             xs.append(float("nan"))
             ys.extend(lat[seg].tolist())
             ys.append(float("nan"))
-        fig.add_trace(go.Scattergl(
-            x=xs, y=ys,
-            mode="lines",
-            name="Straight",
-            line=dict(color=_PHASE_COLORS["Straight"], width=3),
-            hovertemplate="Straight<extra></extra>",
-        ))
+        fig.add_trace(
+            go.Scattergl(
+                x=xs,
+                y=ys,
+                mode="lines",
+                name="Straight",
+                line=dict(color=_PHASE_COLORS["Straight"], width=3),
+                hovertemplate="Straight<extra></extra>",
+            )
+        )
 
     entry_legend_shown = False
     exit_legend_shown = False
@@ -3517,44 +3596,51 @@ def lap_phase_track_fig(
             elif is_active and phase_name == "Exit" and not exit_legend_shown:
                 showlegend = True
                 exit_legend_shown = True
-            fig.add_trace(go.Scattergl(
-                x=lng[seg_mask],
-                y=lat[seg_mask],
-                mode="lines+markers",
-                line=dict(color=phase_color if is_active else "rgba(235,235,235,0.42)", width=5),
-                marker=dict(
-                    size=7,
-                    color=phase_color if is_active else "rgba(235,235,235,0.42)",
-                    line=dict(width=0),
-                ),
-                customdata=[["turn", turn_id] for _ in range(int(seg_mask.sum()))],
-                name=phase_name if is_active else f"T{turn_id} excluded",
-                showlegend=showlegend,
-                hovertemplate=(
-                    f"T{turn_id} · {phase_name}<br>"
-                    + ("Click to exclude" if is_active else "Click to include")
-                    + "<extra></extra>"
-                ),
-            ))
+            fig.add_trace(
+                go.Scattergl(
+                    x=lng[seg_mask],
+                    y=lat[seg_mask],
+                    mode="lines+markers",
+                    line=dict(
+                        color=phase_color if is_active else "rgba(235,235,235,0.42)", width=5
+                    ),
+                    marker=dict(
+                        size=7,
+                        color=phase_color if is_active else "rgba(235,235,235,0.42)",
+                        line=dict(width=0),
+                    ),
+                    customdata=[["turn", turn_id] for _ in range(int(seg_mask.sum()))],
+                    name=phase_name if is_active else f"T{turn_id} excluded",
+                    showlegend=showlegend,
+                    hovertemplate=(
+                        f"T{turn_id} · {phase_name}<br>"
+                        + ("Click to exclude" if is_active else "Click to include")
+                        + "<extra></extra>"
+                    ),
+                )
+            )
 
         apex_lng = float(np.interp(ph.s_apex_m, s_m, lng))
         apex_lat = float(np.interp(ph.s_apex_m, s_m, lat))
-        fig.add_trace(go.Scattergl(
-            x=[apex_lng], y=[apex_lat],
-            mode="markers+text" if is_active else "markers",
-            text=[f"T{turn_id}"] if is_active else None,
-            textposition="top center",
-            textfont=dict(color="#FFFFFF" if is_active else "rgba(235,235,235,0.45)", size=9),
-            marker=dict(
-                size=7 if is_active else 6,
-                color="#F2C94C" if is_active else "rgba(235,235,235,0.45)",
-                symbol="circle" if is_active else "circle-open",
-            ),
-            customdata=[["turn", turn_id]],
-            name="Apex",
-            showlegend=False,
-            hovertemplate=f"T{turn_id}  apex {ph.s_apex_m:.0f} m<extra></extra>",
-        ))
+        fig.add_trace(
+            go.Scattergl(
+                x=[apex_lng],
+                y=[apex_lat],
+                mode="markers+text" if is_active else "markers",
+                text=[f"T{turn_id}"] if is_active else None,
+                textposition="top center",
+                textfont=dict(color="#FFFFFF" if is_active else "rgba(235,235,235,0.45)", size=9),
+                marker=dict(
+                    size=7 if is_active else 6,
+                    color="#F2C94C" if is_active else "rgba(235,235,235,0.45)",
+                    symbol="circle" if is_active else "circle-open",
+                ),
+                customdata=[["turn", turn_id]],
+                name="Apex",
+                showlegend=False,
+                hovertemplate=f"T{turn_id}  apex {ph.s_apex_m:.0f} m<extra></extra>",
+            )
+        )
 
     fig.update_layout(
         height=430,
@@ -3562,8 +3648,12 @@ def lap_phase_track_fig(
         clickmode="event",
         dragmode="pan",
         legend=dict(
-            orientation="h", yanchor="bottom", y=1.02,
-            xanchor="center", x=0.5, font=dict(size=12),
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=12),
         ),
     )
     fig.update_yaxes(scaleanchor="x", scaleratio=1.0)
@@ -3630,7 +3720,8 @@ def lap_event_detail_fig(
     x_mode = "time" if x_axis_mode == "time" else "distance"
 
     selected_keys = [
-        key for key in (signal_keys or ["delta_s", "vx_mps", "throttle_pct", "steering_deg"])
+        key
+        for key in (signal_keys or ["delta_s", "vx_mps", "throttle_pct", "steering_deg"])
         if key in LAP_SIGNAL_OPTIONS
     ]
     if not selected_keys:
@@ -3662,7 +3753,9 @@ def lap_event_detail_fig(
     ref_x = s_m if x_mode == "distance" else ref_time_s
     cmp_x = s_m if x_mode == "distance" else cmp_time_s
     x_for_single = ref_x
-    event_start_x = float(start_m) if x_mode == "distance" else float(np.interp(start_m, s_m, ref_time_s))
+    event_start_x = (
+        float(start_m) if x_mode == "distance" else float(np.interp(start_m, s_m, ref_time_s))
+    )
     event_end_x = float(end_m) if x_mode == "distance" else float(np.interp(end_m, s_m, ref_time_s))
     _add_event_window(fig, event_start_x, event_end_x, rows=rows)
 
@@ -3834,15 +3927,22 @@ def corner_detail_fig(
         s_apex = float(turn.s_apex_m)
 
     fig = lap_event_detail_fig(
-        dfs, ref_run, ref_lap, cmp_run, cmp_lap,
-        start_m, end_m, padding_m=padding_m,
+        dfs,
+        ref_run,
+        ref_lap,
+        cmp_run,
+        cmp_lap,
+        start_m,
+        end_m,
+        padding_m=padding_m,
         signal_keys=signal_keys,
         x_axis_mode=x_axis_mode,
     )
     fig.update_layout(title=dict(text=f"Turn {int(turn.turn_id)} - Entry · Apex · Exit"))
 
     selected_keys = [
-        key for key in (signal_keys or ["delta_s", "vx_mps", "throttle_pct", "steering_deg"])
+        key
+        for key in (signal_keys or ["delta_s", "vx_mps", "throttle_pct", "steering_deg"])
         if key in LAP_SIGNAL_OPTIONS
     ] or ["delta_s"]
     rows = len(selected_keys)
@@ -3936,16 +4036,18 @@ def corner_phase_delta_table(
         dt_exit = dt_between(ph.s_apex_m, ph.s_exit_m)
         contribs = {"Entry": dt_entry, "Exit": dt_exit}
         worst = max(contribs.items(), key=lambda kv: abs(kv[1]))[0]
-        rows.append({
-            "Turn": int(ph.turn_id),
-            "Δt entry [s]": round(dt_entry, 4),
-            "Δt exit [s]": round(dt_exit, 4),
-            "Total [s]": round(dt_entry + dt_exit, 4),
-            "Worst": worst,
-            "s_entry_m": round(ph.s_entry_m, 1),
-            "s_apex_m": round(ph.s_apex_m, 1),
-            "s_exit_m": round(ph.s_exit_m, 1),
-        })
+        rows.append(
+            {
+                "Turn": int(ph.turn_id),
+                "Δt entry [s]": round(dt_entry, 4),
+                "Δt exit [s]": round(dt_exit, 4),
+                "Total [s]": round(dt_entry + dt_exit, 4),
+                "Worst": worst,
+                "s_entry_m": round(ph.s_entry_m, 1),
+                "s_apex_m": round(ph.s_apex_m, 1),
+                "s_exit_m": round(ph.s_exit_m, 1),
+            }
+        )
     return pl.DataFrame(rows, schema=schema), phases
 
 
@@ -3958,16 +4060,23 @@ def corner_phase_delta_fig(table: pl.DataFrame) -> go.Figure:
     """
     fig = make_dark_figure("Where is the time? · Δt by corner geometry")
     if table.is_empty():
-        fig.update_layout(annotations=[dict(
-            text="No corners detected.",
-            xref="paper", yref="paper", x=0.5, y=0.5,
-            showarrow=False, font=dict(color="#E5E5E5"),
-        )])
+        fig.update_layout(
+            annotations=[
+                dict(
+                    text="No corners detected.",
+                    xref="paper",
+                    yref="paper",
+                    x=0.5,
+                    y=0.5,
+                    showarrow=False,
+                    font=dict(color="#E5E5E5"),
+                )
+            ]
+        )
         return fig
 
     sorted_tbl = (
-        table
-        .with_columns(pl.col("Total [s]").abs().alias("_abs"))
+        table.with_columns(pl.col("Total [s]").abs().alias("_abs"))
         .sort("_abs", descending=False)  # smallest at the bottom in plotly horizontal bars
         .drop("_abs")
     )
@@ -3978,30 +4087,39 @@ def corner_phase_delta_fig(table: pl.DataFrame) -> go.Figure:
     )
     for label, col, color in phase_cols:
         values = sorted_tbl[col].to_list()
-        fig.add_trace(go.Bar(
-            x=values,
-            y=turns,
-            name=label,
-            orientation="h",
-            marker=dict(color=color),
-            hovertemplate=f"%{{y}} · {label}<br>Δt = %{{x:+.3f}} s<extra></extra>",
-        ))
+        fig.add_trace(
+            go.Bar(
+                x=values,
+                y=turns,
+                name=label,
+                orientation="h",
+                marker=dict(color=color),
+                hovertemplate=f"%{{y}} · {label}<br>Δt = %{{x:+.3f}} s<extra></extra>",
+            )
+        )
     totals = sorted_tbl["Total [s]"].to_list()
-    fig.add_trace(go.Scatter(
-        x=totals,
-        y=turns,
-        mode="markers",
-        marker=dict(color="#FFFFFF", size=8, symbol="diamond", line=dict(color="#111", width=1)),
-        name="Total",
-        hovertemplate="%{y} · Total Δt = %{x:+.3f} s<extra></extra>",
-    ))
+    fig.add_trace(
+        go.Scatter(
+            x=totals,
+            y=turns,
+            mode="markers",
+            marker=dict(
+                color="#FFFFFF", size=8, symbol="diamond", line=dict(color="#111", width=1)
+            ),
+            name="Total",
+            hovertemplate="%{y} · Total Δt = %{x:+.3f} s<extra></extra>",
+        )
+    )
     fig.update_layout(
         barmode="relative",
         height=max(280, 28 * len(turns) + 140),
         xaxis=dict(
             title="Δt cmp − ref [s]   (positive = cmp slower)",
-            zeroline=True, zerolinecolor="rgba(229,229,229,0.4)", zerolinewidth=1.2,
-            color="#E5E5E5", gridcolor="rgba(128,128,128,0.2)",
+            zeroline=True,
+            zerolinecolor="rgba(229,229,229,0.4)",
+            zerolinewidth=1.2,
+            color="#E5E5E5",
+            gridcolor="rgba(128,128,128,0.2)",
         ),
         yaxis=dict(color="#E5E5E5", gridcolor="rgba(128,128,128,0.15)"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
@@ -4043,22 +4161,29 @@ def corner_gg_fig(
         gg_s_m = s_m[mask]
         valid = np.isfinite(ax) & np.isfinite(ay)
         label = _comparison_lap_label(run_name, int(lap_id))
-        fig.add_trace(go.Scatter(
-            x=ay[valid],
-            y=ax[valid],
-            customdata=gg_s_m[valid],
-            mode="markers",
-            name=label,
-            marker=dict(color=color, size=4, opacity=0.8),
-            hovertemplate="ay=%{x:.2f}<br>ax=%{y:.2f}<extra>" + label + "</extra>",
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=ay[valid],
+                y=ax[valid],
+                customdata=gg_s_m[valid],
+                mode="markers",
+                name=label,
+                marker=dict(color=color, size=4, opacity=0.8),
+                hovertemplate="ay=%{x:.2f}<br>ax=%{y:.2f}<extra>" + label + "</extra>",
+            )
+        )
     fig.update_layout(
         xaxis=dict(
-            zeroline=True, zerolinecolor="rgba(229,229,229,0.4)", zerolinewidth=1.2,
+            zeroline=True,
+            zerolinecolor="rgba(229,229,229,0.4)",
+            zerolinewidth=1.2,
         ),
         yaxis=dict(
-            zeroline=True, zerolinecolor="rgba(229,229,229,0.4)", zerolinewidth=1.2,
-            scaleanchor="x", scaleratio=1,
+            zeroline=True,
+            zerolinecolor="rgba(229,229,229,0.4)",
+            zerolinewidth=1.2,
+            scaleanchor="x",
+            scaleratio=1,
         ),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
     )
@@ -4088,9 +4213,16 @@ def lap_signal_overlay_fig(
     ref_color = driver_color(ref_run)
     cmp_color = driver_color(cmp_run)
     selected_keys = [
-        key for key in (signal_keys or [
-            "throttle_pct", "brake_pct", "steering_deg", "vx_mps",
-        ])
+        key
+        for key in (
+            signal_keys
+            or [
+                "throttle_pct",
+                "brake_pct",
+                "steering_deg",
+                "vx_mps",
+            ]
+        )
         if key in LAP_SIGNAL_OPTIONS
     ]
     if not selected_keys:
@@ -4209,19 +4341,29 @@ def lap_signal_overlay_fig(
                 cmp_y = np.rad2deg(cmp_y)
             fig.add_trace(
                 go.Scatter(
-                    x=s_m, y=ref_y, mode="lines",
-                    name=ref_label, legendgroup="ref", showlegend=not legend_shown,
+                    x=s_m,
+                    y=ref_y,
+                    mode="lines",
+                    name=ref_label,
+                    legendgroup="ref",
+                    showlegend=not legend_shown,
                     line=dict(color=ref_color, width=1.7),
                 ),
-                row=row, col=1,
+                row=row,
+                col=1,
             )
             fig.add_trace(
                 go.Scatter(
-                    x=s_m, y=cmp_y, mode="lines",
-                    name=cmp_label, legendgroup="cmp", showlegend=not legend_shown,
+                    x=s_m,
+                    y=cmp_y,
+                    mode="lines",
+                    name=cmp_label,
+                    legendgroup="cmp",
+                    showlegend=not legend_shown,
                     line=dict(color=cmp_color, dash="dash", width=1.7),
                 ),
-                row=row, col=1,
+                row=row,
+                col=1,
             )
             legend_shown = True
         else:
@@ -4235,7 +4377,8 @@ def lap_signal_overlay_fig(
                     line=dict(color=color, width=2.0),
                     hovertemplate="Distance %{x:.1f} m<br>%{y:+.3f}<extra></extra>",
                 ),
-                row=row, col=1,
+                row=row,
+                col=1,
             )
             fig.add_hline(
                 y=0.0,
@@ -4269,7 +4412,9 @@ def corner_curvature_fig(
         if not ok.any():
             continue
         x_arr, order, _ = per_lap_axis(
-            res["lap_list"][ok], res["lt_val"][ok], x_mode,
+            res["lap_list"][ok],
+            res["lt_val"][ok],
+            x_mode,
         )
         y_arr = res["mean_curvature"][ok][order]
         lap_ord = res["lap_list"][ok][order]
@@ -4286,8 +4431,10 @@ def corner_curvature_fig(
 
 # ── Standalone CLI ────────────────────────────────────────────────────────────
 
+
 def main() -> None:
     from utils import load_data
+
     df = load_data(CSV_PATH)
     summary = driver_summary(df)
     print("\n─── Driver summary ───")

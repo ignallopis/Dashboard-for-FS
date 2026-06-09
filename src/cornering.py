@@ -1,4 +1,5 @@
 """Corner entry / apex / exit analysis for driver telemetry."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -44,7 +45,9 @@ SIGN_SPLIT_MIN_PART_PEAK_AY_G = 0.35
 SAME_SIGN_SPLIT_MIN_PARENT_LENGTH_M = 80.0
 SAME_SIGN_SPLIT_MIN_PART_LENGTH_M = 22.0
 SAME_SIGN_SPLIT_MIN_PEAK_RATIO = 1.20  # peaks must be at least this ratio over the valley
-SAME_SIGN_SPLIT_VALLEY_REL_TO_PEAK = 0.55  # valley must drop at least to this fraction of smaller peak
+SAME_SIGN_SPLIT_VALLEY_REL_TO_PEAK = (
+    0.55  # valley must drop at least to this fraction of smaller peak
+)
 SAME_SIGN_SPLIT_MIN_PEAK_SEPARATION_M = 18.0
 
 _LAT_ACCEL_CANDIDATES = ("Filtering_VN_ay",)
@@ -63,6 +66,8 @@ _TURN_PALETTE = (
     "#2D9CDB",
     "#F2C94C",
 )
+
+
 @dataclass(frozen=True)
 class TurnDef:
     turn_id: int
@@ -148,11 +153,7 @@ def compute_corner_phases(
             i_off = int(indices[-1])
             s_brake_off = float(s_arr[i_off])
             j = i_off
-            while (
-                j > 0
-                and brake_arr[j - 1] >= brake_threshold_pct
-                and s_arr[j - 1] >= search_lo
-            ):
+            while j > 0 and brake_arr[j - 1] >= brake_threshold_pct and s_arr[j - 1] >= search_lo:
                 j -= 1
             s_brake_on = float(s_arr[j])
             has_brake = True
@@ -195,8 +196,7 @@ def _lateral_accel_col(df: pl.DataFrame) -> str:
         if col in df.columns:
             return col
     raise KeyError(
-        "Missing lateral acceleration column. Expected one of "
-        f"{list(_LAT_ACCEL_CANDIDATES)}."
+        f"Missing lateral acceleration column. Expected one of {list(_LAT_ACCEL_CANDIDATES)}."
     )
 
 
@@ -205,8 +205,7 @@ def _speed_col(df: pl.DataFrame) -> str:
         if col in df.columns:
             return col
     raise KeyError(
-        "Missing speed column for cornering radius. Expected one of "
-        f"{list(_SPEED_CANDIDATES)}."
+        f"Missing speed column for cornering radius. Expected one of {list(_SPEED_CANDIDATES)}."
     )
 
 
@@ -262,9 +261,7 @@ def _fill_short_dist_gaps(
         if gap_end < gap_start:
             continue
         if signed_lat_accel_mps2 is not None:
-            prev_sign = _dominant_turn_sign(
-                signed_lat_accel_mps2, max(0, prev_end - 3), prev_end
-            )
+            prev_sign = _dominant_turn_sign(signed_lat_accel_mps2, max(0, prev_end - 3), prev_end)
             next_sign = _dominant_turn_sign(
                 signed_lat_accel_mps2, next_start, min(len(clean) - 1, next_start + 3)
             )
@@ -272,7 +269,7 @@ def _fill_short_dist_gaps(
                 continue
         gap_m = float(s_lap_m[next_start] - s_lap_m[prev_end])
         if np.isfinite(gap_m) and gap_m >= 0.0 and gap_m < merge_gap_m:
-            clean[gap_start:gap_end + 1] = True
+            clean[gap_start : gap_end + 1] = True
     return clean
 
 
@@ -280,7 +277,7 @@ def _dominant_turn_sign(values: np.ndarray, start: int, end: int) -> int:
     """Return the sustained lateral direction in a segment: -1, 0, or +1."""
     if end < start:
         return 0
-    seg = values[start:end + 1]
+    seg = values[start : end + 1]
     finite = np.isfinite(seg) & (np.abs(seg) >= SIGN_SPLIT_AY_G * G_MPS2)
     if not np.any(finite):
         return 0
@@ -293,7 +290,7 @@ def _dominant_turn_sign(values: np.ndarray, start: int, end: int) -> int:
 
 
 def _filled_direction_sign(values: np.ndarray, start: int, end: int) -> np.ndarray:
-    seg = values[start:end + 1]
+    seg = values[start : end + 1]
     raw = np.where(
         np.isfinite(seg) & (np.abs(seg) >= SIGN_SPLIT_AY_G * G_MPS2),
         np.sign(seg),
@@ -329,10 +326,7 @@ def _split_segment_by_direction(
 ) -> list[tuple[int, int]]:
     """Split a continuous curvature zone when ay direction changes."""
     parent_length_m = float(s_lap_m[end] - s_lap_m[start])
-    if (
-        not np.isfinite(parent_length_m)
-        or parent_length_m < SIGN_SPLIT_MIN_PARENT_LENGTH_M
-    ):
+    if not np.isfinite(parent_length_m) or parent_length_m < SIGN_SPLIT_MIN_PARENT_LENGTH_M:
         return [(start, end)]
 
     signs = _filled_direction_sign(signed_lat_accel_mps2, start, end)
@@ -352,9 +346,7 @@ def _split_segment_by_direction(
         part_start = start + local_start
         part_end = start + local_end_excl - 1
         part_length_m = float(s_lap_m[part_end] - s_lap_m[part_start])
-        part_peak_ay = float(
-            np.nanmax(np.abs(signed_lat_accel_mps2[part_start:part_end + 1]))
-        )
+        part_peak_ay = float(np.nanmax(np.abs(signed_lat_accel_mps2[part_start : part_end + 1])))
         if (
             np.isfinite(part_length_m)
             and part_length_m >= SIGN_SPLIT_MIN_PART_LENGTH_M
@@ -369,8 +361,8 @@ def _expand_seeds_to_support(seed: np.ndarray, support: np.ndarray) -> np.ndarra
     """Keep support segments that contain at least one stronger seed sample."""
     out = np.zeros(len(seed), dtype=bool)
     for start, end in _segment_bounds(support):
-        if np.any(seed[start:end + 1]):
-            out[start:end + 1] = True
+        if np.any(seed[start : end + 1]):
+            out[start : end + 1] = True
     return out
 
 
@@ -458,13 +450,10 @@ def _split_segment_same_sign(
     changes sign.
     """
     parent_length_m = float(s_lap_m[end] - s_lap_m[start])
-    if (
-        not np.isfinite(parent_length_m)
-        or parent_length_m < SAME_SIGN_SPLIT_MIN_PARENT_LENGTH_M
-    ):
+    if not np.isfinite(parent_length_m) or parent_length_m < SAME_SIGN_SPLIT_MIN_PARENT_LENGTH_M:
         return [(start, end)]
 
-    seg = np.asarray(curvature_smooth[start:end + 1], dtype=float)
+    seg = np.asarray(curvature_smooth[start : end + 1], dtype=float)
     finite = np.isfinite(seg)
     if not np.any(finite):
         return [(start, end)]
@@ -487,7 +476,7 @@ def _split_segment_same_sign(
     if not np.isfinite(sep_m) or sep_m < SAME_SIGN_SPLIT_MIN_PEAK_SEPARATION_M:
         return [(start, end)]
 
-    valley_local_offset = int(np.argmin(sig[p1:p2 + 1]))
+    valley_local_offset = int(np.argmin(sig[p1 : p2 + 1]))
     valley_local = p1 + valley_local_offset
     valley_value = float(sig[valley_local])
     smaller_peak = float(min(sig[p1], sig[p2]))
@@ -545,13 +534,7 @@ def _metrics_entries(metrics: pl.DataFrame) -> list[tuple[str, int, float]]:
 def _turn_ids(metrics: pl.DataFrame) -> list[int]:
     if metrics.is_empty():
         return []
-    return (
-        metrics.select("turn_id")
-        .unique()
-        .sort("turn_id")
-        .get_column("turn_id")
-        .to_list()
-    )
+    return metrics.select("turn_id").unique().sort("turn_id").get_column("turn_id").to_list()
 
 
 def _series_by_turn(
@@ -562,10 +545,7 @@ def _series_by_turn(
     turn_ids: list[int],
 ) -> list[float]:
     sub = metrics.filter((pl.col("run") == run_name) & (pl.col("lap") == lap_id))
-    by_turn = {
-        int(tid): float(val)
-        for tid, val in sub.select(["turn_id", value_col]).iter_rows()
-    }
+    by_turn = {int(tid): float(val) for tid, val in sub.select(["turn_id", value_col]).iter_rows()}
     return [by_turn.get(tid, np.nan) for tid in turn_ids]
 
 
@@ -579,13 +559,9 @@ def _mean_series_by_turn(
     if sub.is_empty():
         return [np.nan for _ in turn_ids]
 
-    grouped = (
-        sub.group_by("turn_id")
-        .agg(pl.col(value_col).mean().alias("__mean_value"))
-    )
+    grouped = sub.group_by("turn_id").agg(pl.col(value_col).mean().alias("__mean_value"))
     by_turn = {
-        int(tid): float(val)
-        for tid, val in grouped.select(["turn_id", "__mean_value"]).iter_rows()
+        int(tid): float(val) for tid, val in grouped.select(["turn_id", "__mean_value"]).iter_rows()
     }
     return [by_turn.get(tid, np.nan) for tid in turn_ids]
 
@@ -594,11 +570,7 @@ def _fastest_lap_for_run(metrics: pl.DataFrame, run_name: str) -> int | None:
     sub = metrics.filter(pl.col("run") == run_name)
     if sub.is_empty():
         return None
-    laps = (
-        sub.select(["lap", "lap_time_s"])
-        .unique()
-        .sort(["lap_time_s", "lap"])
-    )
+    laps = sub.select(["lap", "lap_time_s"]).unique().sort(["lap_time_s", "lap"])
     for lap_id, lap_time_s in laps.iter_rows():
         if np.isfinite(float(lap_time_s)):
             return int(lap_id)
@@ -615,10 +587,9 @@ def _run_split_positions(metrics: pl.DataFrame) -> tuple[dict[str, float], float
 
     centers = np.linspace(0.25, 0.75, len(run_names))
     jitter_width = min(0.12, 0.35 / max(len(run_names), 1))
-    return {
-        run_name: float(center)
-        for run_name, center in zip(run_names, centers)
-    }, float(jitter_width)
+    return {run_name: float(center) for run_name, center in zip(run_names, centers)}, float(
+        jitter_width
+    )
 
 
 def _stable_unit_jitter(*parts: object) -> float:
@@ -702,7 +673,7 @@ def compute_radius_curvature(df: pl.DataFrame) -> dict[str, np.ndarray]:
     ay_smooth_mps2 = _peak_preserving_smooth(ay_mps2, win)
     ay_abs = np.abs(ay_mps2)
     R_m = np.divide(
-        vx_mps ** 2,
+        vx_mps**2,
         np.maximum(ay_abs, AY_EPS_MPS2),
         out=np.full_like(vx_mps, np.nan, dtype=float),
         where=np.isfinite(vx_mps) & np.isfinite(ay_abs),
@@ -725,7 +696,7 @@ def compute_radius_curvature(df: pl.DataFrame) -> dict[str, np.ndarray]:
     ay_abs_smooth_mps2 = _peak_preserving_smooth(ay_abs, win)
     signed_curvature_smooth_inv_m = np.divide(
         ay_smooth_mps2,
-        vx_mps ** 2,
+        vx_mps**2,
         out=np.full_like(ay_smooth_mps2, np.nan, dtype=float),
         where=np.isfinite(ay_smooth_mps2)
         & np.isfinite(vx_mps)
@@ -762,9 +733,7 @@ def select_reference_lap(dfs: dict[str, pl.DataFrame]) -> tuple[str, int]:
                 fallback = (run_name, lap_id)
             mask = d["laps"] == lap
             lap_time_s = _finite_lap_time(d["laptime"], mask)
-            if np.isfinite(lap_time_s) and (
-                best is None or lap_time_s < best[0]
-            ):
+            if np.isfinite(lap_time_s) and (best is None or lap_time_s < best[0]):
                 best = (lap_time_s, run_name, lap_id)
     if best is not None:
         return best[1], best[2]
@@ -774,7 +743,8 @@ def select_reference_lap(dfs: dict[str, pl.DataFrame]) -> tuple[str, int]:
 
 
 def detect_skidpad_turn_on_lap(
-    d: dict[str, np.ndarray], lap_id: int,
+    d: dict[str, np.ndarray],
+    lap_id: int,
 ) -> list[TurnDef]:
     """Skidpad: each timed lap is a single sustained-radius circle.
 
@@ -788,11 +758,7 @@ def detect_skidpad_turn_on_lap(
     n = len(lap["s_lap_m"])
     if n < 2:
         return []
-    finite_geom = (
-        np.isfinite(lap["s_lap_m"])
-        & np.isfinite(lap["lat"])
-        & np.isfinite(lap["lng"])
-    )
+    finite_geom = np.isfinite(lap["s_lap_m"]) & np.isfinite(lap["lat"]) & np.isfinite(lap["lng"])
     if not np.any(finite_geom):
         return []
     valid_idx = np.where(finite_geom)[0]
@@ -833,8 +799,13 @@ def detect_skidpad_turn_on_lap(
 
 
 def detect_turns_on_lap(
-    d: dict[str, np.ndarray], run_name: str, lap_id: int,
-    *, R_thr_m: float = 60.0, min_dur_s: float = 0.5, merge_gap_m: float = 8.0,
+    d: dict[str, np.ndarray],
+    run_name: str,
+    lap_id: int,
+    *,
+    R_thr_m: float = 60.0,
+    min_dur_s: float = 0.5,
+    merge_gap_m: float = 8.0,
 ) -> list[TurnDef]:
     _ = run_name
     lap = _lap_arrays(d, lap_id)
@@ -901,7 +872,7 @@ def detect_turns_on_lap(
         corner_length_m = float(lap["s_lap_m"][end] - lap["s_lap_m"][start])
         if not np.isfinite(corner_length_m) or corner_length_m < MIN_CORNER_LENGTH_M:
             continue
-        peak_ay = float(np.nanmax(lap["ay_abs_smooth_mps2"][start:end + 1]))
+        peak_ay = float(np.nanmax(lap["ay_abs_smooth_mps2"][start : end + 1]))
         if not np.isfinite(peak_ay) or peak_ay < MIN_PEAK_AY_G * G_MPS2:
             continue
 
@@ -949,7 +920,8 @@ def detect_turns_on_lap(
 
 
 def compute_turn_metrics(
-    dfs: dict[str, pl.DataFrame], turns: list[TurnDef],
+    dfs: dict[str, pl.DataFrame],
+    turns: list[TurnDef],
 ) -> pl.DataFrame:
     if not turns:
         return _empty_metrics_df()
@@ -966,9 +938,8 @@ def compute_turn_metrics(
             for turn in turns:
                 if turn.s_exit_m <= turn.s_entry_m:
                     continue
-                win = (
-                    (lap_data["s_lap_m"] >= turn.s_entry_m)
-                    & (lap_data["s_lap_m"] <= turn.s_exit_m)
+                win = (lap_data["s_lap_m"] >= turn.s_entry_m) & (
+                    lap_data["s_lap_m"] <= turn.s_exit_m
                 )
                 idx = np.where(win)[0]
                 if idx.size < 5:
@@ -992,13 +963,10 @@ def compute_turn_metrics(
                 )
                 brake_idx = np.where(brake_mask)[0]
                 brake_to_apex = (
-                    float(s_apex - lap_data["s_lap_m"][brake_idx[0]])
-                    if brake_idx.size
-                    else np.nan
+                    float(s_apex - lap_data["s_lap_m"][brake_idx[0]]) if brake_idx.size else np.nan
                 )
                 apex_pos_pct = np.clip(
-                    100.0 * (s_apex - turn.s_entry_m)
-                    / (turn.s_exit_m - turn.s_entry_m),
+                    100.0 * (s_apex - turn.s_entry_m) / (turn.s_exit_m - turn.s_entry_m),
                     0.0,
                     100.0,
                 )
@@ -1013,9 +981,7 @@ def compute_turn_metrics(
                         "v_apex_mps": float(lap_data["vx_mps"][apex_idx]),
                         "v_exit_mps": float(lap_data["vx_mps"][exit_idx]),
                         "R_min_m": float(lap_data["R_smooth_m"][apex_idx]),
-                        "ay_max_g": float(
-                            lap_data["ay_abs_smooth_mps2"][apex_idx] / G_MPS2
-                        ),
+                        "ay_max_g": float(lap_data["ay_abs_smooth_mps2"][apex_idx] / G_MPS2),
                         "brake_to_apex_dist_m": brake_to_apex,
                         "apex_pos_pct": float(apex_pos_pct),
                         "corner_length_m": float(turn.s_exit_m - turn.s_entry_m),
@@ -1183,8 +1149,7 @@ def _run_names(metrics: pl.DataFrame) -> list[str]:
     if metrics.is_empty():
         return []
     return [
-        str(run)
-        for run in metrics.select("run").unique().sort("run").get_column("run").to_list()
+        str(run) for run in metrics.select("run").unique().sort("run").get_column("run").to_list()
     ]
 
 
@@ -1210,9 +1175,7 @@ def _run_fastest_row(metrics: pl.DataFrame, run_name: str, turn_id: int) -> dict
     if lap_id is None:
         return {}
     sub = metrics.filter(
-        (pl.col("run") == run_name)
-        & (pl.col("lap") == lap_id)
-        & (pl.col("turn_id") == turn_id)
+        (pl.col("run") == run_name) & (pl.col("lap") == lap_id) & (pl.col("turn_id") == turn_id)
     )
     if sub.is_empty():
         return {}
@@ -1320,7 +1283,9 @@ def corner_turn_diagnosis_table(metrics: pl.DataFrame) -> pl.DataFrame:
             cmp.get_column("brake_to_apex_dist_m").mean()
             - ref.get_column("brake_to_apex_dist_m").mean()
         )
-        d_apex = float(cmp.get_column("apex_pos_pct").mean() - ref.get_column("apex_pos_pct").mean())
+        d_apex = float(
+            cmp.get_column("apex_pos_pct").mean() - ref.get_column("apex_pos_pct").mean()
+        )
         if dv_exit < -0.6:
             limiter = "Exit speed"
         elif dv_apex < -0.6:
@@ -1331,22 +1296,22 @@ def corner_turn_diagnosis_table(metrics: pl.DataFrame) -> pl.DataFrame:
             limiter = "Apex placement"
         else:
             limiter = "Small difference"
-        rows.append({
-            "Turn": int(turn_id),
-            "Main limiter": limiter,
-            f"Δ apex [m/s]": round(dv_apex, 2),
-            f"Δ exit [m/s]": round(dv_exit, 2),
-            f"Δ brake dist [m]": round(d_brake, 1) if np.isfinite(d_brake) else np.nan,
-            f"Δ apex pos [%]": round(d_apex, 1),
-            "__score": abs(min(0.0, dv_exit)) + 0.7 * abs(min(0.0, dv_apex)) + 0.03 * abs(d_brake),
-        })
+        rows.append(
+            {
+                "Turn": int(turn_id),
+                "Main limiter": limiter,
+                f"Δ apex [m/s]": round(dv_apex, 2),
+                f"Δ exit [m/s]": round(dv_exit, 2),
+                f"Δ brake dist [m]": round(d_brake, 1) if np.isfinite(d_brake) else np.nan,
+                f"Δ apex pos [%]": round(d_apex, 1),
+                "__score": abs(min(0.0, dv_exit))
+                + 0.7 * abs(min(0.0, dv_apex))
+                + 0.03 * abs(d_brake),
+            }
+        )
     if not rows:
         return pl.DataFrame()
-    return (
-        pl.DataFrame(rows)
-        .sort("__score", descending=True)
-        .drop("__score")
-    )
+    return pl.DataFrame(rows).sort("__score", descending=True).drop("__score")
 
 
 def corner_speed_delta_overview_fig(metrics: pl.DataFrame) -> go.Figure:
@@ -1432,9 +1397,15 @@ def corner_quick_findings_table(metrics: pl.DataFrame) -> pl.DataFrame:
         if ref.is_empty() or cmp.is_empty():
             continue
         deltas = {
-            "Entry": float(cmp.get_column("v_entry_mps").mean() - ref.get_column("v_entry_mps").mean()),
-            "Apex": float(cmp.get_column("v_apex_mps").mean() - ref.get_column("v_apex_mps").mean()),
-            "Exit": float(cmp.get_column("v_exit_mps").mean() - ref.get_column("v_exit_mps").mean()),
+            "Entry": float(
+                cmp.get_column("v_entry_mps").mean() - ref.get_column("v_entry_mps").mean()
+            ),
+            "Apex": float(
+                cmp.get_column("v_apex_mps").mean() - ref.get_column("v_apex_mps").mean()
+            ),
+            "Exit": float(
+                cmp.get_column("v_exit_mps").mean() - ref.get_column("v_exit_mps").mean()
+            ),
         }
         worst_point, worst_delta = min(deltas.items(), key=lambda item: item[1])
         d_brake = float(
@@ -1449,23 +1420,20 @@ def corner_quick_findings_table(metrics: pl.DataFrame) -> pl.DataFrame:
             read = "too slow at apex"
         else:
             read = "arrives slower"
-        rows.append({
-            "Turn": int(turn_id),
-            "Where": worst_point,
-            "Loss": read,
-            "Δ speed [m/s]": round(worst_delta, 2),
-            "Δ brake dist [m]": round(d_brake, 1) if np.isfinite(d_brake) else np.nan,
-            "__severity": abs(worst_delta),
-        })
+        rows.append(
+            {
+                "Turn": int(turn_id),
+                "Where": worst_point,
+                "Loss": read,
+                "Δ speed [m/s]": round(worst_delta, 2),
+                "Δ brake dist [m]": round(d_brake, 1) if np.isfinite(d_brake) else np.nan,
+                "__severity": abs(worst_delta),
+            }
+        )
 
     if not rows:
         return pl.DataFrame()
-    return (
-        pl.DataFrame(rows)
-        .sort("__severity", descending=True)
-        .drop("__severity")
-        .head(6)
-    )
+    return pl.DataFrame(rows).sort("__severity", descending=True).drop("__severity").head(6)
 
 
 def corner_metric_bars_fig(

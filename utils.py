@@ -1,4 +1,5 @@
 """Shared utilities for CAT17x data analysis (Formula Student 4WD Electric)."""
+
 from __future__ import annotations
 import hashlib
 from functools import lru_cache
@@ -9,33 +10,33 @@ import polars as pl
 import plotly.graph_objects as go
 
 # ── Dark theme constants ──────────────────────────────────────────────────────
-_BG   = '#141417'
-_TEXT = '#EBEBEB'
-_GRID = 'rgba(128,128,128,0.2)'
-_AXIS = '#E5E5E5'
+_BG = "#141417"
+_TEXT = "#EBEBEB"
+_GRID = "rgba(128,128,128,0.2)"
+_AXIS = "#E5E5E5"
 # Semantic surface/elevation tokens: cards and hover boxes sit slightly above
 # the flat background so KPIs, tables and panels read as distinct objects.
-_SURFACE        = '#1b1f29'              # elevated card surface (cool, clearly above the app bg)
-_SURFACE_BORDER = 'rgba(255,255,255,0.10)'
-_TEXT_MUTED     = 'rgba(235,235,235,0.60)'
-_HOVER_BG       = 'rgba(28,28,32,0.96)'  # dark hover box (replaces Plotly's light default)
+_SURFACE = "#1b1f29"  # elevated card surface (cool, clearly above the app bg)
+_SURFACE_BORDER = "rgba(255,255,255,0.10)"
+_TEXT_MUTED = "rgba(235,235,235,0.60)"
+_HOVER_BG = "rgba(28,28,32,0.96)"  # dark hover box (replaces Plotly's light default)
 
 # Brand blue as a single-hue ramp (instead of two unrelated blues): one step for
 # UI chrome, one brighter step for data lines that must pop on the dark plot bg.
-BRAND_BLUE_600  = '#003B74'   # chrome / UI accents (matches logo + .streamlit primaryColor)
-BRAND_BLUE_400  = '#4DB3F2'   # data on dark background (chart accent)
+BRAND_BLUE_600 = "#003B74"  # chrome / UI accents (matches logo + .streamlit primaryColor)
+BRAND_BLUE_400 = "#4DB3F2"  # data on dark background (chart accent)
 
 # Shared font families so Plotly charts match the Streamlit UI typography.
 # Display = characterful headers; body = clean sans with real tabular numerals;
 # mono = aligned digits for KPI values and tables. Loaded via @import in the
 # dashboard header CSS (see _render_dashboard_header).
 FONT_DISPLAY = '"Archivo", system-ui, -apple-system, "Segoe UI", sans-serif'
-FONT_FAMILY  = '"IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif'
-FONT_MONO    = '"IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace'
+FONT_FAMILY = '"IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif'
+FONT_MONO = '"IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace'
 
 # Per-wheel colours: FL=blue, FR=orange, RL=green, RR=purple
-WHEEL_COLORS  = {'FL': '#4DB3F2', 'FR': '#F28C40', 'RL': '#73D973', 'RR': '#D973D9'}
-WHEEL_SYMBOLS = {'FL': 'circle',  'FR': 'square',  'RL': 'triangle-up', 'RR': 'diamond'}
+WHEEL_COLORS = {"FL": "#4DB3F2", "FR": "#F28C40", "RL": "#73D973", "RR": "#D973D9"}
+WHEEL_SYMBOLS = {"FL": "circle", "FR": "square", "RL": "triangle-up", "RR": "diamond"}
 
 # ── Driver / run identity colours ──────────────────────────────────────────────
 # Single source of truth for "which colour is this driver/run". Used by every
@@ -112,33 +113,38 @@ def driver_color(name: object) -> str:
     if key in _RUN_COLOR_REGISTRY:
         return _RUN_COLOR_REGISTRY[key]
     return DRIVER_PALETTE[_palette_index(key)]
-PerLapAxisMode = Literal['laps', 'laptime']
-COMPLETE_LAPS_MARKER = '__complete_laps_only'
+
+
+PerLapAxisMode = Literal["laps", "laptime"]
+COMPLETE_LAPS_MARKER = "__complete_laps_only"
 PHASE_MASK_COLUMNS = {
     "BRAKE": "phase_brake",
     "CORNER": "phase_corner",
     "STRAIGHT": "phase_straight",
 }
 LOGIC_START_TIME_BY_CSV = {
-    'Abel_FSG.csv': 40.8651,
+    "Abel_FSG.csv": 40.8651,
 }
 _FILTERING_ACCEL_FALLBACKS = (
     ("Filtering_VN_ax", "VN_ax"),
     ("Filtering_VN_ay", "VN_ay"),
 )
-_SUSPENSION_LOOKUP_PATH = Path(__file__).resolve().parent / "data" / "Suspension_Data_CAT17x_Lookup_Table.csv"
+_SUSPENSION_LOOKUP_PATH = (
+    Path(__file__).resolve().parent / "data" / "Suspension_Data_CAT17x_Lookup_Table.csv"
+)
 _POT_COUNTS_SCALE_RAD = 0.00513235
 _POT_COUNTS_OFFSET_RAD = -0.65180882
 
 
 # ── Figure helpers ────────────────────────────────────────────────────────────
 
+
 def apply_dark_layout(
     fig: go.Figure,
     *,
-    title: str = '',
-    xlabel: str = '',
-    ylabel: str = '',
+    title: str = "",
+    xlabel: str = "",
+    ylabel: str = "",
     single_axes: bool = True,
 ) -> go.Figure:
     """Apply shared dark motorsport styling to *fig* (single source of truth).
@@ -153,65 +159,94 @@ def apply_dark_layout(
         paper_bgcolor=_BG,
         plot_bgcolor=_BG,
         font=dict(color=_TEXT, size=11, family=FONT_FAMILY),
-        legend=dict(bgcolor='rgba(20,20,23,0.85)',
-                    bordercolor='rgba(128,128,128,0.3)',
-                    font=dict(color=_TEXT, family=FONT_FAMILY)),
-        hoverlabel=dict(bgcolor=_HOVER_BG, bordercolor=_SURFACE_BORDER,
-                        font=dict(color=_TEXT, family=FONT_FAMILY, size=12)),
-        modebar=dict(bgcolor='rgba(0,0,0,0)', color=_TEXT_MUTED,
-                     activecolor=BRAND_BLUE_400),
+        legend=dict(
+            bgcolor="rgba(20,20,23,0.85)",
+            bordercolor="rgba(128,128,128,0.3)",
+            font=dict(color=_TEXT, family=FONT_FAMILY),
+        ),
+        hoverlabel=dict(
+            bgcolor=_HOVER_BG,
+            bordercolor=_SURFACE_BORDER,
+            font=dict(color=_TEXT, family=FONT_FAMILY, size=12),
+        ),
+        modebar=dict(bgcolor="rgba(0,0,0,0)", color=_TEXT_MUTED, activecolor=BRAND_BLUE_400),
     )
     if single_axes:
         # Consistent base margin for single-panel charts only; multi-panel
         # helpers keep their own spacing so subplot titles aren't clipped.
         fig.update_layout(
             margin=dict(l=70, r=35, t=55, b=60),
-            xaxis=dict(title=xlabel, color=_AXIS, gridcolor=_GRID,
-                       linecolor=_AXIS, tickcolor=_AXIS, showgrid=True),
-            yaxis=dict(title=ylabel, color=_AXIS, gridcolor=_GRID,
-                       linecolor=_AXIS, tickcolor=_AXIS, showgrid=True),
+            xaxis=dict(
+                title=xlabel,
+                color=_AXIS,
+                gridcolor=_GRID,
+                linecolor=_AXIS,
+                tickcolor=_AXIS,
+                showgrid=True,
+            ),
+            yaxis=dict(
+                title=ylabel,
+                color=_AXIS,
+                gridcolor=_GRID,
+                linecolor=_AXIS,
+                tickcolor=_AXIS,
+                showgrid=True,
+            ),
         )
     return fig
 
 
-def make_dark_figure(title: str = '', xlabel: str = '', ylabel: str = '') -> go.Figure:
+def make_dark_figure(title: str = "", xlabel: str = "", ylabel: str = "") -> go.Figure:
     """Return a Plotly Figure with dark motorsport styling."""
     return apply_dark_layout(go.Figure(), title=title, xlabel=xlabel, ylabel=ylabel)
 
 
-def add_lap_scatter(fig: go.Figure, x: np.ndarray, y: np.ndarray,
-                    lap_ids: np.ndarray, name: str = '',
-                    color: str = '#4DB3F2', symbol: str = 'circle',
-                    size: int = 10) -> None:
+def add_lap_scatter(
+    fig: go.Figure,
+    x: np.ndarray,
+    y: np.ndarray,
+    lap_ids: np.ndarray,
+    name: str = "",
+    color: str = "#4DB3F2",
+    symbol: str = "circle",
+    size: int = 10,
+) -> None:
     """Add per-lap scatter trace with connected points."""
-    fig.add_trace(go.Scatter(
-        x=x, y=y,
-        mode='lines+markers',
-        name=name,
-        line=dict(color=color, width=2.0),
-        marker=dict(color=color, symbol=symbol, size=size, line=dict(width=0)),
-    ))
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=y,
+            mode="lines+markers",
+            name=name,
+            line=dict(color=color, width=2.0),
+            marker=dict(color=color, symbol=symbol, size=size, line=dict(width=0)),
+        )
+    )
 
 
-def add_trend_line(fig: go.Figure, x: np.ndarray, y: np.ndarray,
-                   color: str = '#F28C40', dash: str = 'dash') -> None:
+def add_trend_line(
+    fig: go.Figure, x: np.ndarray, y: np.ndarray, color: str = "#F28C40", dash: str = "dash"
+) -> None:
     """Add a linear regression line to *fig*."""
     if len(x) < 2:
         return
-    p     = np.polyfit(x, y, 1)
+    p = np.polyfit(x, y, 1)
     x_fit = np.linspace(x.min(), x.max(), 100)
-    fig.add_trace(go.Scatter(
-        x=x_fit, y=np.polyval(p, x_fit),
-        mode='lines', name='Trend',
-        line=dict(color=color, dash=dash, width=1.6),
-        showlegend=False,
-    ))
+    fig.add_trace(
+        go.Scatter(
+            x=x_fit,
+            y=np.polyval(p, x_fit),
+            mode="lines",
+            name="Trend",
+            line=dict(color=color, dash=dash, width=1.6),
+            showlegend=False,
+        )
+    )
 
 
 def add_zero_line(fig: go.Figure, x: np.ndarray) -> None:
     """Add a horizontal dashed reference line at y=0."""
-    fig.add_hline(y=0, line=dict(color='rgba(200,200,200,0.5)',
-                                 dash='dash', width=1.2))
+    fig.add_hline(y=0, line=dict(color="rgba(200,200,200,0.5)", dash="dash", width=1.2))
 
 
 def per_lap_axis(
@@ -223,16 +258,16 @@ def per_lap_axis(
     laps_arr = np.asarray(lap_ids, dtype=float)
     laptime_arr = np.asarray(lap_times_s, dtype=float)
 
-    if mode == 'laps':
+    if mode == "laps":
         x = laps_arr
-        xlabel = 'Lap'
-    elif mode == 'laptime':
+        xlabel = "Lap"
+    elif mode == "laptime":
         x = laptime_arr
-        xlabel = 'Lap time [s]'
+        xlabel = "Lap time [s]"
     else:
-        raise ValueError(f'Unsupported per-lap axis mode: {mode}')
+        raise ValueError(f"Unsupported per-lap axis mode: {mode}")
 
-    order = np.argsort(x, kind='mergesort')
+    order = np.argsort(x, kind="mergesort")
     return x[order], order, xlabel
 
 
@@ -244,11 +279,12 @@ def per_lap_axis_or_empty(
 ) -> tuple[np.ndarray, np.ndarray, str]:
     """Like :func:`per_lap_axis` but return empty arrays when *mask* selects nothing."""
     if not mask.any():
-        return np.array([]), np.array([], dtype=int), 'Lap'
+        return np.array([]), np.array([], dtype=int), "Lap"
     return per_lap_axis(lap_ids[mask], lap_times_s[mask], mode)
 
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
+
 
 def read_telemetry_csv(
     path: str,
@@ -275,9 +311,8 @@ def ensure_filtering_accel_columns_df(df: pl.DataFrame) -> pl.DataFrame:
         return df
     return df.with_columns(exprs)
 
-def keep_min_duration_segments(mask: np.ndarray,
-                                min_duration: float,
-                                dt: float) -> np.ndarray:
+
+def keep_min_duration_segments(mask: np.ndarray, min_duration: float, dt: float) -> np.ndarray:
     """Remove boolean segments shorter than *min_duration* seconds.
 
     Args:
@@ -293,12 +328,12 @@ def keep_min_duration_segments(mask: np.ndarray,
         return clean
     min_samples = max(1, int(np.ceil(min_duration / dt)))
     padded = np.concatenate([[False], mask.astype(bool), [False]])
-    d      = np.diff(padded.astype(np.int8))
-    starts = np.where(d ==  1)[0]
-    ends   = np.where(d == -1)[0] - 1
+    d = np.diff(padded.astype(np.int8))
+    starts = np.where(d == 1)[0]
+    ends = np.where(d == -1)[0] - 1
     for s, e in zip(starts, ends):
         if e - s + 1 >= min_samples:
-            clean[s:e + 1] = True
+            clean[s : e + 1] = True
     return clean
 
 
@@ -322,7 +357,7 @@ def fill_short_false_gaps(
         gap_start = prev_end + 1
         gap_end = next_start - 1
         if gap_end >= gap_start and (gap_end - gap_start + 1) <= max_gap_samples:
-            clean[gap_start:gap_end + 1] = True
+            clean[gap_start : gap_end + 1] = True
     return clean
 
 
@@ -384,9 +419,7 @@ def apply_logic_start_time(df: pl.DataFrame, path: str | None = None) -> pl.Data
     if start_time_s is None:
         return df
 
-    out = df.filter(
-        pl.col("TimeStamp").is_finite() & (pl.col("TimeStamp") >= float(start_time_s))
-    )
+    out = df.filter(pl.col("TimeStamp").is_finite() & (pl.col("TimeStamp") >= float(start_time_s)))
     if out.is_empty():
         raise ValueError(
             f"{csv_name}: no samples remain after applying logic start at {start_time_s:.4f} s."
@@ -400,7 +433,7 @@ def apply_special_lap_logic(df: pl.DataFrame, path: str | None = None) -> pl.Dat
         return df
 
     csv_name = path.rsplit("/", 1)[-1]
-    if csv_name != 'Abel_FSG.csv':
+    if csv_name != "Abel_FSG.csv":
         return df
     if "TimeStamp" not in df.columns or "laps" not in df.columns:
         return df
@@ -430,10 +463,12 @@ def apply_special_lap_logic(df: pl.DataFrame, path: str | None = None) -> pl.Dat
     new_laps[valid] = new_laps_valid
     new_laptime[valid] = new_laptime_valid
 
-    return df.with_columns([
-        pl.Series("laps", new_laps),
-        pl.Series("laptime", new_laptime),
-    ])
+    return df.with_columns(
+        [
+            pl.Series("laps", new_laps),
+            pl.Series("laptime", new_laptime),
+        ]
+    )
 
 
 def exclude_lap0_and_last_lap(data: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -446,24 +481,19 @@ def exclude_lap0_and_last_lap(data: dict[str, np.ndarray]) -> dict[str, np.ndarr
     Raises ``ValueError`` if fewer than 2 valid laps remain.
     """
     if _laps_filter_applied_dict(data):
-        all_laps = np.unique(data['laps'][np.isfinite(data['laps'])])
+        all_laps = np.unique(data["laps"][np.isfinite(data["laps"])])
         if len(all_laps) < 1:
-            raise ValueError(
-                'Not enough valid selected laps. Run lapcount.py first.'
-            )
+            raise ValueError("Not enough valid selected laps. Run lapcount.py first.")
         return data
 
-    laps  = data['laps']
+    laps = data["laps"]
     valid = laps > 0
-    filt  = {k: v[valid] for k, v in data.items()}
+    filt = {k: v[valid] for k, v in data.items()}
 
-    all_laps = np.unique(filt['laps'][np.isfinite(filt['laps'])])
+    all_laps = np.unique(filt["laps"][np.isfinite(filt["laps"])])
     if len(all_laps) < 2:
-        raise ValueError(
-            'Not enough valid laps after excluding lap 0. '
-            'Run lapcount.py first.'
-        )
-    keep = filt['laps'] != all_laps.max()
+        raise ValueError("Not enough valid laps after excluding lap 0. Run lapcount.py first.")
+    keep = filt["laps"] != all_laps.max()
     return {k: v[keep] for k, v in filt.items()}
 
 
@@ -494,7 +524,7 @@ def robust_dt(time: np.ndarray) -> float:
     diffs = np.diff(time)
     valid = diffs[(diffs > 0) & np.isfinite(diffs)]
     if len(valid) == 0:
-        raise ValueError('Cannot compute dt: no positive time step found.')
+        raise ValueError("Cannot compute dt: no positive time step found.")
     return float(np.median(valid))
 
 
@@ -535,34 +565,41 @@ def select_laps_df(df: pl.DataFrame, lap_ids: list[int] | np.ndarray) -> pl.Data
     if out.is_empty():
         raise ValueError("Selected laps have no telemetry samples.")
 
-    per_lap = out.group_by("laps").agg([
-        (
-            pl.when(pl.col("laptime").is_finite())
-            .then(pl.col("laptime"))
-            .otherwise(None)
-            .max()
-            .alias("__lap_laptime")
-        ),
-        (
-            (pl.col("TimeStamp").max() - pl.col("TimeStamp").min())
-            .alias("__lap_time_from_samples")
-        ),
-    ])
+    per_lap = out.group_by("laps").agg(
+        [
+            (
+                pl.when(pl.col("laptime").is_finite())
+                .then(pl.col("laptime"))
+                .otherwise(None)
+                .max()
+                .alias("__lap_laptime")
+            ),
+            (
+                (pl.col("TimeStamp").max() - pl.col("TimeStamp").min()).alias(
+                    "__lap_time_from_samples"
+                )
+            ),
+        ]
+    )
 
     return (
         out.join(per_lap, on="laps", how="left")
-        .with_columns([
-            pl.coalesce([
-                pl.col("__lap_laptime"),
-                pl.when(
-                    pl.col("__lap_time_from_samples").is_finite()
-                    & (pl.col("__lap_time_from_samples") > 0.0)
-                )
-                .then(pl.col("__lap_time_from_samples"))
-                .otherwise(None),
-            ]).alias("laptime"),
-            pl.lit(1.0).alias(COMPLETE_LAPS_MARKER),
-        ])
+        .with_columns(
+            [
+                pl.coalesce(
+                    [
+                        pl.col("__lap_laptime"),
+                        pl.when(
+                            pl.col("__lap_time_from_samples").is_finite()
+                            & (pl.col("__lap_time_from_samples") > 0.0)
+                        )
+                        .then(pl.col("__lap_time_from_samples"))
+                        .otherwise(None),
+                    ]
+                ).alias("laptime"),
+                pl.lit(1.0).alias(COMPLETE_LAPS_MARKER),
+            ]
+        )
         .drop(["__lap_laptime", "__lap_time_from_samples"])
     )
 
@@ -606,10 +643,7 @@ def _dist_m_from_gps(df: pl.DataFrame) -> np.ndarray:
         lng_r = np.radians(lng[idx])
         dlat = np.diff(lat_r)
         dlng = np.diff(lng_r)
-        a = (
-            (np.sin(dlat / 2) ** 2)
-            + np.cos(lat_r[:-1]) * np.cos(lat_r[1:]) * np.sin(dlng / 2) ** 2
-        )
+        a = (np.sin(dlat / 2) ** 2) + np.cos(lat_r[:-1]) * np.cos(lat_r[1:]) * np.sin(dlng / 2) ** 2
         inc = R * 2 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
         dist[idx] = np.concatenate([[0.0], np.cumsum(inc)])
     return dist
@@ -660,11 +694,7 @@ def _phase_masks_from_signals(df: pl.DataFrame) -> dict[str, np.ndarray]:
     steering = df["Steering"].to_numpy().astype(float)
     ay = df[ay_col].to_numpy().astype(float)
     ax = df[ax_col].to_numpy().astype(float) if ax_col in df.columns else np.zeros(n)
-    throttle = (
-        df["Throttle"].to_numpy().astype(float)
-        if "Throttle" in df.columns
-        else np.zeros(n)
-    )
+    throttle = df["Throttle"].to_numpy().astype(float) if "Throttle" in df.columns else np.zeros(n)
 
     if "TimeStamp" in df.columns:
         time_s = df["TimeStamp"].to_numpy().astype(float)
@@ -800,10 +830,9 @@ def _stabilise_phase_masks_by_progress(
         ext = np.concatenate([arr[-pad:], arr, arr[:pad]])
         return np.convolve(ext, kernel, mode="valid")
 
-    vote_frac_sm = np.vstack([
-        _circular_smooth(vote_frac[phase_i], window=5)
-        for phase_i in range(len(phase_order))
-    ])
+    vote_frac_sm = np.vstack(
+        [_circular_smooth(vote_frac[phase_i], window=5) for phase_i in range(len(phase_order))]
+    )
     bin_dt = 1.0 / n_bins
 
     corner_bins = vote_frac_sm[phase_order.index("CORNER")] >= 0.25
@@ -823,9 +852,7 @@ def _stabilise_phase_masks_by_progress(
     valid_rows = mapped_mask & (progress_bins >= 0)
     stable["BRAKE"][valid_rows] = brake_bins[progress_bins[valid_rows]]
     stable["CORNER"][valid_rows] = corner_bins[progress_bins[valid_rows]]
-    stable["STRAIGHT"][valid_rows] = ~(
-        stable["BRAKE"][valid_rows] | stable["CORNER"][valid_rows]
-    )
+    stable["STRAIGHT"][valid_rows] = ~(stable["BRAKE"][valid_rows] | stable["CORNER"][valid_rows])
     return stable
 
 
@@ -845,10 +872,7 @@ def phase_masks_for_map(df: pl.DataFrame) -> dict[str, np.ndarray]:
         Dict with keys "BRAKE", "CORNER", "STRAIGHT" (boolean arrays, same length as *df*).
     """
     if all(col in df.columns for col in PHASE_MASK_COLUMNS.values()):
-        return {
-            phase: df[col].to_numpy().astype(bool)
-            for phase, col in PHASE_MASK_COLUMNS.items()
-        }
+        return {phase: df[col].to_numpy().astype(bool) for phase, col in PHASE_MASK_COLUMNS.items()}
     provisional = _phase_masks_from_signals(df)
     return _stabilise_phase_masks_by_progress(df, provisional)
 
@@ -866,11 +890,13 @@ def ensure_phase_masks_df(df: pl.DataFrame) -> pl.DataFrame:
     if all(col in df.columns for col in PHASE_MASK_COLUMNS.values()):
         return df
     masks = phase_masks_for_map(df)
-    return df.with_columns([
-        pl.Series(PHASE_MASK_COLUMNS["BRAKE"], masks["BRAKE"]),
-        pl.Series(PHASE_MASK_COLUMNS["CORNER"], masks["CORNER"]),
-        pl.Series(PHASE_MASK_COLUMNS["STRAIGHT"], masks["STRAIGHT"]),
-    ])
+    return df.with_columns(
+        [
+            pl.Series(PHASE_MASK_COLUMNS["BRAKE"], masks["BRAKE"]),
+            pl.Series(PHASE_MASK_COLUMNS["CORNER"], masks["CORNER"]),
+            pl.Series(PHASE_MASK_COLUMNS["STRAIGHT"], masks["STRAIGHT"]),
+        ]
+    )
 
 
 @lru_cache(maxsize=1)
@@ -890,9 +916,7 @@ def _suspension_polyfits() -> dict[str, np.ndarray]:
         return {}
     x_deg = np.rad2deg(lkp["Theta_Rocker"])
     return {
-        col: np.polyfit(x_deg, values, 3)
-        for col, values in lkp.items()
-        if col != "Theta_Rocker"
+        col: np.polyfit(x_deg, values, 3) for col, values in lkp.items() if col != "Theta_Rocker"
     }
 
 
@@ -955,7 +979,9 @@ def _build_suspension_t1_payload(
     jounce: dict[str, np.ndarray] = {}
     for wheel in ("FL", "FR", "RL", "RR"):
         values = _eval_poly(fits, f"Jounce_{wheel}", jounce_sign * angles[wheel])
-        zero = float(np.nanmedian(values[straight])) if straight.any() else float(np.nanmedian(values))
+        zero = (
+            float(np.nanmedian(values[straight])) if straight.any() else float(np.nanmedian(values))
+        )
         jounce[wheel] = values - zero
         payload[f"Jounce_{wheel}"] = jounce[wheel]
         payload[f"Pot_Angle_{wheel}_deg"] = angles[wheel]
@@ -966,10 +992,12 @@ def _build_suspension_t1_payload(
     payload["Roll_Front"] = np.rad2deg(np.arctan2(jounce["FR"] - jounce["FL"], track_f_mm))
     payload["Roll_Rear"] = np.rad2deg(np.arctan2(jounce["RR"] - jounce["RL"], track_r_mm))
     payload["Roll"] = 0.5 * (payload["Roll_Front"] + payload["Roll_Rear"])
-    payload["Pitch"] = np.rad2deg(np.arctan2(
-        (jounce["FL"] + jounce["FR"]) - (jounce["RL"] + jounce["RR"]),
-        2.0 * wheelbase_mm,
-    ))
+    payload["Pitch"] = np.rad2deg(
+        np.arctan2(
+            (jounce["FL"] + jounce["FR"]) - (jounce["RL"] + jounce["RR"]),
+            2.0 * wheelbase_mm,
+        )
+    )
     payload["Heave_Front"] = 0.5 * (jounce["FL"] + jounce["FR"])
     payload["Heave_Rear"] = 0.5 * (jounce["RL"] + jounce["RR"])
     payload["Heave"] = 0.25 * (jounce["FL"] + jounce["FR"] + jounce["RL"] + jounce["RR"])
@@ -984,15 +1012,25 @@ def _build_suspension_t1_payload(
             y_r = _eval_poly(fits, f"Points_Rock_{right}_Spring_{mode}_Y", angles[right])
             z_r = _eval_poly(fits, f"Points_Rock_{right}_Spring_{mode}_Z", angles[right])
             length = np.hypot(y_l - y_r, z_l - z_r)
-            zero = float(np.nanmedian(length[straight])) if straight.any() else float(np.nanmedian(length))
+            zero = (
+                float(np.nanmedian(length[straight]))
+                if straight.any()
+                else float(np.nanmedian(length))
+            )
             payload[f"{prefix}_{mode}_Spring_Length"] = length - zero
 
-    time_s = df["TimeStamp"].to_numpy().astype(float) if "TimeStamp" in df.columns else np.arange(n, dtype=float)
+    time_s = (
+        df["TimeStamp"].to_numpy().astype(float)
+        if "TimeStamp" in df.columns
+        else np.arange(n, dtype=float)
+    )
     dt = np.diff(time_s, prepend=np.nan)
     valid_dt = dt[np.isfinite(dt) & (dt > 0.0)]
     fill_dt = float(np.nanmedian(valid_dt)) if valid_dt.size else 0.01
     dt[~np.isfinite(dt) | (dt <= 0.0)] = fill_dt
-    sample_dt = float(np.nanmedian(dt[np.isfinite(dt) & (dt > 0.0)])) if np.isfinite(dt).any() else 0.01
+    sample_dt = (
+        float(np.nanmedian(dt[np.isfinite(dt) & (dt > 0.0)])) if np.isfinite(dt).any() else 0.01
+    )
 
     for col in ("Roll_Front", "Roll_Rear", "Roll", "Pitch", "Heave_Front", "Heave_Rear", "Heave"):
         payload[f"{col}_Speed"] = np.gradient(payload[col], sample_dt)
@@ -1009,8 +1047,16 @@ def _build_suspension_t1_payload(
 
 
 def _choose_suspension_payload(df: pl.DataFrame) -> tuple[dict[str, np.ndarray], dict[str, object]]:
-    ay = df["Filtering_VN_ay"].to_numpy().astype(float) if "Filtering_VN_ay" in df.columns else np.zeros(df.height)
-    ax = df["Filtering_VN_ax"].to_numpy().astype(float) if "Filtering_VN_ax" in df.columns else np.zeros(df.height)
+    ay = (
+        df["Filtering_VN_ay"].to_numpy().astype(float)
+        if "Filtering_VN_ay" in df.columns
+        else np.zeros(df.height)
+    )
+    ax = (
+        df["Filtering_VN_ax"].to_numpy().astype(float)
+        if "Filtering_VN_ax" in df.columns
+        else np.zeros(df.height)
+    )
     roll_ref = None
     pitch_ref = None
     for candidate in ("VN_roll", "Roll_VN", "VN_phi", "Filtering_VN_roll"):
@@ -1038,37 +1084,63 @@ def _choose_suspension_payload(df: pl.DataFrame) -> tuple[dict[str, np.ndarray],
 
     for convention in ("counts", "degrees"):
         angles = _suspension_angles_deg(df, convention)
-        range_score = float(np.mean([
-            np.nanmean((vals >= x_min - 3.0) & (vals <= x_max + 3.0))
-            for vals in angles.values()
-        ]))
+        range_score = float(
+            np.mean(
+                [
+                    np.nanmean((vals >= x_min - 3.0) & (vals <= x_max + 3.0))
+                    for vals in angles.values()
+                ]
+            )
+        )
         if not fits:
             continue
         for sign in (-1.0, 1.0):
             payload = _build_suspension_t1_payload(df, convention=convention, jounce_sign=sign)
-            r_roll = _corr_finite(payload["Roll"], roll_ref, np.abs(ay) > 0.5) if roll_ref is not None else np.nan
-            r_pitch = _corr_finite(payload["Pitch"], pitch_ref, np.abs(ax) > 0.5) if pitch_ref is not None else np.nan
+            r_roll = (
+                _corr_finite(payload["Roll"], roll_ref, np.abs(ay) > 0.5)
+                if roll_ref is not None
+                else np.nan
+            )
+            r_pitch = (
+                _corr_finite(payload["Pitch"], pitch_ref, np.abs(ax) > 0.5)
+                if pitch_ref is not None
+                else np.nan
+            )
             corr_vals = np.abs(np.asarray([r_roll, r_pitch], dtype=float))
-            corr_score = float(np.nanmean(corr_vals[np.isfinite(corr_vals)])) if np.isfinite(corr_vals).any() else -1.0
+            corr_score = (
+                float(np.nanmean(corr_vals[np.isfinite(corr_vals)]))
+                if np.isfinite(corr_vals).any()
+                else -1.0
+            )
             score = corr_score + 0.1 * range_score
             if score > best_score:
                 best_score = score
                 best_payload = payload
                 best_meta = {
                     "status": "failed",
-                    "convention": convention if np.isfinite(corr_score) and corr_score >= 0.3 else f"{convention}-range",
+                    "convention": convention
+                    if np.isfinite(corr_score) and corr_score >= 0.3
+                    else f"{convention}-range",
                     "jounce_sign": sign,
                     "r_roll": r_roll,
                     "r_pitch": r_pitch,
                     "message": "Calibration failed - VectorNav roll/pitch references are missing.",
                 }
                 if roll_ref is not None and pitch_ref is not None:
-                    if np.nan_to_num(abs(r_roll), nan=0.0) > 0.7 and np.nan_to_num(abs(r_pitch), nan=0.0) > 0.7:
+                    if (
+                        np.nan_to_num(abs(r_roll), nan=0.0) > 0.7
+                        and np.nan_to_num(abs(r_pitch), nan=0.0) > 0.7
+                    ):
                         best_meta["status"] = "validated"
                         best_meta["message"] = "Potentiometers calibrated against VectorNav."
-                    elif np.nan_to_num(abs(r_roll), nan=0.0) > 0.3 or np.nan_to_num(abs(r_pitch), nan=0.0) > 0.3:
+                    elif (
+                        np.nan_to_num(abs(r_roll), nan=0.0) > 0.3
+                        or np.nan_to_num(abs(r_pitch), nan=0.0) > 0.3
+                    ):
                         best_meta["status"] = "partial"
-                        best_meta["message"] = "Partial potentiometer calibration - interpret with caution."
+                        best_meta["message"] = (
+                            "Partial potentiometer calibration - interpret with caution."
+                        )
                     else:
                         best_meta["message"] = "Calibration failed - poor VectorNav correlation."
 
@@ -1083,33 +1155,39 @@ def ensure_suspension_t1_df(df: pl.DataFrame) -> pl.DataFrame:
     if "Pot_Calibration_Status" in df.columns:
         return df
     if not _suspension_polyfits():
-        return df.with_columns([
-            pl.lit("failed").alias("Pot_Calibration_Status"),
-            pl.lit("lookup-missing").alias("Pot_Calibration_Convention"),
-            pl.lit(float("nan")).alias("Pot_Calibration_r_roll"),
-            pl.lit(float("nan")).alias("Pot_Calibration_r_pitch"),
-            pl.lit("Calibration failed - lookup CSV missing.").alias("Pot_Calibration_Message"),
-        ])
+        return df.with_columns(
+            [
+                pl.lit("failed").alias("Pot_Calibration_Status"),
+                pl.lit("lookup-missing").alias("Pot_Calibration_Convention"),
+                pl.lit(float("nan")).alias("Pot_Calibration_r_roll"),
+                pl.lit(float("nan")).alias("Pot_Calibration_r_pitch"),
+                pl.lit("Calibration failed - lookup CSV missing.").alias("Pot_Calibration_Message"),
+            ]
+        )
 
     try:
         payload, meta = _choose_suspension_payload(df)
     except Exception as exc:
-        return df.with_columns([
-            pl.lit("failed").alias("Pot_Calibration_Status"),
-            pl.lit("error").alias("Pot_Calibration_Convention"),
-            pl.lit(float("nan")).alias("Pot_Calibration_r_roll"),
-            pl.lit(float("nan")).alias("Pot_Calibration_r_pitch"),
-            pl.lit(f"Calibration failed - {exc}").alias("Pot_Calibration_Message"),
-        ])
+        return df.with_columns(
+            [
+                pl.lit("failed").alias("Pot_Calibration_Status"),
+                pl.lit("error").alias("Pot_Calibration_Convention"),
+                pl.lit(float("nan")).alias("Pot_Calibration_r_roll"),
+                pl.lit(float("nan")).alias("Pot_Calibration_r_pitch"),
+                pl.lit(f"Calibration failed - {exc}").alias("Pot_Calibration_Message"),
+            ]
+        )
 
     exprs = [pl.Series(name, values) for name, values in payload.items()]
-    exprs.extend([
-        pl.lit(str(meta["status"])).alias("Pot_Calibration_Status"),
-        pl.lit(str(meta["convention"])).alias("Pot_Calibration_Convention"),
-        pl.lit(float(meta["r_roll"])).alias("Pot_Calibration_r_roll"),
-        pl.lit(float(meta["r_pitch"])).alias("Pot_Calibration_r_pitch"),
-        pl.lit(str(meta["message"])).alias("Pot_Calibration_Message"),
-    ])
+    exprs.extend(
+        [
+            pl.lit(str(meta["status"])).alias("Pot_Calibration_Status"),
+            pl.lit(str(meta["convention"])).alias("Pot_Calibration_Convention"),
+            pl.lit(float(meta["r_roll"])).alias("Pot_Calibration_r_roll"),
+            pl.lit(float(meta["r_pitch"])).alias("Pot_Calibration_r_pitch"),
+            pl.lit(str(meta["message"])).alias("Pot_Calibration_Message"),
+        ]
+    )
     return df.with_columns(exprs)
 
 
@@ -1153,15 +1231,18 @@ def load_data(path: str, complete_laps_only: bool = True) -> pl.DataFrame:
 # Rank ramp: purple reserved for the single best value; the rest run on a sober,
 # colour-blind-aware teal → amber → muted-red progression (more luminance contrast
 # and hue separation than the old neon green→yellow→red).
-_TBL_PURPLE = '#8E5AA8'   # best (rank 1) — reserved
-_TBL_GREEN  = '#2A9D8F'   # 2nd best — teal-green
-_TBL_YELLOW = '#D9A441'   # middle — amber
-_TBL_RED    = '#C75D5D'   # worst — muted red
+_TBL_PURPLE = "#8E5AA8"  # best (rank 1) — reserved
+_TBL_GREEN = "#2A9D8F"  # 2nd best — teal-green
+_TBL_YELLOW = "#D9A441"  # middle — amber
+_TBL_RED = "#C75D5D"  # worst — muted red
 
 _LOWER_BETTER_PATTERNS: tuple[str, ...] = (
-    'LapTime', 'laptime', 'lap time', 'Lap time',
-    'Off throttle',
-    'Steering smoothness',
+    "LapTime",
+    "laptime",
+    "lap time",
+    "Lap time",
+    "Off throttle",
+    "Steering smoothness",
 )
 
 
@@ -1170,7 +1251,7 @@ def _table_lower_is_better(col: str) -> bool:
 
 
 def _hex_to_rgb(h: str) -> tuple[float, float, float]:
-    h = h.lstrip('#')
+    h = h.lstrip("#")
     return int(h[0:2], 16) / 255.0, int(h[2:4], 16) / 255.0, int(h[4:6], 16) / 255.0
 
 
@@ -1180,7 +1261,7 @@ def _lerp_hex(c0: str, c1: str, t: float) -> str:
     r = r0 + t * (r1 - r0)
     g = g0 + t * (g1 - g0)
     b = b0 + t * (b1 - b0)
-    return f'#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}'
+    return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
 
 
 def _grad3(t: float) -> str:
@@ -1193,7 +1274,7 @@ def _grad3(t: float) -> str:
 def _text_on(bg_hex: str) -> str:
     r, g, b = _hex_to_rgb(bg_hex)
     lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
-    return 'white' if lum < 0.55 else 'black'
+    return "white" if lum < 0.55 else "black"
 
 
 def _rank_color_styles(vals: np.ndarray, lower_better: bool) -> list[str]:
@@ -1201,7 +1282,7 @@ def _rank_color_styles(vals: np.ndarray, lower_better: bool) -> list[str]:
     finite = np.isfinite(vals)
     valid_idx = np.where(finite)[0]
     nv = len(valid_idx)
-    styles: list[str] = [''] * n
+    styles: list[str] = [""] * n
     if nv == 0:
         return styles
 
@@ -1223,12 +1304,12 @@ def _rank_color_styles(vals: np.ndarray, lower_better: bool) -> list[str]:
             t = (rank - 1) / (nv - 2)
             bg = _grad3(t)
         txt = _text_on(bg)
-        styles[i] = f'background-color: {bg}; color: {txt}'
+        styles[i] = f"background-color: {bg}; color: {txt}"
 
     return styles
 
 
-def style_per_lap_table(df: pl.DataFrame) -> 'pd.io.formats.style.Styler':
+def style_per_lap_table(df: pl.DataFrame) -> "pd.io.formats.style.Styler":
     """Return a pandas Styler with rank-based colour gradient per numeric column.
 
     Purple = best, green = 2nd best, red = worst,
@@ -1237,20 +1318,18 @@ def style_per_lap_table(df: pl.DataFrame) -> 'pd.io.formats.style.Styler':
     """
     import pandas as pd  # noqa: PLC0415
 
-    _SKIP = {'Lap', 'lap', 'Run', 'run'}
+    _SKIP = {"Lap", "lap", "Run", "run"}
     pdf = df.to_pandas()
 
     def _apply_all(frame: pd.DataFrame) -> pd.DataFrame:
-        result = pd.DataFrame('', index=frame.index, columns=frame.columns)
+        result = pd.DataFrame("", index=frame.index, columns=frame.columns)
         for col in frame.columns:
             if col in _SKIP:
                 continue
             if not pd.api.types.is_numeric_dtype(frame[col]):
                 continue
             lb = _table_lower_is_better(col)
-            result[col] = _rank_color_styles(
-                frame[col].to_numpy(dtype=float, na_value=np.nan), lb
-            )
+            result[col] = _rank_color_styles(frame[col].to_numpy(dtype=float, na_value=np.nan), lb)
         return result
 
     return pdf.style.apply(_apply_all, axis=None)
@@ -1260,19 +1339,18 @@ def style_metrics_table(
     df: pl.DataFrame,
     *,
     lower_better: dict[str, bool],
-) -> 'pd.io.formats.style.Styler':
+) -> "pd.io.formats.style.Styler":
     """Return a pandas Styler with rank-based colours applied per metric row."""
     import pandas as pd  # noqa: PLC0415
 
     pdf = df.to_pandas()
     numeric_cols = [
-        col for col in pdf.columns
-        if col != 'Metric' and pd.api.types.is_numeric_dtype(pdf[col])
+        col for col in pdf.columns if col != "Metric" and pd.api.types.is_numeric_dtype(pdf[col])
     ]
 
     def _apply_row(row: pd.Series) -> list[str]:
-        styles = [''] * len(row)
-        metric_name = row.get('Metric')
+        styles = [""] * len(row)
+        metric_name = row.get("Metric")
         if metric_name not in lower_better or not numeric_cols:
             return styles
         ranked = _rank_color_styles(

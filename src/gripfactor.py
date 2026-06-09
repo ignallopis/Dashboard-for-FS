@@ -24,6 +24,7 @@ Inputs use the pre-filtered acceleration channels ``Filtering_VN_ax`` and
 ``Filtering_VN_ay`` (m/s²) and convert them to G internally so every metric is
 reported in the same unit as the reference book.
 """
+
 from __future__ import annotations
 from dataclasses import dataclass
 
@@ -47,15 +48,18 @@ G = 9.80665  # [m/s²]
 
 GRIP_CATEGORIES: tuple[str, ...] = ("Overall", "Cornering", "Braking", "Traction")
 GRIP_COLORS: dict[str, str] = {
-    "Overall":   "#FFD700",
+    "Overall": "#FFD700",
     "Cornering": "#00BFBF",
-    "Braking":   "#D94F4F",
-    "Traction":  "#73D973",
+    "Braking": "#D94F4F",
+    "Traction": "#73D973",
 }
 
 _REQUIRED_COLS: tuple[str, ...] = (
-    "TimeStamp", "laps", "laptime",
-    "Filtering_VN_ax", "Filtering_VN_ay",
+    "TimeStamp",
+    "laps",
+    "laptime",
+    "Filtering_VN_ax",
+    "Filtering_VN_ay",
 )
 
 # A sample counts as "at the limit" when its combined |G| reaches this fraction
@@ -71,12 +75,13 @@ class GripThresholds:
     Channels are independent, so thresholds should be easy to interpret on the
     raw accelerations rather than on derived sector geometry.
     """
+
     overall_combined_g: float = 0.80
-    cornering_ay_g:     float = 0.50
-    braking_ax_g:       float = 0.60
-    traction_ax_g:      float = 0.15
-    traction_ay_g:      float = 0.35
-    min_samples:        int   = 25
+    cornering_ay_g: float = 0.50
+    braking_ax_g: float = 0.60
+    traction_ax_g: float = 0.15
+    traction_ay_g: float = 0.35
+    min_samples: int = 25
 
 
 def estimate_thresholds(df: pl.DataFrame) -> GripThresholds:
@@ -101,22 +106,16 @@ def estimate_thresholds(df: pl.DataFrame) -> GripThresholds:
 
     ax_ok = ax_g[ok]
     ay_ok = ay_g[ok]
-    combined = np.sqrt(ax_ok ** 2 + ay_ok ** 2)
+    combined = np.sqrt(ax_ok**2 + ay_ok**2)
 
     peak_combined = float(np.percentile(combined, 95))
-    peak_lat      = float(np.percentile(np.abs(ay_ok), 95))
+    peak_lat = float(np.percentile(np.abs(ay_ok), 95))
 
     decel = ax_ok[ax_ok < -0.05]
-    peak_brk = (
-        float(np.percentile(np.abs(decel), 95))
-        if len(decel) > 50 else peak_combined
-    )
+    peak_brk = float(np.percentile(np.abs(decel), 95)) if len(decel) > 50 else peak_combined
 
     accel = ax_ok[ax_ok > 0.05]
-    peak_acc = (
-        float(np.percentile(accel, 95))
-        if len(accel) > 50 else peak_combined * 0.4
-    )
+    peak_acc = float(np.percentile(accel, 95)) if len(accel) > 50 else peak_combined * 0.4
 
     return GripThresholds(
         overall_combined_g=round(float(np.clip(0.70 * peak_combined, 0.60, 1.30)), 2),
@@ -145,15 +144,13 @@ def _phase_masks(
 ) -> dict[str, np.ndarray]:
     """Sample-level masks for each grip category. ``ax_g``/``ay_g`` in G."""
     finite = np.isfinite(ax_g) & np.isfinite(ay_g)
-    combined = np.sqrt(ax_g ** 2 + ay_g ** 2)
+    combined = np.sqrt(ax_g**2 + ay_g**2)
 
     return {
-        "Overall":   finite & (combined >= t.overall_combined_g),
+        "Overall": finite & (combined >= t.overall_combined_g),
         "Cornering": finite & (np.abs(ay_g) >= t.cornering_ay_g),
-        "Braking":   finite & (ax_g <= -t.braking_ax_g),
-        "Traction":  finite
-                     & (ax_g >= t.traction_ax_g)
-                     & (np.abs(ay_g) >= t.traction_ay_g),
+        "Braking": finite & (ax_g <= -t.braking_ax_g),
+        "Traction": finite & (ax_g >= t.traction_ax_g) & (np.abs(ay_g) >= t.traction_ay_g),
     }
 
 
@@ -164,7 +161,7 @@ def _value_for_category(
 ) -> np.ndarray:
     """Per-sample value used to compute the mean grip factor (in G)."""
     if category == "Overall":
-        return np.sqrt(ax_g ** 2 + ay_g ** 2)
+        return np.sqrt(ax_g**2 + ay_g**2)
     if category == "Cornering":
         return np.abs(ay_g)
     if category == "Braking":
@@ -180,10 +177,10 @@ def _per_lap_table(
 ) -> pl.DataFrame:
     """Build the per-lap grip-factor table. Empty if no laps available."""
     d = exclude_lap0_and_last_lap(d)
-    laps    = d["laps"]
+    laps = d["laps"]
     laptime = d["laptime"]
-    ax_g    = d["Filtering_VN_ax"] / G
-    ay_g    = d["Filtering_VN_ay"] / G
+    ax_g = d["Filtering_VN_ax"] / G
+    ay_g = d["Filtering_VN_ay"] / G
 
     masks = _phase_masks(ax_g, ay_g, t)
     lap_list = unique_laps(laps).astype(int)
@@ -282,7 +279,7 @@ def grip_utilization_kpis(df: pl.DataFrame) -> dict:
 
     ax_g = ax_g[ok]
     ay_g = ay_g[ok]
-    combined = np.sqrt(ax_g ** 2 + ay_g ** 2)
+    combined = np.sqrt(ax_g**2 + ay_g**2)
     envelope = float(np.percentile(combined, 95))
     if not np.isfinite(envelope) or envelope <= 0.0:
         return {"warnings": ["Could not estimate grip envelope."]}
@@ -301,8 +298,7 @@ def grip_utilization_kpis(df: pl.DataFrame) -> dict:
         "utilization_pct": round(float(np.mean(combined) / envelope * 100.0), 1),
         "time_at_limit_pct": round(float(np.mean(near) * 100.0), 1),
         "phase_time_at_limit_pct": {
-            cat: (round(v, 1) if np.isfinite(v) else float("nan"))
-            for cat, v in phase_tal.items()
+            cat: (round(v, 1) if np.isfinite(v) else float("nan")) for cat, v in phase_tal.items()
         },
         "samples": int(ok.sum()),
         "warnings": [],
@@ -324,13 +320,15 @@ def grip_utilization_fig(dfs: dict[str, pl.DataFrame]) -> go.Figure:
             continue
         phase = k["phase_time_at_limit_pct"]
         ys = [k["time_at_limit_pct"], *(phase.get(cat, float("nan")) for cat in _UTIL_PHASES)]
-        fig.add_trace(go.Bar(
-            x=categories,
-            y=ys,
-            name=run_name.rsplit("/", 1)[-1].removesuffix(".csv"),
-            marker=dict(color=driver_color(run_name)),
-            hovertemplate="%{x}: %{y:.1f}%<extra></extra>",
-        ))
+        fig.add_trace(
+            go.Bar(
+                x=categories,
+                y=ys,
+                name=run_name.rsplit("/", 1)[-1].removesuffix(".csv"),
+                marker=dict(color=driver_color(run_name)),
+                hovertemplate="%{x}: %{y:.1f}%<extra></extra>",
+            )
+        )
         any_bar = True
     if any_bar:
         fig.update_layout(barmode="group")
@@ -343,7 +341,9 @@ _DESIGN_MU_CIRCLE = 1.70
 
 
 def _phase_for_scatter(
-    ax_g: np.ndarray, ay_g: np.ndarray, t: GripThresholds,
+    ax_g: np.ndarray,
+    ay_g: np.ndarray,
+    t: GripThresholds,
 ) -> dict[str, np.ndarray]:
     """Assign each sample ONE colour group for the g-g cloud.
 
@@ -386,10 +386,10 @@ def gg_scatter_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     max_r = _DESIGN_MU_CIRCLE
     single = len(dfs) == 1
     phase_colors = {
-        "Braking":   GRIP_COLORS["Braking"],
+        "Braking": GRIP_COLORS["Braking"],
         "Cornering": GRIP_COLORS["Cornering"],
-        "Traction":  GRIP_COLORS["Traction"],
-        "Straight":  "#7A7A7A",
+        "Traction": GRIP_COLORS["Traction"],
+        "Straight": "#7A7A7A",
     }
 
     for run_name, df in dfs.items():
@@ -406,7 +406,7 @@ def gg_scatter_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
             continue
         ax_g = ax_g[ok]
         ay_g = ay_g[ok]
-        combined = np.sqrt(ax_g ** 2 + ay_g ** 2)
+        combined = np.sqrt(ax_g**2 + ay_g**2)
         envelope = float(np.percentile(combined, 95))
         peak = float(np.percentile(combined, 99.5))
         max_r = max(max_r, peak)
@@ -417,33 +417,43 @@ def gg_scatter_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
             for label, mask in groups.items():
                 if not mask.any():
                     continue
-                fig.add_trace(go.Scattergl(
-                    x=ay_g[mask][::stride], y=ax_g[mask][::stride],
-                    mode="markers",
-                    marker=dict(color=phase_colors[label], size=3, opacity=0.45),
-                    name=label,
-                    hovertemplate="ay=%{x:.2f} g<br>ax=%{y:.2f} g<extra>" + label + "</extra>",
-                ))
+                fig.add_trace(
+                    go.Scattergl(
+                        x=ay_g[mask][::stride],
+                        y=ax_g[mask][::stride],
+                        mode="markers",
+                        marker=dict(color=phase_colors[label], size=3, opacity=0.45),
+                        name=label,
+                        hovertemplate="ay=%{x:.2f} g<br>ax=%{y:.2f} g<extra>" + label + "</extra>",
+                    )
+                )
             ring_color = "#EBEBEB"
         else:
             color = driver_color(run_name)
-            fig.add_trace(go.Scattergl(
-                x=ay_g[::stride], y=ax_g[::stride],
-                mode="markers",
-                marker=dict(color=color, size=3, opacity=0.40),
-                name=run_name.rsplit("/", 1)[-1].removesuffix(".csv"),
-                hovertemplate="ay=%{x:.2f} g<br>ax=%{y:.2f} g<extra></extra>",
-            ))
+            fig.add_trace(
+                go.Scattergl(
+                    x=ay_g[::stride],
+                    y=ax_g[::stride],
+                    mode="markers",
+                    marker=dict(color=color, size=3, opacity=0.40),
+                    name=run_name.rsplit("/", 1)[-1].removesuffix(".csv"),
+                    hovertemplate="ay=%{x:.2f} g<br>ax=%{y:.2f} g<extra></extra>",
+                )
+            )
             ring_color = color
 
         cx, cy = _envelope_circle(envelope)
-        fig.add_trace(go.Scatter(
-            x=cx, y=cy, mode="lines",
-            line=dict(color=ring_color, width=2.0, dash="dash"),
-            name=f"P95 envelope {envelope:.2f} g",
-            showlegend=single,
-            hoverinfo="skip",
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=cx,
+                y=cy,
+                mode="lines",
+                line=dict(color=ring_color, width=2.0, dash="dash"),
+                name=f"P95 envelope {envelope:.2f} g",
+                showlegend=single,
+                hoverinfo="skip",
+            )
+        )
         runs[run_name] = {
             "envelope_g": round(envelope, 3),
             "peak_combined_g": round(peak, 3),
@@ -451,12 +461,16 @@ def gg_scatter_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
         }
 
     mx, my = _envelope_circle(_DESIGN_MU_CIRCLE)
-    fig.add_trace(go.Scatter(
-        x=mx, y=my, mode="lines",
-        line=dict(color="rgba(235,235,235,0.45)", width=1.4, dash="dot"),
-        name=f"Design μ={_DESIGN_MU_CIRCLE:.2f} g",
-        hoverinfo="skip",
-    ))
+    fig.add_trace(
+        go.Scatter(
+            x=mx,
+            y=my,
+            mode="lines",
+            line=dict(color="rgba(235,235,235,0.45)", width=1.4, dash="dot"),
+            name=f"Design μ={_DESIGN_MU_CIRCLE:.2f} g",
+            hoverinfo="skip",
+        )
+    )
     lim = max_r * 1.08
     fig.add_hline(y=0.0, line=dict(color="rgba(200,200,200,0.35)", dash="dot", width=1))
     fig.add_vline(x=0.0, line=dict(color="rgba(200,200,200,0.35)", dash="dot", width=1))
@@ -490,16 +504,18 @@ def grip_factor_evolution_fig(
         ok = np.isfinite(ys)
         if not ok.any():
             continue
-        fig.add_trace(go.Scatter(
-            x=x_arr[ok],
-            y=ys[ok],
-            mode="lines+markers",
-            name=cat,
-            line=dict(color=GRIP_COLORS[cat], width=1.8),
-            marker=dict(size=7, color=GRIP_COLORS[cat]),
-            text=[str(int(l)) for l in sorted_laps[ok]],
-            hovertemplate=f"{cat} %{{y:.3f}} G (L%{{text}})<extra></extra>",
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=x_arr[ok],
+                y=ys[ok],
+                mode="lines+markers",
+                name=cat,
+                line=dict(color=GRIP_COLORS[cat], width=1.8),
+                marker=dict(size=7, color=GRIP_COLORS[cat]),
+                text=[str(int(l)) for l in sorted_laps[ok]],
+                hovertemplate=f"{cat} %{{y:.3f}} G (L%{{text}})<extra></extra>",
+            )
+        )
 
     if x_mode == "laps":
         fig.update_xaxes(tickvals=sorted(set(laps.tolist())))
@@ -520,7 +536,8 @@ def grip_factor_track_maps_fig(
     t = thresholds or GripThresholds()
 
     fig = make_subplots(
-        rows=1, cols=4,
+        rows=1,
+        cols=4,
         subplot_titles=list(GRIP_CATEGORIES),
         horizontal_spacing=0.03,
     )
@@ -533,31 +550,41 @@ def grip_factor_track_maps_fig(
         showlegend=False,
     )
 
-    needed = ("laps", "VN_latitude", "VN_longitude",
-              "Filtering_VN_ax", "Filtering_VN_ay")
+    needed = ("laps", "VN_latitude", "VN_longitude", "Filtering_VN_ax", "Filtering_VN_ay")
     missing = [c for c in needed if c not in df.columns]
     if missing:
         fig.add_annotation(
             text=f"Missing columns: {missing}",
-            xref="paper", yref="paper", x=0.5, y=0.5,
-            showarrow=False, font=dict(color="#EBEBEB", size=12),
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            font=dict(color="#EBEBEB", size=12),
         )
         return fig
 
-    cols = cols_to_numpy(df, [
-        "laps",
-        "VN_latitude",
-        "VN_longitude",
-        "Filtering_VN_ax",
-        "Filtering_VN_ay",
-    ])
+    cols = cols_to_numpy(
+        df,
+        [
+            "laps",
+            "VN_latitude",
+            "VN_longitude",
+            "Filtering_VN_ax",
+            "Filtering_VN_ay",
+        ],
+    )
     laps_arr = cols["laps"]
     lap_mask = laps_arr == float(lap)
     if not lap_mask.any():
         fig.add_annotation(
             text=f"Lap {lap} not found",
-            xref="paper", yref="paper", x=0.5, y=0.5,
-            showarrow=False, font=dict(color="#EBEBEB", size=12),
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            font=dict(color="#EBEBEB", size=12),
         )
         return fig
 
@@ -570,8 +597,12 @@ def grip_factor_track_maps_fig(
     if not valid.any():
         fig.add_annotation(
             text=f"Lap {lap}: no valid GPS samples",
-            xref="paper", yref="paper", x=0.5, y=0.5,
-            showarrow=False, font=dict(color="#EBEBEB", size=12),
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            font=dict(color="#EBEBEB", size=12),
         )
         return fig
 
@@ -583,37 +614,51 @@ def grip_factor_track_maps_fig(
     for col_idx, cat in enumerate(GRIP_CATEGORIES, start=1):
         fig.add_trace(
             go.Scattergl(
-                x=lng_v, y=lat_v, mode="markers",
+                x=lng_v,
+                y=lat_v,
+                mode="markers",
                 marker=dict(size=2, color="rgba(150,150,150,0.30)"),
-                hoverinfo="skip", showlegend=False,
+                hoverinfo="skip",
+                showlegend=False,
             ),
-            row=1, col=col_idx,
+            row=1,
+            col=col_idx,
         )
         m = valid & masks[cat]
         n = int(m.sum())
         if n > 0:
             fig.add_trace(
                 go.Scattergl(
-                    x=lng[m], y=lat[m], mode="markers",
+                    x=lng[m],
+                    y=lat[m],
+                    mode="markers",
                     marker=dict(size=4, color=GRIP_COLORS[cat], opacity=0.85),
-                    hoverinfo="skip", showlegend=False,
+                    hoverinfo="skip",
+                    showlegend=False,
                 ),
-                row=1, col=col_idx,
+                row=1,
+                col=col_idx,
             )
         pct = 100.0 * n / max(n_lap, 1)
-        fig.layout.annotations[col_idx - 1].text = (
-            f"{cat} — {n} pts ({pct:.1f}%)"
-        )
+        fig.layout.annotations[col_idx - 1].text = f"{cat} — {n} pts ({pct:.1f}%)"
 
     for i in range(1, 5):
         sfx = "" if i == 1 else str(i)
-        fig.update_layout(**{
-            f"xaxis{sfx}": dict(showgrid=False, zeroline=False,
-                                showticklabels=False, showline=False),
-            f"yaxis{sfx}": dict(showgrid=False, zeroline=False,
-                                showticklabels=False, showline=False,
-                                scaleanchor=f"x{sfx}", scaleratio=1.0),
-        })
+        fig.update_layout(
+            **{
+                f"xaxis{sfx}": dict(
+                    showgrid=False, zeroline=False, showticklabels=False, showline=False
+                ),
+                f"yaxis{sfx}": dict(
+                    showgrid=False,
+                    zeroline=False,
+                    showticklabels=False,
+                    showline=False,
+                    scaleanchor=f"x{sfx}",
+                    scaleratio=1.0,
+                ),
+            }
+        )
     for ann in fig.layout.annotations:
         ann.font.color = "#EBEBEB"
     return fig
@@ -645,7 +690,9 @@ def grip_factor_evolution_multi_fig(
         if table.is_empty():
             continue
         dash = _RUN_DASHES[run_idx % len(_RUN_DASHES)]
-        cols = cols_to_numpy(table, ["Lap", "LapTime [s]", *[f"GF {cat}" for cat in GRIP_CATEGORIES]])
+        cols = cols_to_numpy(
+            table, ["Lap", "LapTime [s]", *[f"GF {cat}" for cat in GRIP_CATEGORIES]]
+        )
         laps = cols["Lap"].astype(int)
         laptime = cols["LapTime [s]"]
         x_arr, order, _ = per_lap_axis(laps, laptime, x_mode)
@@ -657,20 +704,19 @@ def grip_factor_evolution_multi_fig(
             ok = np.isfinite(ys)
             if not ok.any():
                 continue
-            fig.add_trace(go.Scatter(
-                x=x_arr[ok],
-                y=ys[ok],
-                mode="lines+markers",
-                name=f"{run_name} · {cat}",
-                legendgroup=cat,
-                line=dict(color=GRIP_COLORS[cat], width=1.8, dash=dash),
-                marker=dict(size=7, color=GRIP_COLORS[cat]),
-                text=[str(int(l)) for l in sorted_laps[ok]],
-                hovertemplate=(
-                    f"{run_name} · {cat} "
-                    "%{y:.3f} G (L%{text})<extra></extra>"
-                ),
-            ))
+            fig.add_trace(
+                go.Scatter(
+                    x=x_arr[ok],
+                    y=ys[ok],
+                    mode="lines+markers",
+                    name=f"{run_name} · {cat}",
+                    legendgroup=cat,
+                    line=dict(color=GRIP_COLORS[cat], width=1.8, dash=dash),
+                    marker=dict(size=7, color=GRIP_COLORS[cat]),
+                    text=[str(int(l)) for l in sorted_laps[ok]],
+                    hovertemplate=(f"{run_name} · {cat} %{{y:.3f}} G (L%{{text}})<extra></extra>"),
+                )
+            )
 
     if x_mode == "laps" and all_laps:
         fig.update_xaxes(tickvals=sorted(all_laps))
@@ -715,12 +761,14 @@ def grip_factor_radar_fig(
             means.append(float(col.mean()) if len(col) > 0 else 0.0)
         r = means + [means[0]]
         color = driver_color(run_name)
-        fig.add_trace(go.Scatterpolar(
-            r=r,
-            theta=theta,
-            fill="toself",
-            name=run_name,
-            line=dict(color=color, width=1.8),
-            opacity=0.55,
-        ))
+        fig.add_trace(
+            go.Scatterpolar(
+                r=r,
+                theta=theta,
+                fill="toself",
+                name=run_name,
+                line=dict(color=color, width=1.8),
+                opacity=0.55,
+            )
+        )
     return fig

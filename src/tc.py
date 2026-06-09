@@ -14,6 +14,7 @@ KPIs:
   5. Traction efficiency: mean ax when SR is in target
   6. Worst-wheel overslip
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -57,11 +58,22 @@ TC_ENABLE_COL = "TCenable"
 TC_ENABLE_MODE_COL = "TCEnableMode"
 TC_TORQUE_COLS = ("TC_FL_MaxTrq", "TC_FR_MaxTrq", "TC_RL_MaxTrq", "TC_RR_MaxTrq")
 TC_ANGVEL_COLS = ("TC_FL_MaxAngVel", "TC_FR_MaxAngVel", "TC_RL_MaxAngVel", "TC_RR_MaxAngVel")
-MOTOR_VEL_COLS = ("FL_actualVelocity", "FR_actualVelocity", "RL_actualVelocity", "RR_actualVelocity")
+MOTOR_VEL_COLS = (
+    "FL_actualVelocity",
+    "FR_actualVelocity",
+    "RL_actualVelocity",
+    "RR_actualVelocity",
+)
 MOTOR_TORQUE_COLS = ("FL_actualTorque", "FR_actualTorque", "RL_actualTorque", "RR_actualTorque")
 TC_OPTIONAL_COLS = (
-    TC_ENABLE_COL, TC_ENABLE_MODE_COL, "TCenableTorque", "TCenableVelocity",
-    *TC_TORQUE_COLS, *TC_ANGVEL_COLS, *MOTOR_VEL_COLS, *MOTOR_TORQUE_COLS,
+    TC_ENABLE_COL,
+    TC_ENABLE_MODE_COL,
+    "TCenableTorque",
+    "TCenableVelocity",
+    *TC_TORQUE_COLS,
+    *TC_ANGVEL_COLS,
+    *MOTOR_VEL_COLS,
+    *MOTOR_TORQUE_COLS,
 )
 
 
@@ -102,14 +114,24 @@ def _prepare_arrays_from_df(
     ax_col = _ax_signal(df.columns)
     vx_col = _vx_signal(df.columns)
     cols = [
-        "TimeStamp", "laps", "laptime",
-        "Throttle", "Steering", ax_col, vx_col,
-        "Est_SRFL", "Est_SRFR", "Est_SRRL", "Est_SRRR",
+        "TimeStamp",
+        "laps",
+        "laptime",
+        "Throttle",
+        "Steering",
+        ax_col,
+        vx_col,
+        "Est_SRFL",
+        "Est_SRFR",
+        "Est_SRRL",
+        "Est_SRRR",
     ]
     cols.extend(c for c in TC_OPTIONAL_COLS if c in df.columns)
     d = cols_to_numpy(df_eff, cols)
     if COMPLETE_LAPS_MARKER in df_eff.columns and COMPLETE_LAPS_MARKER not in d:
-        d[COMPLETE_LAPS_MARKER] = cols_to_numpy(df_eff, [COMPLETE_LAPS_MARKER])[COMPLETE_LAPS_MARKER]
+        d[COMPLETE_LAPS_MARKER] = cols_to_numpy(df_eff, [COMPLETE_LAPS_MARKER])[
+            COMPLETE_LAPS_MARKER
+        ]
     s_m = lap_dist_from_gps(df_eff)
     d["s_m"] = s_m
     d["time"] = d["TimeStamp"] - d["TimeStamp"][0]
@@ -124,11 +146,21 @@ def _prepare_arrays_from_csv() -> dict[str, np.ndarray]:
     header = pl.read_csv(CSV_PATH, n_rows=1).columns
     ax_col = _ax_signal(header)
     vx_col = _vx_signal(header)
-    d = _load([
-        "TimeStamp", "laps", "laptime",
-        "Throttle", "Steering", ax_col, vx_col,
-        "Est_SRFL", "Est_SRFR", "Est_SRRL", "Est_SRRR",
-    ])
+    d = _load(
+        [
+            "TimeStamp",
+            "laps",
+            "laptime",
+            "Throttle",
+            "Steering",
+            ax_col,
+            vx_col,
+            "Est_SRFL",
+            "Est_SRFR",
+            "Est_SRRL",
+            "Est_SRRR",
+        ]
+    )
     d["time"] = d["TimeStamp"] - d["TimeStamp"][0]
     d["ax"] = d.pop(ax_col)
     d["vx"] = d.pop(vx_col)
@@ -156,9 +188,7 @@ def _compute_tc(d: dict[str, np.ndarray]) -> dict:
         traction_mask = d["__accel_mask"].astype(bool) & (np.abs(vx) >= MIN_SPEED)
     else:
         raw_traction = (
-            (throttle >= THROTTLE_THRESHOLD)
-            & (ax >= AX_THRESHOLD)
-            & (np.abs(vx) >= MIN_SPEED)
+            (throttle >= THROTTLE_THRESHOLD) & (ax >= AX_THRESHOLD) & (np.abs(vx) >= MIN_SPEED)
         )
         if USE_STRAIGHT_FILTER:
             raw_traction &= np.abs(steering) <= STEERING_STRAIGHT
@@ -253,31 +283,33 @@ def _compute_tc(d: dict[str, np.ndarray]) -> dict:
     )
     eff_ok = base_ok & np.isfinite(ax_in_tgt_glob)
 
-    table = pl.DataFrame({
-        "Lap": lap_list[base_ok].astype(int),
-        "LapTime [s]": np.round(lt_val[base_ok], 3),
-        "Traction samples": trac_samps[base_ok].astype(int),
-        "Coverage [%]": np.round(trac_cover[base_ok] * 100.0, 2),
-        "Global MAE": np.round(mae_global[base_ok], 4),
-        "Global Bias": np.round(bias_global[base_ok], 4),
-        "Worst MAE": np.round(mae_worst[base_ok], 4),
-        "Worst Bias": np.round(bias_worst[base_ok], 4),
-        "In target [%]": np.round(in_tgt_pct_glob[base_ok], 2),
-        "Overslip [%]": np.round(over_pct_glob[base_ok], 2),
-        "Underslip [%]": np.round(under_pct_glob[base_ok], 2),
-        "Worst overslip [%]": np.round(worst_over_pct[base_ok], 2),
-        "ax in target [m/s²]": np.round(ax_in_tgt_glob[base_ok], 3),
-        "MAE FL": np.round(mae_w["FL"][base_ok], 4),
-        "MAE FR": np.round(mae_w["FR"][base_ok], 4),
-        "MAE RL": np.round(mae_w["RL"][base_ok], 4),
-        "MAE RR": np.round(mae_w["RR"][base_ok], 4),
-        "Bias FL": np.round(bias_w["FL"][base_ok], 4),
-        "Bias FR": np.round(bias_w["FR"][base_ok], 4),
-        "Bias RL": np.round(bias_w["RL"][base_ok], 4),
-        "Bias RR": np.round(bias_w["RR"][base_ok], 4),
-        "MAE imbalance": np.round(imb_mae[base_ok], 4),
-        "Bias imbalance": np.round(imb_bias[base_ok], 4),
-    })
+    table = pl.DataFrame(
+        {
+            "Lap": lap_list[base_ok].astype(int),
+            "LapTime [s]": np.round(lt_val[base_ok], 3),
+            "Traction samples": trac_samps[base_ok].astype(int),
+            "Coverage [%]": np.round(trac_cover[base_ok] * 100.0, 2),
+            "Global MAE": np.round(mae_global[base_ok], 4),
+            "Global Bias": np.round(bias_global[base_ok], 4),
+            "Worst MAE": np.round(mae_worst[base_ok], 4),
+            "Worst Bias": np.round(bias_worst[base_ok], 4),
+            "In target [%]": np.round(in_tgt_pct_glob[base_ok], 2),
+            "Overslip [%]": np.round(over_pct_glob[base_ok], 2),
+            "Underslip [%]": np.round(under_pct_glob[base_ok], 2),
+            "Worst overslip [%]": np.round(worst_over_pct[base_ok], 2),
+            "ax in target [m/s²]": np.round(ax_in_tgt_glob[base_ok], 3),
+            "MAE FL": np.round(mae_w["FL"][base_ok], 4),
+            "MAE FR": np.round(mae_w["FR"][base_ok], 4),
+            "MAE RL": np.round(mae_w["RL"][base_ok], 4),
+            "MAE RR": np.round(mae_w["RR"][base_ok], 4),
+            "Bias FL": np.round(bias_w["FL"][base_ok], 4),
+            "Bias FR": np.round(bias_w["FR"][base_ok], 4),
+            "Bias RL": np.round(bias_w["RL"][base_ok], 4),
+            "Bias RR": np.round(bias_w["RR"][base_ok], 4),
+            "MAE imbalance": np.round(imb_mae[base_ok], 4),
+            "Bias imbalance": np.round(imb_bias[base_ok], 4),
+        }
+    )
 
     warnings: list[str] = []
     if not base_ok.any():
@@ -333,7 +365,9 @@ def _build_tc_figures(res: dict, x_mode: str = "laps") -> list[go.Figure]:
     x_glob, order_glob, xlabel = per_lap_axis_or_empty(lap_list, lt_val, x_mode, glob_ok)
     fig = make_dark_figure(f"Global SR MAE vs {vs}", xlabel, "MAE SR global")
     if glob_ok.any():
-        add_lap_scatter(fig, x_glob, res["mae_global"][glob_ok][order_glob], lap_list[glob_ok][order_glob])
+        add_lap_scatter(
+            fig, x_glob, res["mae_global"][glob_ok][order_glob], lap_list[glob_ok][order_glob]
+        )
         if x_mode == "laps":
             fig.update_xaxes(tickvals=np.sort(lap_list[glob_ok].astype(int)))
     figs.append(fig)
@@ -391,16 +425,30 @@ def _build_tc_figures(res: dict, x_mode: str = "laps") -> list[go.Figure]:
     fig = make_dark_figure(f"Time in SR Target vs {vs}", xlabel_pct, "% of traction time")
     if ok_pct.any():
         add_lap_scatter(
-            fig, x_pct, res["in_tgt_pct_glob"][ok_pct][order_pct], lap_list[ok_pct][order_pct],
-            name="In target", color="#73D973",
+            fig,
+            x_pct,
+            res["in_tgt_pct_glob"][ok_pct][order_pct],
+            lap_list[ok_pct][order_pct],
+            name="In target",
+            color="#73D973",
         )
         add_lap_scatter(
-            fig, x_pct, res["over_pct_glob"][ok_pct][order_pct], lap_list[ok_pct][order_pct],
-            name="Overslip", color="#F27070", symbol="square",
+            fig,
+            x_pct,
+            res["over_pct_glob"][ok_pct][order_pct],
+            lap_list[ok_pct][order_pct],
+            name="Overslip",
+            color="#F27070",
+            symbol="square",
         )
         add_lap_scatter(
-            fig, x_pct, res["under_pct_glob"][ok_pct][order_pct], lap_list[ok_pct][order_pct],
-            name="Underslip", color="#4DB3F2", symbol="diamond",
+            fig,
+            x_pct,
+            res["under_pct_glob"][ok_pct][order_pct],
+            lap_list[ok_pct][order_pct],
+            name="Underslip",
+            color="#4DB3F2",
+            symbol="diamond",
         )
         if x_mode == "laps":
             fig.update_xaxes(tickvals=np.sort(lap_list[ok_pct].astype(int)))
@@ -408,11 +456,16 @@ def _build_tc_figures(res: dict, x_mode: str = "laps") -> list[go.Figure]:
 
     x_eff, order_eff, xlabel_eff = per_lap_axis_or_empty(lap_list, lt_val, x_mode, eff_ok)
     fig = make_dark_figure(
-        f"Traction Efficiency vs {vs}", xlabel_eff, "Mean ax when SR in target [m/s²]",
+        f"Traction Efficiency vs {vs}",
+        xlabel_eff,
+        "Mean ax when SR in target [m/s²]",
     )
     if eff_ok.any():
         add_lap_scatter(
-            fig, x_eff, res["ax_in_tgt_glob"][eff_ok][order_eff], lap_list[eff_ok][order_eff],
+            fig,
+            x_eff,
+            res["ax_in_tgt_glob"][eff_ok][order_eff],
+            lap_list[eff_ok][order_eff],
             color="#73D973",
         )
         if x_mode == "laps":
@@ -426,13 +479,15 @@ def _build_tc_figures(res: dict, x_mode: str = "laps") -> list[go.Figure]:
     )
     t_trac = res["time"][res["traction_mask"]]
     for w in WHEELS:
-        fig.add_trace(go.Scatter(
-            x=t_trac,
-            y=res["sr"][w][res["traction_mask"]] - SR_TARGET,
-            mode="lines",
-            name=w,
-            line=dict(color=WHEEL_COLORS[w], width=1.0),
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=t_trac,
+                y=res["sr"][w][res["traction_mask"]] - SR_TARGET,
+                mode="lines",
+                name=w,
+                line=dict(color=WHEEL_COLORS[w], width=1.0),
+            )
+        )
     fig.add_hline(y=0.0, line=dict(color="rgba(200,200,200,0.5)", dash="dash"))
     fig.add_hline(y=DELTA_SR, line=dict(color="rgba(200,200,200,0.3)", dash="dot"))
     fig.add_hline(y=-DELTA_SR, line=dict(color="rgba(200,200,200,0.3)", dash="dot"))
@@ -463,8 +518,12 @@ def tc_figs_kpis(
 
     kpis = {
         "valid_laps": int(base_ok.sum()),
-        "mean_global_mae": float(np.nanmean(res["mae_global"][glob_ok])) if glob_ok.any() else np.nan,
-        "mean_global_bias": float(np.nanmean(res["bias_global"][glob_ok])) if glob_ok.any() else np.nan,
+        "mean_global_mae": float(np.nanmean(res["mae_global"][glob_ok]))
+        if glob_ok.any()
+        else np.nan,
+        "mean_global_bias": float(np.nanmean(res["bias_global"][glob_ok]))
+        if glob_ok.any()
+        else np.nan,
         "mean_worst_mae": float(np.nanmean(res["mae_worst"][glob_ok])) if glob_ok.any() else np.nan,
         "mean_in_target_pct": (
             float(np.nanmean(res["in_tgt_pct_glob"][base_ok])) if base_ok.any() else np.nan
@@ -523,6 +582,7 @@ def main() -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 # Function check  —  is TC delivering its job (SR ≈ +0.20 in acceleration)?
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def _tc_armed_mask(d: dict[str, np.ndarray]) -> np.ndarray:
     return (
@@ -627,7 +687,9 @@ def _tc_visual_figures(
         row=1,
         col=1,
     )
-    fig_track.add_hline(y=SR_TARGET, line=dict(color="rgba(255,255,255,0.65)", dash="dash", width=1.3), row=1, col=1)
+    fig_track.add_hline(
+        y=SR_TARGET, line=dict(color="rgba(255,255,255,0.65)", dash="dash", width=1.3), row=1, col=1
+    )
 
     heat_x, heat_z = _binned_sr_error_by_distance(s_m, sr_mat, eval_mask)
     if heat_x.size:
@@ -690,7 +752,9 @@ def _tc_visual_figures(
         col=1,
     )
     if np.any(np.isfinite(torque_min)):
-        scaled_torque = np.clip(torque_min / max(torque_m := abs(np.nanmin(torque_min)), 1.0), -1.0, 0.0)
+        scaled_torque = np.clip(
+            torque_min / max(torque_m := abs(np.nanmin(torque_min)), 1.0), -1.0, 0.0
+        )
         fig_track.add_trace(
             go.Scattergl(
                 x=s_m[status_mask],
@@ -712,10 +776,20 @@ def _tc_visual_figures(
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
         height=820,
     )
-    fig_track.update_xaxes(title_text="Distance from start line [m]", row=3, col=1, gridcolor="rgba(128,128,128,0.2)")
-    fig_track.update_yaxes(title_text="Slip ratio [-]", row=1, col=1, range=[-0.05, 0.45], gridcolor="rgba(128,128,128,0.2)")
+    fig_track.update_xaxes(
+        title_text="Distance from start line [m]", row=3, col=1, gridcolor="rgba(128,128,128,0.2)"
+    )
+    fig_track.update_yaxes(
+        title_text="Slip ratio [-]",
+        row=1,
+        col=1,
+        range=[-0.05, 0.45],
+        gridcolor="rgba(128,128,128,0.2)",
+    )
     fig_track.update_yaxes(title_text="Wheel", row=2, col=1, gridcolor="rgba(128,128,128,0.2)")
-    fig_track.update_yaxes(title_text="State", row=3, col=1, range=[-1.05, 1.25], gridcolor="rgba(128,128,128,0.2)")
+    fig_track.update_yaxes(
+        title_text="State", row=3, col=1, range=[-1.05, 1.25], gridcolor="rgba(128,128,128,0.2)"
+    )
 
     fig_dist = make_dark_figure(
         title=f"SR distribution while TC armed at full throttle (target = +{SR_TARGET:.2f})",
@@ -727,17 +801,23 @@ def _tc_visual_figures(
         if s.size == 0:
             continue
         s = s[(s >= -0.5) & (s <= 0.8)]
-        fig_dist.add_trace(go.Histogram(
-            x=s,
-            name=w,
-            histnorm="probability density",
-            marker=dict(color=WHEEL_COLORS[w]),
-            opacity=0.55,
-            nbinsx=80,
-        ))
+        fig_dist.add_trace(
+            go.Histogram(
+                x=s,
+                name=w,
+                histnorm="probability density",
+                marker=dict(color=WHEEL_COLORS[w]),
+                opacity=0.55,
+                nbinsx=80,
+            )
+        )
     fig_dist.update_layout(barmode="overlay")
-    fig_dist.add_vrect(x0=under_thr, x1=over_thr, fillcolor="rgba(115, 217, 115, 0.10)", line_width=0)
-    fig_dist.add_vline(x=SR_TARGET, line=dict(color="rgba(255,255,255,0.6)", dash="dash", width=1.4))
+    fig_dist.add_vrect(
+        x0=under_thr, x1=over_thr, fillcolor="rgba(115, 217, 115, 0.10)", line_width=0
+    )
+    fig_dist.add_vline(
+        x=SR_TARGET, line=dict(color="rgba(255,255,255,0.6)", dash="dash", width=1.4)
+    )
 
     fig_scatter = make_dark_figure(
         title="Slip ratio vs longitudinal acceleration (TC armed at full throttle)",
@@ -751,14 +831,23 @@ def _tc_visual_figures(
             mask = (s >= -0.2) & (s <= 0.6) & np.isfinite(ax_eval)
             if not mask.any():
                 continue
-            fig_scatter.add_trace(go.Scattergl(
-                x=s[mask], y=ax_eval[mask],
-                mode="markers", name=w,
-                marker=dict(color=WHEEL_COLORS[w], size=4, opacity=0.45,
-                            symbol=WHEEL_SYMBOLS[w]),
-            ))
-        fig_scatter.add_vline(x=SR_TARGET, line=dict(color="rgba(255,255,255,0.6)", dash="dash", width=1.4))
-        fig_scatter.add_vrect(x0=under_thr, x1=over_thr, fillcolor="rgba(115, 217, 115, 0.08)", line_width=0)
+            fig_scatter.add_trace(
+                go.Scattergl(
+                    x=s[mask],
+                    y=ax_eval[mask],
+                    mode="markers",
+                    name=w,
+                    marker=dict(
+                        color=WHEEL_COLORS[w], size=4, opacity=0.45, symbol=WHEEL_SYMBOLS[w]
+                    ),
+                )
+            )
+        fig_scatter.add_vline(
+            x=SR_TARGET, line=dict(color="rgba(255,255,255,0.6)", dash="dash", width=1.4)
+        )
+        fig_scatter.add_vrect(
+            x0=under_thr, x1=over_thr, fillcolor="rgba(115, 217, 115, 0.08)", line_width=0
+        )
 
     return [fig_track, fig_dist, fig_scatter]
 
@@ -788,12 +877,14 @@ def _tc_objective_figures(
             vals = vals[np.isfinite(vals)]
             if vals.size == 0:
                 continue
-            event_rows.append({
-                "wheel": w,
-                "event": event_id,
-                "lap": lap,
-                "max_sr": float(np.nanmax(vals)),
-            })
+            event_rows.append(
+                {
+                    "wheel": w,
+                    "event": event_id,
+                    "lap": lap,
+                    "max_sr": float(np.nanmax(vals)),
+                }
+            )
 
     for w in WHEELS:
         wheel_rows = [row for row in event_rows if row["wheel"] == w]
@@ -802,25 +893,27 @@ def _tc_objective_figures(
         wheel_vals = np.array([float(row["max_sr"]) for row in wheel_rows], dtype=float)
         wheel_events = np.array([int(row["event"]) for row in wheel_rows], dtype=int)
         wheel_laps = np.array([int(row["lap"]) for row in wheel_rows], dtype=int)
-        fig_box.add_trace(go.Box(
-            x=np.full(wheel_vals.size, w),
-            y=wheel_vals,
-            name=w,
-            marker=dict(color=WHEEL_COLORS[w], size=5, opacity=0.45),
-            line=dict(color=WHEEL_COLORS[w]),
-            boxmean=True,
-            boxpoints="all",
-            jitter=0.28,
-            pointpos=0.0,
-            customdata=np.column_stack([wheel_events, wheel_laps]),
-            hovertemplate=(
-                "Wheel %{x}"
-                "<br>Max SR %{y:.3f}"
-                "<br>Event %{customdata[0]:.0f}"
-                "<br>Lap %{customdata[1]:.0f}"
-                "<extra></extra>"
-            ),
-        ))
+        fig_box.add_trace(
+            go.Box(
+                x=np.full(wheel_vals.size, w),
+                y=wheel_vals,
+                name=w,
+                marker=dict(color=WHEEL_COLORS[w], size=5, opacity=0.45),
+                line=dict(color=WHEEL_COLORS[w]),
+                boxmean=True,
+                boxpoints="all",
+                jitter=0.28,
+                pointpos=0.0,
+                customdata=np.column_stack([wheel_events, wheel_laps]),
+                hovertemplate=(
+                    "Wheel %{x}"
+                    "<br>Max SR %{y:.3f}"
+                    "<br>Event %{customdata[0]:.0f}"
+                    "<br>Lap %{customdata[1]:.0f}"
+                    "<extra></extra>"
+                ),
+            )
+        )
     fig_box.update_yaxes(range=[-0.02, 0.45])
     figs.append(fig_box)
 
@@ -841,7 +934,7 @@ def _tc_objective_figures(
 
     order = sorted(
         range(len(WHEELS)),
-        key=lambda i: (0.0 if np.isnan(in_pct[i]) else in_pct[i]),
+        key=lambda i: 0.0 if np.isnan(in_pct[i]) else in_pct[i],
     )
     wheels_ordered = [WHEELS[i] for i in order]
     low_ordered = [-(0.0 if np.isnan(low_pct[i]) else low_pct[i]) for i in order]
@@ -854,46 +947,55 @@ def _tc_objective_figures(
         xlabel="Evaluated samples [%]  (short ← 0 → over)",
         ylabel="Wheel",
     )
-    fig_split.add_trace(go.Bar(
-        x=low_ordered,
-        y=wheels_ordered,
-        orientation="h",
-        name=f"Short: SR < {under_thr:.2f}",
-        marker=dict(color="#4DB3F2"),
-        text=[f"{abs(v):.1f}%" for v in low_ordered],
-        textposition="inside",
-        insidetextanchor="middle",
-        hovertemplate="%{y}<br>Short: %{customdata:.1f}%<extra></extra>",
-        customdata=[abs(v) for v in low_ordered],
-    ))
-    fig_split.add_trace(go.Bar(
-        x=high_ordered,
-        y=wheels_ordered,
-        orientation="h",
-        name=f"Over: SR > {over_thr:.2f}",
-        marker=dict(color="#F27070"),
-        text=[f"{v:.1f}%" for v in high_ordered],
-        textposition="inside",
-        insidetextanchor="middle",
-        hovertemplate="%{y}<br>Over: %{x:.1f}%<extra></extra>",
-    ))
-    fig_split.add_trace(go.Bar(
-        x=[target_bar_width for _ in wheels_ordered],
-        y=wheels_ordered,
-        base=[-target_bar_width / 2.0 for _ in wheels_ordered],
-        orientation="h",
-        name=f"Target: {under_thr:.2f}-{over_thr:.2f}",
-        marker=dict(color="#73D973", line=dict(color="#141417", width=1)),
-        text=[f"{v:.1f}% target" for v in in_ordered],
-        textposition="outside",
-        textfont=dict(color="#73D973", size=11),
-        hovertemplate="%{y}<br>Target: %{customdata:.1f}%<extra></extra>",
-        customdata=in_ordered,
-    ))
+    fig_split.add_trace(
+        go.Bar(
+            x=low_ordered,
+            y=wheels_ordered,
+            orientation="h",
+            name=f"Short: SR < {under_thr:.2f}",
+            marker=dict(color="#4DB3F2"),
+            text=[f"{abs(v):.1f}%" for v in low_ordered],
+            textposition="inside",
+            insidetextanchor="middle",
+            hovertemplate="%{y}<br>Short: %{customdata:.1f}%<extra></extra>",
+            customdata=[abs(v) for v in low_ordered],
+        )
+    )
+    fig_split.add_trace(
+        go.Bar(
+            x=high_ordered,
+            y=wheels_ordered,
+            orientation="h",
+            name=f"Over: SR > {over_thr:.2f}",
+            marker=dict(color="#F27070"),
+            text=[f"{v:.1f}%" for v in high_ordered],
+            textposition="inside",
+            insidetextanchor="middle",
+            hovertemplate="%{y}<br>Over: %{x:.1f}%<extra></extra>",
+        )
+    )
+    fig_split.add_trace(
+        go.Bar(
+            x=[target_bar_width for _ in wheels_ordered],
+            y=wheels_ordered,
+            base=[-target_bar_width / 2.0 for _ in wheels_ordered],
+            orientation="h",
+            name=f"Target: {under_thr:.2f}-{over_thr:.2f}",
+            marker=dict(color="#73D973", line=dict(color="#141417", width=1)),
+            text=[f"{v:.1f}% target" for v in in_ordered],
+            textposition="outside",
+            textfont=dict(color="#73D973", size=11),
+            hovertemplate="%{y}<br>Target: %{customdata:.1f}%<extra></extra>",
+            customdata=in_ordered,
+        )
+    )
     fig_split.add_vline(x=0.0, line=dict(color="rgba(235,235,235,0.65)", width=1.2))
     fig_split.update_layout(barmode="relative", height=430)
-    fig_split.update_xaxes(range=[-100, 100], tickvals=[-100, -75, -50, -25, 0, 25, 50, 75, 100],
-                           ticktext=["100", "75", "50", "25", "0", "25", "50", "75", "100"])
+    fig_split.update_xaxes(
+        range=[-100, 100],
+        tickvals=[-100, -75, -50, -25, 0, 25, 50, 75, 100],
+        ticktext=["100", "75", "50", "25", "0", "25", "50", "75", "100"],
+    )
     figs.append(fig_split)
 
     return figs
@@ -959,43 +1061,56 @@ def _tc_control_diagnostic_figures(
         p25 = np.nanpercentile(mat, 25.0, axis=0)
         p50 = np.nanpercentile(mat, 50.0, axis=0)
         p75 = np.nanpercentile(mat, 75.0, axis=0)
-        fig_response.add_trace(go.Scatter(
-            x=np.r_[grid, grid[::-1]],
-            y=np.r_[p75, p25[::-1]],
-            fill="toself",
-            fillcolor="rgba(77,179,242,0.18)",
-            line=dict(color="rgba(77,179,242,0.0)"),
-            name="P25-P75 SR",
-            hoverinfo="skip",
-        ))
-        fig_response.add_trace(go.Scatter(
-            x=grid,
-            y=p50,
-            mode="lines",
-            name=f"Median worst SR ({len(traces)} events)",
-            line=dict(color="#EBEBEB", width=2.4),
-            hovertemplate="t %{x:+.2f}s<br>median worst SR %{y:.3f}<extra></extra>",
-        ))
+        fig_response.add_trace(
+            go.Scatter(
+                x=np.r_[grid, grid[::-1]],
+                y=np.r_[p75, p25[::-1]],
+                fill="toself",
+                fillcolor="rgba(77,179,242,0.18)",
+                line=dict(color="rgba(77,179,242,0.0)"),
+                name="P25-P75 SR",
+                hoverinfo="skip",
+            )
+        )
+        fig_response.add_trace(
+            go.Scatter(
+                x=grid,
+                y=p50,
+                mode="lines",
+                name=f"Median worst SR ({len(traces)} events)",
+                line=dict(color="#EBEBEB", width=2.4),
+                hovertemplate="t %{x:+.2f}s<br>median worst SR %{y:.3f}<extra></extra>",
+            )
+        )
         if cut_traces:
             cut_med = np.nanmedian(np.vstack(cut_traces), axis=0)
-            fig_response.add_trace(go.Scatter(
-                x=grid,
-                y=under_thr + cut_med * (over_thr - under_thr),
-                mode="lines",
-                name="TC cut active (scaled)",
-                line=dict(color="#F28C40", width=1.6, dash="dot"),
-                hovertemplate="t %{x:+.2f}s<br>TC cut scaled %{text}<extra></extra>",
-                text=[f"{v:.0%}" for v in cut_med],
-            ))
+            fig_response.add_trace(
+                go.Scatter(
+                    x=grid,
+                    y=under_thr + cut_med * (over_thr - under_thr),
+                    mode="lines",
+                    name="TC cut active (scaled)",
+                    line=dict(color="#F28C40", width=1.6, dash="dot"),
+                    hovertemplate="t %{x:+.2f}s<br>TC cut scaled %{text}<extra></extra>",
+                    text=[f"{v:.0%}" for v in cut_med],
+                )
+            )
     else:
         fig_response.add_annotation(
-            x=0.5, y=0.5, xref="paper", yref="paper",
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
             text="No SR > 0.25 events in the evaluated TC window",
             showarrow=False,
             font=dict(color="#EBEBEB", size=13),
         )
-    fig_response.add_hrect(y0=under_thr, y1=over_thr, fillcolor="rgba(115,217,115,0.12)", line_width=0)
-    fig_response.add_hline(y=SR_TARGET, line=dict(color="rgba(255,255,255,0.65)", dash="dash", width=1.3))
+    fig_response.add_hrect(
+        y0=under_thr, y1=over_thr, fillcolor="rgba(115,217,115,0.12)", line_width=0
+    )
+    fig_response.add_hline(
+        y=SR_TARGET, line=dict(color="rgba(255,255,255,0.65)", dash="dash", width=1.3)
+    )
     fig_response.add_vline(x=0.0, line=dict(color="rgba(242,112,112,0.65)", dash="dash", width=1.3))
     fig_response.update_yaxes(range=[-0.02, 0.45])
     figs.append(fig_response)
@@ -1013,16 +1128,24 @@ def _tc_control_diagnostic_figures(
             mask = np.isfinite(torque) & np.isfinite(slip)
             if not mask.any():
                 continue
-            fig_torque.add_trace(go.Scattergl(
-                x=slip[mask],
-                y=torque[mask],
-                mode="markers",
-                name=w,
-                marker=dict(color=WHEEL_COLORS[w], size=4, opacity=0.35, symbol=WHEEL_SYMBOLS[w]),
-                hovertemplate=f"{w}<br>SR %{{x:.3f}}<br>Torque %{{y:.1f}} Nm<extra></extra>",
-            ))
-        fig_torque.add_vrect(x0=under_thr, x1=over_thr, fillcolor="rgba(115,217,115,0.10)", line_width=0)
-        fig_torque.add_vline(x=SR_TARGET, line=dict(color="rgba(255,255,255,0.65)", dash="dash", width=1.3))
+            fig_torque.add_trace(
+                go.Scattergl(
+                    x=slip[mask],
+                    y=torque[mask],
+                    mode="markers",
+                    name=w,
+                    marker=dict(
+                        color=WHEEL_COLORS[w], size=4, opacity=0.35, symbol=WHEEL_SYMBOLS[w]
+                    ),
+                    hovertemplate=f"{w}<br>SR %{{x:.3f}}<br>Torque %{{y:.1f}} Nm<extra></extra>",
+                )
+            )
+        fig_torque.add_vrect(
+            x0=under_thr, x1=over_thr, fillcolor="rgba(115,217,115,0.10)", line_width=0
+        )
+        fig_torque.add_vline(
+            x=SR_TARGET, line=dict(color="rgba(255,255,255,0.65)", dash="dash", width=1.3)
+        )
         fig_torque.update_xaxes(range=[-0.08, 0.45])
         figs.append(fig_torque)
 
@@ -1097,9 +1220,7 @@ def tc_function_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
     sr_max_eval = np.nanmax(sr_eval, axis=1) if sr_eval.size else np.array([], dtype=float)
     sr_min_eval = np.nanmin(sr_eval, axis=1) if sr_eval.size else np.array([], dtype=float)
     abs_err_eval = np.abs(sr_eval - SR_TARGET) if sr_eval.size else np.array([], dtype=float)
-    median_sr_error = (
-        float(np.nanmedian(sr_mean_eval - SR_TARGET)) if sr_mean_eval.size else np.nan
-    )
+    median_sr_error = float(np.nanmedian(sr_mean_eval - SR_TARGET)) if sr_mean_eval.size else np.nan
     median_sr = float(np.nanmedian(sr_eval)) if sr_eval.size else np.nan
     median_abs_error = float(np.nanmedian(abs_err_eval)) if abs_err_eval.size else np.nan
     target_gap_pct = (
@@ -1108,9 +1229,15 @@ def tc_function_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
         else np.nan
     )
     p90_abs_error = float(np.nanpercentile(abs_err_eval, 90.0)) if abs_err_eval.size else np.nan
-    pct_any_overslip = float((sr_max_eval > over_thr).mean() * 100.0) if sr_max_eval.size else np.nan
-    pct_any_underslip = float((sr_min_eval < under_thr).mean() * 100.0) if sr_min_eval.size else np.nan
-    pct_all_underslip = float(np.all(sr_eval < under_thr, axis=1).mean() * 100.0) if sr_eval.size else np.nan
+    pct_any_overslip = (
+        float((sr_max_eval > over_thr).mean() * 100.0) if sr_max_eval.size else np.nan
+    )
+    pct_any_underslip = (
+        float((sr_min_eval < under_thr).mean() * 100.0) if sr_min_eval.size else np.nan
+    )
+    pct_all_underslip = (
+        float(np.all(sr_eval < under_thr, axis=1).mean() * 100.0) if sr_eval.size else np.nan
+    )
     pct_tc_needed = pct_any_overslip
     p95_worst_sr = float(np.nanpercentile(sr_max_eval, 95.0)) if sr_max_eval.size else np.nan
     median_wheel_spread = float(np.nanmedian(sr_max_eval - sr_min_eval)) if sr_eval.size else np.nan
@@ -1169,16 +1296,15 @@ def tc_function_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
         failure_mode = "Mixed / unstable"
     else:
         failure_mode = "On target"
-    tc_action_seen = bool(
-        np.isfinite(pct_cut_when_overslip)
-        and pct_cut_when_overslip > 0.0
-    )
+    tc_action_seen = bool(np.isfinite(pct_cut_when_overslip) and pct_cut_when_overslip > 0.0)
 
     notes: list[str] = []
     if not used_tc_enable_signal:
         notes.append("TCenable not found; using throttle/ax/vx heuristic as TC armed mask.")
     if not eval_mask.any():
-        notes.append("No samples with full-throttle acceleration and TC armed after excluding lap 0 and the last lap.")
+        notes.append(
+            "No samples with full-throttle acceleration and TC armed after excluding lap 0 and the last lap."
+        )
     command_active = bool(
         present_torque_cols
         and eval_mask.any()
@@ -1268,11 +1394,7 @@ def _median_first_after(
     latencies: list[float] = []
     for idx in starts:
         t0 = time_s[idx]
-        win = np.flatnonzero(
-            response_mask
-            & (time_s >= t0)
-            & (time_s <= t0 + max_latency_s)
-        )
+        win = np.flatnonzero(response_mask & (time_s >= t0) & (time_s <= t0 + max_latency_s))
         if win.size:
             latencies.append(float(time_s[win[0]] - t0))
     return float(np.nanmedian(latencies) * 1000.0) if latencies else np.nan
@@ -1312,15 +1434,13 @@ def tc_control_impact_figs_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict
         & (np.abs(d["vx"]) >= MIN_SPEED)
     )
 
-    tc_torque = np.stack([
-        series_or_nan(df_eff, TC_TORQUE_ALIASES[w]) for w in WHEELS
-    ], axis=1)
-    master_torque = np.stack([
-        series_or_nan(df_eff, MASTER_TORQUE_ALIASES[w]) for w in WHEELS
-    ], axis=1)
-    actual_torque = np.stack([
-        series_or_nan(df_eff, ACTUAL_TORQUE_ALIASES[w]) for w in WHEELS
-    ], axis=1)
+    tc_torque = np.stack([series_or_nan(df_eff, TC_TORQUE_ALIASES[w]) for w in WHEELS], axis=1)
+    master_torque = np.stack(
+        [series_or_nan(df_eff, MASTER_TORQUE_ALIASES[w]) for w in WHEELS], axis=1
+    )
+    actual_torque = np.stack(
+        [series_or_nan(df_eff, ACTUAL_TORQUE_ALIASES[w]) for w in WHEELS], axis=1
+    )
     tc_cut = np.minimum(tc_torque, 0.0)
     cut_active = np.any(tc_cut < -1.0e-6, axis=1)
     cut_total_nm = -np.nansum(tc_cut, axis=1)
@@ -1348,11 +1468,11 @@ def tc_control_impact_figs_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict
     ax_no_cut = d["ax"][no_cut_eval]
     ax_penalty = (
         float(np.nanmedian(ax_no_cut) - np.nanmedian(ax_cut))
-        if ax_cut.size and ax_no_cut.size else np.nan
+        if ax_cut.size and ax_no_cut.size
+        else np.nan
     )
     cut_without_overslip_pct = (
-        float(np.nanmean((worst_sr[cut_eval] <= over_thr)) * 100.0)
-        if cut_eval.any() else np.nan
+        float(np.nanmean((worst_sr[cut_eval] <= over_thr)) * 100.0) if cut_eval.any() else np.nan
     )
     overslip_excess = np.clip(worst_sr - over_thr, 0.0, None)
     cut_starts = np.flatnonzero(cut_active & ~np.r_[False, cut_active[:-1]])
@@ -1361,9 +1481,15 @@ def tc_control_impact_figs_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict
         pre = (time_s >= time_s[idx] - 0.25) & (time_s < time_s[idx])
         post = (time_s >= time_s[idx]) & (time_s <= time_s[idx] + 0.35)
         if pre.sum() >= 3 and post.sum() >= 3:
-            ax_delta_after_cut.append(float(np.nanmedian(d["ax"][post]) - np.nanmedian(d["ax"][pre])))
-    recovery_time_ms = float(np.nanmedian(recovery_times_s) * 1000.0) if recovery_times_s else np.nan
-    pct_events_with_cut = float(events_with_cut / len(overslip_starts) * 100.0) if len(overslip_starts) else np.nan
+            ax_delta_after_cut.append(
+                float(np.nanmedian(d["ax"][post]) - np.nanmedian(d["ax"][pre]))
+            )
+    recovery_time_ms = (
+        float(np.nanmedian(recovery_times_s) * 1000.0) if recovery_times_s else np.nan
+    )
+    pct_events_with_cut = (
+        float(events_with_cut / len(overslip_starts) * 100.0) if len(overslip_starts) else np.nan
+    )
 
     fig = make_subplots(
         rows=3,
@@ -1373,22 +1499,62 @@ def tc_control_impact_figs_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict
         subplot_titles=("Worst-wheel SR", "Longitudinal acceleration", "TC cut applied"),
     )
     order = np.argsort(dist_m)
-    fig.add_trace(go.Scattergl(
-        x=dist_m[order], y=worst_sr[order], mode="markers", name="Worst SR",
-        marker=dict(color=cut_total_nm[order], colorscale="Turbo", size=3, opacity=0.50, colorbar=dict(title="Cut [Nm]")),
-    ), row=1, col=1)
-    fig.add_hrect(y0=under_thr, y1=over_thr, fillcolor="rgba(115,217,115,0.12)", line_width=0, row=1, col=1)
-    fig.add_hline(y=SR_TARGET, line=dict(color="rgba(255,255,255,0.65)", dash="dash", width=1.2), row=1, col=1)
-    fig.add_trace(go.Scattergl(
-        x=dist_m[order], y=d["ax"][order], mode="markers", name="ax",
-        marker=dict(color=worst_sr[order], colorscale="RdYlGn_r", size=3, opacity=0.50, colorbar=dict(title="Worst SR")),
-    ), row=2, col=1)
-    fig.add_trace(go.Scattergl(
-        x=dist_m[order], y=cut_total_nm[order], mode="markers", name="TC cut",
-        marker=dict(color="#F28C40", size=3, opacity=0.55),
-    ), row=3, col=1)
+    fig.add_trace(
+        go.Scattergl(
+            x=dist_m[order],
+            y=worst_sr[order],
+            mode="markers",
+            name="Worst SR",
+            marker=dict(
+                color=cut_total_nm[order],
+                colorscale="Turbo",
+                size=3,
+                opacity=0.50,
+                colorbar=dict(title="Cut [Nm]"),
+            ),
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_hrect(
+        y0=under_thr, y1=over_thr, fillcolor="rgba(115,217,115,0.12)", line_width=0, row=1, col=1
+    )
+    fig.add_hline(
+        y=SR_TARGET, line=dict(color="rgba(255,255,255,0.65)", dash="dash", width=1.2), row=1, col=1
+    )
+    fig.add_trace(
+        go.Scattergl(
+            x=dist_m[order],
+            y=d["ax"][order],
+            mode="markers",
+            name="ax",
+            marker=dict(
+                color=worst_sr[order],
+                colorscale="RdYlGn_r",
+                size=3,
+                opacity=0.50,
+                colorbar=dict(title="Worst SR"),
+            ),
+        ),
+        row=2,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scattergl(
+            x=dist_m[order],
+            y=cut_total_nm[order],
+            mode="markers",
+            name="TC cut",
+            marker=dict(color="#F28C40", size=3, opacity=0.55),
+        ),
+        row=3,
+        col=1,
+    )
     fig.update_layout(
-        title=dict(text="TC: overslip recovery versus acceleration penalty", font=dict(size=14, color="#EBEBEB")),
+        title=dict(
+            text="TC: overslip recovery versus acceleration penalty",
+            font=dict(size=14, color="#EBEBEB"),
+        ),
         paper_bgcolor="#141417",
         plot_bgcolor="#141417",
         font=dict(color="#EBEBEB", size=11),
@@ -1407,21 +1573,43 @@ def tc_control_impact_figs_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict
         subplot_titles=("Slip error vs acceleration", "TC cut vs acceleration"),
     )
     rel_mask = eval_mask & np.isfinite(slip_error) & np.isfinite(d["ax"])
-    fig_rel.add_trace(go.Scattergl(
-        x=slip_error[rel_mask],
-        y=d["ax"][rel_mask],
-        mode="markers",
-        name="Slip -> ax",
-        marker=dict(color=cut_total_nm[rel_mask], colorscale="Turbo", size=4, opacity=0.45, colorbar=dict(title="Cut")),
-    ), row=1, col=1)
-    fig_rel.add_trace(go.Scattergl(
-        x=cut_total_nm[rel_mask],
-        y=d["ax"][rel_mask],
-        mode="markers",
-        name="Cut -> ax",
-        marker=dict(color=worst_sr[rel_mask], colorscale="RdYlGn_r", size=4, opacity=0.45, colorbar=dict(title="SR")),
-    ), row=1, col=2)
-    fig_rel.add_vline(x=DELTA_SR, line=dict(color="rgba(235,235,235,0.5)", dash="dash", width=1.0), row=1, col=1)
+    fig_rel.add_trace(
+        go.Scattergl(
+            x=slip_error[rel_mask],
+            y=d["ax"][rel_mask],
+            mode="markers",
+            name="Slip -> ax",
+            marker=dict(
+                color=cut_total_nm[rel_mask],
+                colorscale="Turbo",
+                size=4,
+                opacity=0.45,
+                colorbar=dict(title="Cut"),
+            ),
+        ),
+        row=1,
+        col=1,
+    )
+    fig_rel.add_trace(
+        go.Scattergl(
+            x=cut_total_nm[rel_mask],
+            y=d["ax"][rel_mask],
+            mode="markers",
+            name="Cut -> ax",
+            marker=dict(
+                color=worst_sr[rel_mask],
+                colorscale="RdYlGn_r",
+                size=4,
+                opacity=0.45,
+                colorbar=dict(title="SR"),
+            ),
+        ),
+        row=1,
+        col=2,
+    )
+    fig_rel.add_vline(
+        x=DELTA_SR, line=dict(color="rgba(235,235,235,0.5)", dash="dash", width=1.0), row=1, col=1
+    )
     fig_rel.update_layout(
         title=dict(text="TC variable relationships", font=dict(size=14, color="#EBEBEB")),
         paper_bgcolor="#141417",
@@ -1430,7 +1618,9 @@ def tc_control_impact_figs_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict
         height=520,
         legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="left", x=0.0),
     )
-    fig_rel.update_xaxes(title_text="Worst SR - target [-]", row=1, col=1, gridcolor="rgba(128,128,128,0.2)")
+    fig_rel.update_xaxes(
+        title_text="Worst SR - target [-]", row=1, col=1, gridcolor="rgba(128,128,128,0.2)"
+    )
     fig_rel.update_yaxes(title_text="ax [m/s²]", row=1, col=1, gridcolor="rgba(128,128,128,0.2)")
     fig_rel.update_xaxes(title_text="TC cut [Nm]", row=1, col=2, gridcolor="rgba(128,128,128,0.2)")
     fig_rel.update_yaxes(title_text="ax [m/s²]", row=1, col=2, gridcolor="rgba(128,128,128,0.2)")
@@ -1445,28 +1635,49 @@ def tc_control_impact_figs_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict
         lap_no_cut = lm & no_cut_eval
         lap_ax_penalty = (
             float(np.nanmedian(d["ax"][lap_no_cut]) - np.nanmedian(d["ax"][lap_cut]))
-            if lap_cut.any() and lap_no_cut.any() else np.nan
+            if lap_cut.any() and lap_no_cut.any()
+            else np.nan
         )
-        lap_rows.append({
-            "Lap": int(lap),
-            "TC samples": int(lem.sum()),
-            "Overslip [%]": round(float(np.nanmean(worst_sr[lem] > over_thr) * 100.0), 1),
-            "Mean SR excess": round(float(np.nanmean(overslip_excess[lem])), 4),
-            "Cut without overslip [%]": round(float(np.nanmean(worst_sr[lap_cut] <= over_thr) * 100.0), 1) if lap_cut.any() else np.nan,
-            "ax penalty cut [m/s²]": round(lap_ax_penalty, 3) if np.isfinite(lap_ax_penalty) else np.nan,
-            "Mean ax [m/s²]": round(float(np.nanmean(d["ax"][lem])), 3),
-            "Actual/Master lag [Nm]": round(float(np.nanmean(np.abs(actual_total[lem] - master_total[lem]))), 2),
-        })
+        lap_rows.append(
+            {
+                "Lap": int(lap),
+                "TC samples": int(lem.sum()),
+                "Overslip [%]": round(float(np.nanmean(worst_sr[lem] > over_thr) * 100.0), 1),
+                "Mean SR excess": round(float(np.nanmean(overslip_excess[lem])), 4),
+                "Cut without overslip [%]": round(
+                    float(np.nanmean(worst_sr[lap_cut] <= over_thr) * 100.0), 1
+                )
+                if lap_cut.any()
+                else np.nan,
+                "ax penalty cut [m/s²]": round(lap_ax_penalty, 3)
+                if np.isfinite(lap_ax_penalty)
+                else np.nan,
+                "Mean ax [m/s²]": round(float(np.nanmean(d["ax"][lem])), 3),
+                "Actual/Master lag [Nm]": round(
+                    float(np.nanmean(np.abs(actual_total[lem] - master_total[lem]))), 2
+                ),
+            }
+        )
 
     kpis = {
-        "overslip_pct": float(np.nanmean(overslip[eval_mask]) * 100.0) if eval_mask.any() else np.nan,
-        "mean_sr_excess": float(np.nanmean(overslip_excess[eval_mask])) if eval_mask.any() else np.nan,
+        "overslip_pct": float(np.nanmean(overslip[eval_mask]) * 100.0)
+        if eval_mask.any()
+        else np.nan,
+        "mean_sr_excess": float(np.nanmean(overslip_excess[eval_mask]))
+        if eval_mask.any()
+        else np.nan,
         "recovery_time_ms": recovery_time_ms,
         "pct_events_with_cut": pct_events_with_cut,
         "cut_without_overslip_pct": cut_without_overslip_pct,
         "ax_penalty_cut_ms2": ax_penalty,
-        "ax_delta_after_cut_ms2": float(np.nanmedian(ax_delta_after_cut)) if ax_delta_after_cut else np.nan,
-        "actual_master_mae_nm": float(np.nanmean(np.abs(actual_total[eval_mask] - master_total[eval_mask]))) if eval_mask.any() else np.nan,
+        "ax_delta_after_cut_ms2": float(np.nanmedian(ax_delta_after_cut))
+        if ax_delta_after_cut
+        else np.nan,
+        "actual_master_mae_nm": float(
+            np.nanmean(np.abs(actual_total[eval_mask] - master_total[eval_mask]))
+        )
+        if eval_mask.any()
+        else np.nan,
         "eval_samples": int(eval_mask.sum()),
         "table": pl.DataFrame(lap_rows) if lap_rows else pl.DataFrame(),
         "warnings": [],

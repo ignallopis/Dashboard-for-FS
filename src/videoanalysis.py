@@ -1,4 +1,5 @@
 """Video analysis helpers — onboard video synced with telemetry charts."""
+
 from __future__ import annotations
 
 import json
@@ -403,7 +404,9 @@ def _phase_stats_payload(
                 "throttle_pct": round(100.0 * float((phase == "ACCELERATING").sum()) / n_valid, 1),
                 "braking_pct": round(100.0 * float((phase == "BRAKING").sum()) / n_valid, 1),
                 "coasting_pct": round(100.0 * float((phase == "COASTING").sum()) / n_valid, 1),
-                "plausibility_pct": round(100.0 * float((phase == "PLAUSIBILITY").sum()) / n_valid, 1),
+                "plausibility_pct": round(
+                    100.0 * float((phase == "PLAUSIBILITY").sum()) / n_valid, 1
+                ),
             }
         )
 
@@ -449,14 +452,9 @@ def build_video_payload(
 
     available_columns = set(df.columns)
     signal_specs = [
-        spec
-        for spec in _SIGNAL_SPECS
-        if _signal_column_name(spec, available_columns) is not None
+        spec for spec in _SIGNAL_SPECS if _signal_column_name(spec, available_columns) is not None
     ]
-    signal_arrays = {
-        str(spec["key"]): _signal_values_from_df(df, spec)
-        for spec in signal_specs
-    }
+    signal_arrays = {str(spec["key"]): _signal_values_from_df(df, spec) for spec in signal_specs}
 
     cols = cols_to_numpy(df, ["TimeStamp", "laps", "laptime", "VN_latitude", "VN_longitude"])
     t_global_raw = cols["TimeStamp"]
@@ -556,8 +554,7 @@ def build_video_payload(
             phase_names = drv._classify_phases(thr_map, brk_map)
             map_idx = _downsample_indices(len(t_map), MAP_DOWNSAMPLE_HZ)
             phase_codes = [
-                int(_PHASE_CODE_BY_NAME[str(phase_name)])
-                for phase_name in phase_names[map_idx]
+                int(_PHASE_CODE_BY_NAME[str(phase_name)]) for phase_name in phase_names[map_idx]
             ]
         else:
             t_map = np.array([], dtype=float)
@@ -643,7 +640,8 @@ def build_video_component_html(
 
     media_html = (
         f'<video id="vid_{component_id}" controls preload="metadata" playsinline></video>'
-        if has_video else '<div class="media_placeholder">No onboard video loaded.</div>'
+        if has_video
+        else '<div class="media_placeholder">No onboard video loaded.</div>'
     )
     top_row_height_px = max(280, int(height_px * 0.42))
     chart_height_px = max(360, height_px - top_row_height_px - 86)
@@ -809,17 +807,17 @@ def build_video_component_html(
   const SIGNAL_BY_KEY = Object.fromEntries(SIGNAL_LIBRARY.map(signal => [signal.key, signal]));
   const DEFAULT_SIGNAL_KEYS = Array.isArray(PAYLOAD.default_signal_keys) ? PAYLOAD.default_signal_keys : [];
   const PHASES = [
-    {{ code:0, key:"ACCELERATING", label:"Accelerating", color:"{drv.MAP_PHASE_COLORS['ACCELERATING']}" }},
-    {{ code:1, key:"BRAKING", label:"Braking", color:"{drv.MAP_PHASE_COLORS['BRAKING']}" }},
-    {{ code:2, key:"COASTING", label:"Coasting", color:"{drv.MAP_PHASE_COLORS['COASTING']}" }},
-    {{ code:3, key:"PLAUSIBILITY", label:"Plausibility", color:"{drv.MAP_PHASE_COLORS['PLAUSIBILITY']}" }},
+    {{ code:0, key:"ACCELERATING", label:"Accelerating", color:"{drv.MAP_PHASE_COLORS["ACCELERATING"]}" }},
+    {{ code:1, key:"BRAKING", label:"Braking", color:"{drv.MAP_PHASE_COLORS["BRAKING"]}" }},
+    {{ code:2, key:"COASTING", label:"Coasting", color:"{drv.MAP_PHASE_COLORS["COASTING"]}" }},
+    {{ code:3, key:"PLAUSIBILITY", label:"Plausibility", color:"{drv.MAP_PHASE_COLORS["PLAUSIBILITY"]}" }},
   ];
   const PHASE_STATS_COLUMNS = [
     {{ key: "laptime_s", label: "LapTime [s]", color: "rgba(130, 60, 180, 0.92)", decimals: 2 }},
-    {{ key: "throttle_pct", label: "Throttle [%]", color: "{drv.MAP_PHASE_COLORS['ACCELERATING']}", decimals: 1 }},
-    {{ key: "braking_pct", label: "Braking [%]", color: "{drv.MAP_PHASE_COLORS['BRAKING']}", decimals: 1 }},
-    {{ key: "coasting_pct", label: "Coasting [%]", color: "{drv.MAP_PHASE_COLORS['COASTING']}", decimals: 1 }},
-    {{ key: "plausibility_pct", label: "Plausability [%]", color: "{drv.MAP_PHASE_COLORS['PLAUSIBILITY']}", textColor: "#111111", decimals: 1 }},
+    {{ key: "throttle_pct", label: "Throttle [%]", color: "{drv.MAP_PHASE_COLORS["ACCELERATING"]}", decimals: 1 }},
+    {{ key: "braking_pct", label: "Braking [%]", color: "{drv.MAP_PHASE_COLORS["BRAKING"]}", decimals: 1 }},
+    {{ key: "coasting_pct", label: "Coasting [%]", color: "{drv.MAP_PHASE_COLORS["COASTING"]}", decimals: 1 }},
+    {{ key: "plausibility_pct", label: "Plausability [%]", color: "{drv.MAP_PHASE_COLORS["PLAUSIBILITY"]}", textColor: "#111111", decimals: 1 }},
   ];
   const COMPARE_PHASE_COLORS = {{
     ACCELERATING: "#81C784",
