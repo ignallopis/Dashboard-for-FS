@@ -1737,6 +1737,7 @@ def accel_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     warnings: list[str] = []
     runs: dict[str, dict[str, float]] = {}
     all_ax_g: list[float] = []
+    crossover_mps = MAX_POWER_W / (MASS_KG * MU_TIRE * G_MPS2)
     for idx, (run_name, df_in) in enumerate(dfs.items()):
         df = ensure_complete_laps_df(df_in)
         missing = [c for c in required if c not in df.columns]
@@ -1782,8 +1783,29 @@ def accel_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
                     hovertemplate="vx=%{x:.1f} m/s<br>P95=%{y:.2f} g<extra></extra>",
                 )
             )
+        # Robust peak = max of the per-bin P95 envelope (capability, not the
+        # pooled P95 which is contaminated by how often the driver pushes).
+        env_valid = np.isfinite(p95_g)
+        peak_ax_g = float(np.nanmax(p95_g[env_valid])) if env_valid.any() else float("nan")
+        # Limiting-regime split (grip vs power) over the accel samples.
+        fx_tire_n, _fx_torque_n, fx_power_n, _fx_max_n = _accel_envelope_curves(vx_m)
+        pct_grip = float(np.nanmean(fx_tire_n <= fx_power_n) * 100.0)
+        # Traction efficiency: how close the envelope gets to the aero-scaled tyre
+        # grip limit in the grip-limited regime (bin centre < crossover). Reuses the
+        # envelope line; max across grip-zone bins = capability, not average effort.
+        grip_bins = env_valid & (centers < crossover_mps)
+        eff_pct = float("nan")
+        n_eff_bins = int(grip_bins.sum())
+        if grip_bins.any():
+            aero_down = 0.5 * RHO_AIR_KGM3 * (centers[grip_bins] ** 2) * abs(CL_AERO) * A_AERO_M2
+            grip_limit_g = MU_TIRE * (1.0 + aero_down / (MASS_KG * G_MPS2))
+            eff_pct = float(np.nanmax(p95_g[grip_bins] / grip_limit_g) * 100.0)
         runs[run_name] = {
-            "peak_ax_g": float(np.nanmax(ax_g_m)),
+            "peak_ax_g": peak_ax_g,
+            "pct_grip_limited": pct_grip,
+            "pct_power_limited": 100.0 - pct_grip,
+            "traction_efficiency_grip_pct": eff_pct,
+            "efficiency_bins": n_eff_bins,
             "samples": int(m.sum()),
         }
     # Reference curves — power limit clipped to grip limit to keep y-axis sane
@@ -1792,7 +1814,6 @@ def accel_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     power_g_clipped = np.minimum(
         power_g, MU_TIRE * 1.05
     )  # clip for display; crossover is the key feature
-    crossover_mps = MAX_POWER_W / (MASS_KG * MU_TIRE * G_MPS2)
     fig.add_trace(
         go.Scatter(
             x=v_grid,
