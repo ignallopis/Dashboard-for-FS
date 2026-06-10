@@ -136,6 +136,18 @@ METRIC_HELP: dict[str, str] = {
     "Raising avg end [g]": "Final cumulative mean of Max Braking G across laps. Useful to compare runs without overreacting to one lap.",
     "Best lap": "Lap with the most negative Max Braking G in the selected laps.",
     "Mean brake samples": "Average count of braking samples per lap behind the Max Braking G metric.",
+    "Front brake bias": "Median front share of total braking force (Est_FX). Compare to the ideal load-transfer line: above = front-biased, below = rear over-braked.",
+    "Bias error vs ideal": "Median (measured front share - ideal front share). Negative = rear doing more braking than ideal.",
+    "Rear-overbraked %": "Share of braking samples where the front share is below the ideal - the rear is carrying more than its grip-proportional load (lock-up-prone).",
+    "Front load (static)": "Front vertical-load share at low decel (approx static). ~0.50 for this 50/50 car.",
+    "Front load (peak)": "Front vertical-load share in the hardest-braking bin - how far load migrates forward.",
+    "Transfer deficit": "Median (measured - rigid-body) front load share, in points. Negative = the car transfers less than textbook (anti-dive / suspension compliance).",
+    "Brake util front": "Median front-axle brake grip utilisation |Fx|/(mu*Fz). 1.0 = at the longitudinal grip limit.",
+    "Brake util rear": "Median rear-axle brake grip utilisation |Fx|/(mu*Fz). 1.0 = at the longitudinal grip limit.",
+    "Limiting axle (brake)": "Axle whose P95 brake utilisation is higher - the end closest to locking under braking.",
+    "Brake slip front": "Median front-axle braking slip ratio (Est_SR). More negative = more slip; -0.20 optimal, -0.30 lock-up onset.",
+    "Brake slip rear": "Median rear-axle braking slip ratio (Est_SR). More negative = more slip.",
+    "Axle nearer lock-up": "Axle whose P5 braking slip is more negative - the end kinematically closest to lock-up.",
     # Dynamics · acceleration force balance
     "Peak accel [g]": "Peak longitudinal acceleration [g].",
     # Dynamics · setup (LLTD)
@@ -325,8 +337,12 @@ def _clear_data_caches() -> None:
         _pt_power_per_wheel_fig_cached,
         _pt_battery_status_fig_cached,
         _pt_thermal_evolution_fig_cached,
-        _dyn_ideal_braking_curve_fig_cached,
         _dyn_decel_envelope_fig_cached,
+        _dyn_brake_balance_fig_cached,
+        _dyn_brake_load_transfer_fig_cached,
+        _dyn_axle_brake_utilisation_fig_cached,
+        _dyn_axle_brake_slip_fig_cached,
+        _driver_max_braking_g_per_lap_fig_cached,
         _skidpad_fig_cached,
         _accel_fig_cached,
         _dyn_ideal_traction_curve_fig_cached,
@@ -1948,15 +1964,6 @@ def _pt_thermal_evolution_fig_cached(
 
 
 @st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
-def _dyn_ideal_braking_curve_fig_cached(
-    dfs: dict[str, pl.DataFrame],
-    run_tokens: tuple[tuple[str, FileSignature, str], ...],
-) -> tuple[go.Figure, dict]:
-    _ = run_tokens
-    return dyn.ideal_braking_curve_fig(dfs)
-
-
-@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
 def _dyn_decel_envelope_fig_cached(
     dfs: dict[str, pl.DataFrame],
     run_tokens: tuple[tuple[str, FileSignature, str], ...],
@@ -1966,12 +1973,48 @@ def _dyn_decel_envelope_fig_cached(
 
 
 @st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
-def _dyn_max_braking_g_per_lap_fig_cached(
+def _dyn_brake_balance_fig_cached(
     dfs: dict[str, pl.DataFrame],
     run_tokens: tuple[tuple[str, FileSignature, str], ...],
 ) -> tuple[go.Figure, dict]:
     _ = run_tokens
-    return dyn.max_braking_g_per_lap_fig(dfs)
+    return dyn.brake_balance_fig(dfs)
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _dyn_brake_load_transfer_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+) -> tuple[go.Figure, dict]:
+    _ = run_tokens
+    return dyn.brake_load_transfer_fig(dfs)
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _dyn_axle_brake_utilisation_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+) -> tuple[go.Figure, dict]:
+    _ = run_tokens
+    return dyn.axle_brake_utilisation_fig(dfs)
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _dyn_axle_brake_slip_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+) -> tuple[go.Figure, dict]:
+    _ = run_tokens
+    return dyn.axle_brake_slip_fig(dfs)
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _driver_max_braking_g_per_lap_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+) -> tuple[go.Figure, dict]:
+    _ = run_tokens
+    return drv.max_braking_g_per_lap_fig(dfs)
 
 
 @st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
@@ -3482,56 +3525,6 @@ def _render_skidpad_top_kpis(skidpad_dfs: dict[str, pl.DataFrame]) -> None:
         c5.metric("Subviraje", f"{_fmt(run_values['understeer_angle_deg'], '+.2f')} deg")
 
 
-def _render_ideal_braking_curve(dfs: dict[str, pl.DataFrame]) -> None:
-    """Render ideal front/rear brake distribution vs measured regen."""
-    st.subheader("Ideal Braking Curve  ·  Model vs Measured Regen (regen only)")
-    st.caption(
-        "Brake-force plane (front axle vs rear axle). Curves are the ideal "
-        "load-proportional distribution at 0, 15 and 25 m/s; points are "
-        "measured regenerative force from motor torque. **Front bias here is the "
-        "regen split, not the car's total brake balance** — the hydraulic "
-        "friction brakes are not measured. If a `BSE` trace appears, treat it as "
-        "pedal-pressure demand, not as proven hydraulic brake torque at the disc."
-    )
-    try:
-        fig, kpis = _dyn_ideal_braking_curve_fig_cached(dfs, _run_cache_tokens(dfs))
-        for w in kpis.get("warnings", []):
-            st.warning(w)
-
-        run_kpis = kpis.get("runs", {})
-        if len(run_kpis) == 1:
-            _run_name, vals = next(iter(run_kpis.items()))
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Front bias", f"{_fmt(vals.get('front_bias_mean', np.nan) * 100.0, '.1f')} %")
-            c2.metric("Bias std", f"{_fmt(vals.get('front_bias_std', np.nan) * 100.0, '.1f')} pp")
-            c3.metric("RMS to ideal", f"{_fmt(vals.get('rms_dist_to_ideal_N', np.nan), '.0f')} N")
-            c4.metric(
-                "Rear overbiased", f"{_fmt(vals.get('pct_time_rear_overbiased', np.nan), '.1f')} %"
-            )
-            c5.metric("Peak brake", f"{_fmt(vals.get('peak_combined_brake_g', np.nan), '.2f')} g")
-        elif len(run_kpis) > 1:
-            rows = []
-            for run_name, vals in run_kpis.items():
-                rows.append(
-                    {
-                        "Run": run_name,
-                        "Front bias [%]": round(vals.get("front_bias_mean", np.nan) * 100.0, 2),
-                        "Bias std [pp]": round(vals.get("front_bias_std", np.nan) * 100.0, 2),
-                        "RMS to ideal [N]": round(vals.get("rms_dist_to_ideal_N", np.nan), 1),
-                        "Rear overbiased [%]": round(
-                            vals.get("pct_time_rear_overbiased", np.nan), 2
-                        ),
-                        "Peak brake [g]": round(vals.get("peak_combined_brake_g", np.nan), 3),
-                        "Samples": int(vals.get("samples", 0)),
-                    }
-                )
-            st.dataframe(pl.DataFrame(rows), use_container_width=True, hide_index=True)
-
-        _plotly_chart(fig, use_container_width=True, theme=None)
-    except Exception as exc:
-        st.error(f"Ideal braking curve unavailable: {exc}")
-
-
 def _render_dynamics_overview(dfs: dict[str, pl.DataFrame]) -> None:
     """g-g landing view: the car's combined-acceleration envelope at a glance."""
     st.subheader("g-g Diagram  ·  Combined Acceleration Envelope")
@@ -3593,18 +3586,19 @@ def _render_dynamics_overview(dfs: dict[str, pl.DataFrame]) -> None:
 
 
 def _render_dynamics_braking(dfs: dict[str, pl.DataFrame]) -> None:
-    """Longitudinal chassis response in braking."""
-    _render_ideal_braking_curve(dfs)
-    st.divider()
+    """Vehicle dynamic behavior under braking: capability, balance, load transfer, limits."""
+    single = len(dfs) == 1
+    tokens = _run_cache_tokens(dfs)
 
-    st.subheader("Longitudinal Decel Envelope")
+    # 1 - Decel Envelope ------------------------------------------------------
+    st.subheader("Decel Envelope  ·  Longitudinal G vs Speed")
     st.caption(
-        "Faint points are real braking samples. The thick line is the p95 "
-        "deceleration envelope by 5 m/s speed bin. The dashed line is the "
-        "CAT17x design target, brake.MaxDeceleration = 1.79 g."
+        "Faint points are real braking samples; the thick line is the P95 "
+        "deceleration envelope by 5 m/s speed bin. Dashed line = CAT17x design "
+        "target brake.MaxDeceleration = 1.79 g."
     )
     try:
-        fig, kpis = _dyn_decel_envelope_fig_cached(dfs, _run_cache_tokens(dfs))
+        fig, kpis = _dyn_decel_envelope_fig_cached(dfs, tokens)
         for w in kpis.get("warnings", []):
             st.warning(w)
         rows = [
@@ -3625,65 +3619,205 @@ def _render_dynamics_braking(dfs: dict[str, pl.DataFrame]) -> None:
         st.error(f"Decel envelope unavailable: {exc}")
 
     st.divider()
-    st.subheader("Max Braking G per Lap")
+
+    # 2 - Real Brake Balance --------------------------------------------------
+    st.subheader("Real Brake Balance  ·  Front Share of Braking Force")
     st.caption(
-        "Per lap, this takes the minimum filtered longitudinal acceleration "
-        "during real braking samples (`Brake > 5 %`, `ax < -1.0 m/s²`). "
-        "More negative = harder peak braking. The dashed trace is the "
-        "raising average (cumulative mean), which makes run-to-run "
-        "comparison less sensitive to one standout lap."
+        "Front share of total braking force from Est_FX (regen + hydraulic, "
+        "validated vs the IMU) vs the ideal load-transfer brake-bias line. Above "
+        "the line = front-biased; below = rear over-braked (lock-up-prone)."
     )
     try:
-        fig, kpis = _dyn_max_braking_g_per_lap_fig_cached(dfs, _run_cache_tokens(dfs))
+        fig, kpis = _dyn_brake_balance_fig_cached(dfs, tokens)
         for w in kpis.get("warnings", []):
             st.warning(w)
-        run_kpis = kpis.get("runs", {})
-        if len(run_kpis) == 1:
-            _run_name, vals = next(iter(run_kpis.items()))
-            c1, c2, c3, c4, c5 = st.columns(5)
+        runs = kpis.get("runs", {})
+        if single and runs:
+            v = next(iter(runs.values()))
+            c1, c2, c3 = st.columns(3)
             c1.metric(
-                "Best max braking [g]",
-                f"{_fmt(vals.get('best_max_braking_g', np.nan), '.3f')} g",
-                help=METRIC_HELP["Best max braking [g]"],
+                "Front brake bias",
+                f"{_fmt(v['front_bias_median'], '.3f')}",
+                help=METRIC_HELP["Front brake bias"],
             )
             c2.metric(
-                "Mean max braking [g]",
-                f"{_fmt(vals.get('mean_max_braking_g', np.nan), '.3f')} g",
-                help=METRIC_HELP["Mean max braking [g]"],
+                "Bias error vs ideal",
+                f"{_fmt(v['bias_error_vs_ideal'], '+.3f')}",
+                help=METRIC_HELP["Bias error vs ideal"],
             )
             c3.metric(
-                "Raising avg end [g]",
-                f"{_fmt(vals.get('raising_avg_last_g', np.nan), '.3f')} g",
-                help=METRIC_HELP["Raising avg end [g]"],
+                "Rear-overbraked %",
+                f"{_fmt(v['pct_rear_overbraked'], '.0f')}%",
+                help=METRIC_HELP["Rear-overbraked %"],
             )
-            c4.metric(
-                "Best lap",
-                f"L{int(vals.get('best_lap', 0))}",
-                help=METRIC_HELP["Best lap"],
-            )
-            c5.metric(
-                "Mean brake samples",
-                f"{_fmt(vals.get('mean_brake_samples', np.nan), '.0f')}",
-                help=METRIC_HELP["Mean brake samples"],
-            )
-        elif len(run_kpis) > 1:
-            rows = []
-            for run_name, vals in run_kpis.items():
-                rows.append(
+        elif runs:
+            _show_summary_table(
+                [
                     {
-                        "Run": run_name,
-                        "Best max braking [g]": round(vals.get("best_max_braking_g", np.nan), 3),
-                        "Mean max braking [g]": round(vals.get("mean_max_braking_g", np.nan), 3),
-                        "Raising avg end [g]": round(vals.get("raising_avg_last_g", np.nan), 3),
-                        "Best lap": int(vals.get("best_lap", 0)),
-                        "Valid laps": int(vals.get("valid_laps", 0)),
-                        "Mean brake samples": round(vals.get("mean_brake_samples", np.nan), 1),
+                        "Run": rn,
+                        "Front brake bias": round(v.get("front_bias_median", np.nan), 3),
+                        "Bias error vs ideal": round(v.get("bias_error_vs_ideal", np.nan), 3),
+                        "Rear-overbraked [%]": round(v.get("pct_rear_overbraked", np.nan), 1),
+                        "Peak decel [g]": round(v.get("peak_decel_g", np.nan), 2),
+                        "Samples": int(v.get("samples", 0)),
                     }
-                )
-            _show_summary_table(rows)
+                    for rn, v in runs.items()
+                ]
+            )
         _plotly_chart(fig, use_container_width=True, theme=None)
     except Exception as exc:
-        st.error(f"Max Braking G per lap unavailable: {exc}")
+        st.error(f"Brake balance unavailable: {exc}")
+
+    st.divider()
+
+    # 3 - Longitudinal Load Transfer ------------------------------------------
+    st.subheader("Longitudinal Load Transfer  ·  Front Fz Share vs Decel")
+    st.caption(
+        "Measured front vertical-load share vs the rigid point-mass prediction "
+        "(dashed). The gap below the line is anti-dive / suspension compliance - "
+        "the car transfers less load forward than textbook."
+    )
+    try:
+        fig, kpis = _dyn_brake_load_transfer_fig_cached(dfs, tokens)
+        for w in kpis.get("warnings", []):
+            st.warning(w)
+        runs = kpis.get("runs", {})
+        if single and runs:
+            v = next(iter(runs.values()))
+            c1, c2, c3 = st.columns(3)
+            c1.metric(
+                "Front load (static)",
+                f"{_fmt(v['fz_front_static'], '.3f')}",
+                help=METRIC_HELP["Front load (static)"],
+            )
+            c2.metric(
+                "Front load (peak)",
+                f"{_fmt(v['fz_front_at_peak'], '.3f')}",
+                help=METRIC_HELP["Front load (peak)"],
+            )
+            c3.metric(
+                "Transfer deficit",
+                f"{_fmt(v['transfer_deficit_pp'], '+.1f')} pp",
+                help=METRIC_HELP["Transfer deficit"],
+            )
+        elif runs:
+            _show_summary_table(
+                [
+                    {
+                        "Run": rn,
+                        "Front load static": round(v.get("fz_front_static", np.nan), 3),
+                        "Front load peak": round(v.get("fz_front_at_peak", np.nan), 3),
+                        "Transfer deficit [pp]": round(v.get("transfer_deficit_pp", np.nan), 1),
+                        "Samples": int(v.get("samples", 0)),
+                    }
+                    for rn, v in runs.items()
+                ]
+            )
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.error(f"Load transfer unavailable: {exc}")
+
+    st.divider()
+
+    # 4 - Per-axle Brake Utilisation ------------------------------------------
+    st.subheader("Per-axle Brake Utilisation  ·  |Fx| / (mu·Fz)")
+    st.caption(
+        "Front vs rear brake grip utilisation by decel. The axle reaching 1.0 "
+        "first is the limiting end (would lock first). Est_FX/Est_FZ are estimates "
+        "- read the front-vs-rear difference, not the absolute level."
+    )
+    try:
+        fig, kpis = _dyn_axle_brake_utilisation_fig_cached(dfs, tokens)
+        for w in kpis.get("warnings", []):
+            st.warning(w)
+        runs = kpis.get("runs", {})
+        if single and runs:
+            v = next(iter(runs.values()))
+            c1, c2, c3 = st.columns(3)
+            c1.metric(
+                "Brake util front",
+                f"{_fmt(v['util_front_median'], '.3f')}",
+                help=METRIC_HELP["Brake util front"],
+            )
+            c2.metric(
+                "Brake util rear",
+                f"{_fmt(v['util_rear_median'], '.3f')}",
+                help=METRIC_HELP["Brake util rear"],
+            )
+            c3.metric(
+                "Limiting axle",
+                v.get("limiting_axle", "-"),
+                help=METRIC_HELP["Limiting axle (brake)"],
+            )
+        elif runs:
+            _show_summary_table(
+                [
+                    {
+                        "Run": rn,
+                        "Util front (med)": round(v.get("util_front_median", np.nan), 3),
+                        "Util rear (med)": round(v.get("util_rear_median", np.nan), 3),
+                        "Util front (p95)": round(v.get("util_front_p95", np.nan), 3),
+                        "Util rear (p95)": round(v.get("util_rear_p95", np.nan), 3),
+                        "Limiting axle": v.get("limiting_axle", "-"),
+                        "Samples": int(v.get("samples", 0)),
+                    }
+                    for rn, v in runs.items()
+                ]
+            )
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.error(f"Brake utilisation unavailable: {exc}")
+
+    st.divider()
+
+    # 5 - Per-axle Braking Slip -----------------------------------------------
+    st.subheader("Per-axle Braking Slip  ·  Est_SR vs Decel")
+    st.caption(
+        "Front vs rear kinematic braking slip - the cross-check of the force "
+        "utilisation above. References at -0.20 (optimal) and -0.30 (lock-up onset) "
+        "are physical context. Lock-up control quality lives in Controls › RB."
+    )
+    try:
+        fig, kpis = _dyn_axle_brake_slip_fig_cached(dfs, tokens)
+        for w in kpis.get("warnings", []):
+            st.warning(w)
+        runs = kpis.get("runs", {})
+        if single and runs:
+            v = next(iter(runs.values()))
+            c1, c2, c3 = st.columns(3)
+            c1.metric(
+                "Brake slip front",
+                f"{_fmt(v['sr_front_median'], '+.3f')}",
+                help=METRIC_HELP["Brake slip front"],
+            )
+            c2.metric(
+                "Brake slip rear",
+                f"{_fmt(v['sr_rear_median'], '+.3f')}",
+                help=METRIC_HELP["Brake slip rear"],
+            )
+            c3.metric(
+                "Axle nearer lock-up",
+                v.get("axle_nearer_lockup", "-"),
+                help=METRIC_HELP["Axle nearer lock-up"],
+            )
+        elif runs:
+            _show_summary_table(
+                [
+                    {
+                        "Run": rn,
+                        "Slip front (med)": round(v.get("sr_front_median", np.nan), 4),
+                        "Slip rear (med)": round(v.get("sr_rear_median", np.nan), 4),
+                        "Slip front (p5)": round(v.get("sr_front_p5", np.nan), 4),
+                        "Slip rear (p5)": round(v.get("sr_rear_p5", np.nan), 4),
+                        "Nearer lock-up": v.get("axle_nearer_lockup", "-"),
+                        "Samples": int(v.get("samples", 0)),
+                    }
+                    for rn, v in runs.items()
+                ]
+            )
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.error(f"Braking slip unavailable: {exc}")
 
 
 def _render_dynamics_acceleration(dfs: dict[str, pl.DataFrame]) -> None:
@@ -5180,6 +5314,66 @@ def _render_driver_brake_subtab(
         _plotly_chart(fig, use_container_width=True, theme=None)
     except Exception as exc:
         st.error(f"Brake release smoothness unavailable: {exc}")
+
+    st.divider()
+    st.subheader("Max Braking G per Lap")
+    st.caption(
+        "Per lap, the robust hard-braking tail (P5 of filtered ax during real "
+        "braking, `Brake > 5 %`, `ax < -1.0 m/s²`). More negative = harder peak "
+        "braking. Dashed = raising average (cumulative mean) for run-to-run "
+        "comparison robust to one standout lap."
+    )
+    try:
+        fig, kpis = _driver_max_braking_g_per_lap_fig_cached(dfs, driver_run_tokens)
+        for w in kpis.get("warnings", []):
+            st.warning(w)
+        run_kpis = kpis.get("runs", {})
+        if len(run_kpis) == 1:
+            _run_name, vals = next(iter(run_kpis.items()))
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric(
+                "Best max braking [g]",
+                f"{_fmt(vals.get('best_max_braking_g', np.nan), '.3f')} g",
+                help=METRIC_HELP["Best max braking [g]"],
+            )
+            c2.metric(
+                "Mean max braking [g]",
+                f"{_fmt(vals.get('mean_max_braking_g', np.nan), '.3f')} g",
+                help=METRIC_HELP["Mean max braking [g]"],
+            )
+            c3.metric(
+                "Raising avg end [g]",
+                f"{_fmt(vals.get('raising_avg_last_g', np.nan), '.3f')} g",
+                help=METRIC_HELP["Raising avg end [g]"],
+            )
+            c4.metric(
+                "Best lap",
+                f"L{int(vals.get('best_lap', 0))}",
+                help=METRIC_HELP["Best lap"],
+            )
+            c5.metric(
+                "Mean brake samples",
+                f"{_fmt(vals.get('mean_brake_samples', np.nan), '.0f')}",
+                help=METRIC_HELP["Mean brake samples"],
+            )
+        elif len(run_kpis) > 1:
+            _show_summary_table(
+                [
+                    {
+                        "Run": run_name,
+                        "Best max braking [g]": round(vals.get("best_max_braking_g", np.nan), 3),
+                        "Mean max braking [g]": round(vals.get("mean_max_braking_g", np.nan), 3),
+                        "Raising avg end [g]": round(vals.get("raising_avg_last_g", np.nan), 3),
+                        "Best lap": int(vals.get("best_lap", 0)),
+                        "Valid laps": int(vals.get("valid_laps", 0)),
+                        "Mean brake samples": round(vals.get("mean_brake_samples", np.nan), 1),
+                    }
+                    for run_name, vals in run_kpis.items()
+                ]
+            )
+        _plotly_chart(fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.error(f"Max Braking G per lap unavailable: {exc}")
 
 
 def _render_driver_steering_subtab(
