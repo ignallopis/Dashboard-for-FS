@@ -2007,6 +2007,56 @@ def lap_time_distribution_fig(dfs: dict[str, pl.DataFrame]) -> go.Figure:
     return fig
 
 
+def run_phase_distribution_fig(
+    dfs: dict[str, pl.DataFrame],
+) -> tuple[go.Figure, dict]:
+    """Stacked horizontal bar: percent of time per driving phase, one bar per run."""
+    fig = make_dark_figure(
+        title="Driving Phases (share of lap time)",
+        xlabel="Share of time [%]",
+        ylabel="",
+    )
+    kpis: dict[str, dict] = {}
+    run_labels: list[str] = []
+
+    for run_name, df in dfs.items():
+        d = _prep(df)
+        valid = np.isfinite(d["laps"]) & np.isfinite(d["laptime"])
+        d = {k: v[valid] for k, v in d.items()}
+        d = exclude_lap0_and_last_lap(d)
+        thr = np.asarray(d["Throttle"], dtype=float)
+        brk = np.asarray(d["Brake"], dtype=float)
+        n = thr.size
+        label = _run_display_name(run_name)
+        run_labels.append(label)
+        if n == 0:
+            kpis[run_name] = {
+                "pct": {phase: float("nan") for phase in _PHASE_ORDER},
+                "samples": 0,
+            }
+            continue
+        phases = _classify_phases(thr, brk)
+        pct = {
+            phase: 100.0 * float(np.count_nonzero(phases == phase)) / n for phase in _PHASE_ORDER
+        }
+        kpis[run_name] = {"pct": pct, "samples": int(n)}
+
+    for phase in _PHASE_ORDER:
+        fig.add_trace(
+            go.Bar(
+                y=run_labels,
+                x=[kpis[run_name]["pct"][phase] for run_name in dfs],
+                name=_PHASE_LABELS[phase],
+                orientation="h",
+                marker=dict(color=MAP_PHASE_COLORS[phase]),
+                hovertemplate=(f"{_PHASE_LABELS[phase]}: " + "%{x:.1f} %<extra>%{y}</extra>"),
+            )
+        )
+    fig.update_layout(barmode="stack", legend=dict(orientation="h"))
+    fig.update_xaxes(range=[0, 100])
+    return fig, kpis
+
+
 def _lap_comparison_data(
     df: pl.DataFrame,
     lap_id: int,
