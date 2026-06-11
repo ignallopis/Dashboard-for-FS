@@ -47,7 +47,15 @@ def test_multi_run_builds() -> None:
     dfs = {name: df for name, df in (_load(p) for p in CSVS)}
     pfig, pk = drv.run_phase_distribution_fig(dfs)
     assert pfig is not None and len(pk) == 2, pk
-    print("multi-run phase build  OK")
+    mfig, mk = drv.fastest_lap_speed_map_fig(dfs)
+    assert mfig is not None and len(mk) == 2, mk
+    for name, df in (_load(p) for p in CSVS):
+        lap_id, laptime_s = drv._fastest_valid_lap(df)
+        assert lap_id > 0
+        cons = drv.lap_consistency_stats({name: df})
+        best = float(cons["Best [s]"][0])
+        assert abs(laptime_s - best) < 1e-3, f"{name}: fastest {laptime_s} != Best {best}"
+    print("multi-run build  OK")
 
 
 if __name__ == "__main__":

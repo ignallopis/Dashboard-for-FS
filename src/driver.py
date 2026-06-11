@@ -36,6 +36,7 @@ from utils import (
     COMPLETE_LAPS_MARKER,
     add_lap_scatter,
     add_trend_line,
+    apply_dark_layout,
     available_laps,
     cols_to_numpy,
     driver_color,
@@ -1601,6 +1602,15 @@ def _lap_times_per_run(df: pl.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     return lap_list[ok], lt[ok]
 
 
+def _fastest_valid_lap(df: pl.DataFrame) -> tuple[int, float]:
+    """Return (lap_id, laptime_s) of the fastest valid lap, or (-1, nan)."""
+    lap_ids, lt = _lap_times_per_run(df)
+    if lap_ids.size == 0:
+        return -1, float("nan")
+    i = int(np.argmin(lt))
+    return int(lap_ids[i]), float(lt[i])
+
+
 def lap_time_progression_fig(dfs: dict[str, pl.DataFrame]) -> go.Figure:
     """Lap time per lap (markers + line) and raising average per driver/run.
 
@@ -2054,6 +2064,106 @@ def run_phase_distribution_fig(
         )
     fig.update_layout(barmode="stack", legend=dict(orientation="h"))
     fig.update_xaxes(range=[0, 100])
+    return fig, kpis
+
+
+def fastest_lap_speed_map_fig(
+    dfs: dict[str, pl.DataFrame],
+) -> tuple[go.Figure, dict]:
+    """GPS track of each run's fastest valid lap, coloured by speed [km/h].
+
+    One subplot per run, side by side, on a shared colour range so the maps are
+    comparable. Grey full-session context is drawn underneath.
+    """
+    runs = list(dfs)
+    n = max(len(runs), 1)
+    fig = make_subplots(
+        rows=1,
+        cols=n,
+        subplot_titles=[_run_display_name(r) for r in runs] or [""],
+        horizontal_spacing=0.04,
+    )
+
+    kpis: dict[str, dict] = {}
+    lap_data: dict[str, dict[str, np.ndarray]] = {}
+    vmax_all = 0.0
+    for run_name, df in dfs.items():
+        lap_id, laptime_s = _fastest_valid_lap(df)
+        entry = {
+            "fastest_lap": lap_id,
+            "laptime_s": laptime_s,
+            "v_max_kmh": float("nan"),
+        }
+        if lap_id < 0 or not {"VN_latitude", "VN_longitude", "VN_vx"} <= set(df.columns):
+            kpis[run_name] = entry
+            continue
+        sub = df.filter(pl.col("laps") == lap_id)
+        lat = sub["VN_latitude"].to_numpy().astype(float)
+        lng = sub["VN_longitude"].to_numpy().astype(float)
+        spd = np.abs(sub["VN_vx"].to_numpy().astype(float)) * 3.6
+        ok = np.isfinite(lat) & np.isfinite(lng) & np.isfinite(spd)
+        if not ok.any():
+            kpis[run_name] = entry
+            continue
+        lap_data[run_name] = {"lat": lat[ok], "lng": lng[ok], "spd": spd[ok]}
+        entry["v_max_kmh"] = float(np.max(spd[ok]))
+        vmax_all = max(vmax_all, entry["v_max_kmh"])
+        kpis[run_name] = entry
+
+    for col, run_name in enumerate(runs, start=1):
+        full_lat, full_lng = _full_session_gps(dfs.get(run_name))
+        if full_lat.size > 0:
+            fig.add_trace(
+                go.Scattergl(
+                    x=full_lng,
+                    y=full_lat,
+                    mode="lines",
+                    line=dict(color="rgba(160,160,160,0.18)", width=2),
+                    showlegend=False,
+                    hoverinfo="skip",
+                ),
+                row=1,
+                col=col,
+            )
+        data = lap_data.get(run_name)
+        if data is None:
+            fig.add_annotation(
+                text="GPS / lap not available",
+                showarrow=False,
+                xref=f"x{col} domain" if col > 1 else "x domain",
+                yref=f"y{col} domain" if col > 1 else "y domain",
+                x=0.5,
+                y=0.5,
+                font=dict(color="#EBEBEB"),
+            )
+            continue
+        fig.add_trace(
+            go.Scattergl(
+                x=data["lng"],
+                y=data["lat"],
+                mode="markers",
+                marker=dict(
+                    color=data["spd"],
+                    colorscale="Turbo",
+                    cmin=0.0,
+                    cmax=vmax_all or None,
+                    size=5,
+                    colorbar=dict(title="km/h") if col == n else None,
+                    showscale=(col == n),
+                ),
+                showlegend=False,
+                hovertemplate="%{marker.color:.0f} km/h<extra></extra>",
+            ),
+            row=1,
+            col=col,
+        )
+
+    apply_dark_layout(fig)
+    fig.update_layout(title="Fastest-Lap Speed Map")
+    fig.update_xaxes(showgrid=False, zeroline=False, visible=False)
+    fig.update_yaxes(showgrid=False, zeroline=False, visible=False)
+    for i in range(1, n + 1):
+        fig.update_yaxes(scaleanchor=("x" if i == 1 else f"x{i}"), row=1, col=i)
     return fig, kpis
 
 
