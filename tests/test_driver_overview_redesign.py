@@ -72,9 +72,16 @@ def test_per_lap_overview_table() -> None:
     print(f"per_lap_overview_table  OK  cols={tbl.columns}")
 
 
+def test_scorecard_deleted() -> None:
+    for attr in ("driver_scorecard", "_scorecard_verdict", "_SCORECARD_SPEC"):
+        assert not hasattr(drv, attr), f"{attr} should be deleted"
+    print("scorecard deleted  OK")
+
+
 if __name__ == "__main__":
     test_run_speed_stats()
     test_run_phase_distribution_fig()
     test_multi_run_builds()
     test_per_lap_overview_table()
+    test_scorecard_deleted()
     print("ALL OK")
