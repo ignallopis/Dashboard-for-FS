@@ -1708,6 +1708,29 @@ def lap_consistency_stats(dfs: dict[str, pl.DataFrame]) -> pl.DataFrame:
     return pl.DataFrame(rows) if rows else pl.DataFrame()
 
 
+def run_speed_stats(df: pl.DataFrame) -> dict:
+    """Per-run speed aggregates over valid laps (lap 0 + last lap excluded).
+
+    `VN_vx` is m/s, so values are reported in km/h. v_avg is a plain sample
+    mean; at uniform logger rate that is already time-weighted.
+    """
+    if "VN_vx" not in df.columns:
+        return {"v_max_kmh": float("nan"), "v_avg_kmh": float("nan"), "samples": 0}
+    d = _prep(df, extra_cols=("VN_vx",))
+    valid = np.isfinite(d["laps"]) & np.isfinite(d["laptime"])
+    d = {k: v[valid] for k, v in d.items()}
+    d = exclude_lap0_and_last_lap(d)
+    vx = np.abs(np.asarray(d["VN_vx"], dtype=float))
+    vx = vx[np.isfinite(vx)]
+    if vx.size == 0:
+        return {"v_max_kmh": float("nan"), "v_avg_kmh": float("nan"), "samples": 0}
+    return {
+        "v_max_kmh": float(np.max(vx) * 3.6),
+        "v_avg_kmh": float(np.mean(vx) * 3.6),
+        "samples": int(vx.size),
+    }
+
+
 def _run_display_name(run_name: str) -> str:
     """File-stem style label for a run key (mirrors the dashboard display)."""
     stem = run_name.rsplit("/", 1)[-1]
