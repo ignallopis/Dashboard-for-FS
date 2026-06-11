@@ -2327,6 +2327,46 @@ def _driver_lap_time_distribution_fig_cached(
     return drv.lap_time_distribution_fig(dfs)
 
 
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _driver_run_phase_distribution_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+) -> tuple[go.Figure, dict]:
+    """Cached wrapper for the Overview pedal-phase distribution bar."""
+    _ = run_tokens
+    return drv.run_phase_distribution_fig(dfs)
+
+
+@st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _driver_fastest_lap_speed_map_fig_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+) -> tuple[go.Figure, dict]:
+    """Cached wrapper for the Overview fastest-lap speed maps."""
+    _ = run_tokens
+    return drv.fastest_lap_speed_map_fig(dfs)
+
+
+@st.cache_data(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _driver_per_lap_overview_table_cached(
+    dfs: dict[str, pl.DataFrame],
+    run_tokens: tuple[tuple[str, FileSignature, str], ...],
+) -> pl.DataFrame:
+    """Cached wrapper for the Overview per-lap detail table."""
+    _ = run_tokens
+    return drv.per_lap_overview_table(dfs)
+
+
+@st.cache_data(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
+def _driver_run_speed_stats_cached(
+    df: pl.DataFrame,
+    run_token: tuple[str, FileSignature, str],
+) -> dict:
+    """Cached wrapper for per-run speed stats (v_max / v_avg)."""
+    _ = run_token
+    return drv.run_speed_stats(df)
+
+
 def _is_skidpad_lap(df: pl.DataFrame, lap_id: int) -> bool:
     """True if the given lap was logged in skidpad event mode."""
     if "lapcount_mode" not in df.columns or "laps" not in df.columns:
