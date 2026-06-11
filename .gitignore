@@ -7,6 +7,7 @@ data/
 *.csv
 .claude/
 .codex/
+.agents/
 # Ignore everything in .streamlit/ (e.g. secrets.toml) except the theme config,
 # which carries the dashboard's fonts/theme and should ship with the repo.
 .streamlit/*
