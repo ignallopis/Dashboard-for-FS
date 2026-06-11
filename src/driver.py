@@ -1741,6 +1741,52 @@ def run_speed_stats(df: pl.DataFrame) -> dict:
     }
 
 
+def _per_lap_speed(df: pl.DataFrame) -> dict[int, tuple[float, float]]:
+    """Return {lap_id: (v_max_kmh, v_avg_kmh)} over valid laps."""
+    if "VN_vx" not in df.columns:
+        return {}
+    d = _prep(df, extra_cols=("VN_vx",))
+    valid = np.isfinite(d["laps"]) & np.isfinite(d["laptime"])
+    d = {k: v[valid] for k, v in d.items()}
+    d = exclude_lap0_and_last_lap(d)
+    laps = np.asarray(d["laps"], dtype=float)
+    vx = np.abs(np.asarray(d["VN_vx"], dtype=float))
+    out: dict[int, tuple[float, float]] = {}
+    for lap in unique_laps(laps).astype(int):
+        m = (laps == lap) & np.isfinite(vx)
+        if m.any():
+            out[int(lap)] = (
+                float(np.max(vx[m]) * 3.6),
+                float(np.mean(vx[m]) * 3.6),
+            )
+    return out
+
+
+def per_lap_overview_table(dfs: dict[str, pl.DataFrame]) -> pl.DataFrame:
+    """Per-lap drill-down: Lap + (laptime, v_max, v_avg) per run, km/h."""
+    laptimes: dict[str, dict[int, float]] = {}
+    speeds: dict[str, dict[int, tuple[float, float]]] = {}
+    all_laps: set[int] = set()
+    for run_name, df in dfs.items():
+        lap_ids, lt = _lap_times_per_run(df)
+        laptimes[run_name] = {int(k): float(v) for k, v in zip(lap_ids, lt)}
+        speeds[run_name] = _per_lap_speed(df)
+        all_laps |= set(laptimes[run_name])
+
+    rows: list[dict] = []
+    for lap in sorted(all_laps):
+        row: dict = {"Lap": int(lap)}
+        for run_name in dfs:
+            label = _run_display_name(run_name)
+            lt = laptimes[run_name].get(lap)
+            vmax, vavg = speeds[run_name].get(lap, (float("nan"), float("nan")))
+            row[f"{label} laptime [s]"] = round(lt, 3) if lt is not None else None
+            row[f"{label} v_max [km/h]"] = round(vmax, 1) if np.isfinite(vmax) else None
+            row[f"{label} v_avg [km/h]"] = round(vavg, 1) if np.isfinite(vavg) else None
+        rows.append(row)
+    return pl.DataFrame(rows) if rows else pl.DataFrame()
+
+
 def _run_display_name(run_name: str) -> str:
     """File-stem style label for a run key (mirrors the dashboard display)."""
     stem = run_name.rsplit("/", 1)[-1]

@@ -58,8 +58,23 @@ def test_multi_run_builds() -> None:
     print("multi-run build  OK")
 
 
+def test_per_lap_overview_table() -> None:
+    dfs = {name: df for name, df in (_load(p) for p in CSVS)}
+    tbl = drv.per_lap_overview_table(dfs)
+    assert not tbl.is_empty()
+    assert "Lap" in tbl.columns
+    # one laptime + vmax + vavg column per run
+    for name in dfs:
+        label = drv._run_display_name(name)
+        assert any(label in c and "laptime" in c for c in tbl.columns), tbl.columns
+        assert any(label in c and "v_max" in c for c in tbl.columns), tbl.columns
+        assert any(label in c and "v_avg" in c for c in tbl.columns), tbl.columns
+    print(f"per_lap_overview_table  OK  cols={tbl.columns}")
+
+
 if __name__ == "__main__":
     test_run_speed_stats()
     test_run_phase_distribution_fig()
     test_multi_run_builds()
+    test_per_lap_overview_table()
     print("ALL OK")
