@@ -681,6 +681,7 @@ def damper_histogram_figs(
     split = float(DAMPER_LSHS_SPLIT_MMPS)
     quad_share: dict[str, dict[str, float]] = {}
     quad_p95: dict[str, dict[str, float]] = {}
+    samples: dict[str, int] = {}
     calibrated = bool(DAMPER_CALIBRATED or t1_ok)
 
     from plotly.subplots import make_subplots
@@ -707,15 +708,18 @@ def damper_histogram_figs(
         if t1_ok:
             vel = np.asarray(arr[f"Pot_Speed_{w}"], dtype=float)
         else:
-            damp_mm = _damper_mm(arr[f"Damp{w}"], w)
-            wheel_mm = _wheel_mm_from_damper_mm(damp_mm, w)
-            wheel_mm = smooth_signal(wheel_mm, smooth_n)
-            vel = np.gradient(wheel_mm, dt)  # [mm/s] when calibrated, counts/s otherwise
+            # Damper clicks act on ROD velocity, and the ±25 mm/s LS/HS split is a
+            # rod-speed convention — so differentiate rod travel directly (NO motion
+            # ratio here; that wheel-travel step belongs to roll/pitch, not this plot).
+            rod_mm = _damper_mm(arr[f"Damp{w}"], w)
+            rod_mm = smooth_signal(rod_mm, smooth_n)
+            vel = np.gradient(rod_mm, dt)  # rod [mm/s] when calibrated, counts/s otherwise
         vel = vel[sample_mask]
         finite = np.isfinite(vel)
         vel = vel[finite]
         if vel.size == 0:
             continue
+        samples[w] = int(vel.size)
 
         lo = float(np.nanpercentile(vel, 1))
         hi = float(np.nanpercentile(vel, 99))
@@ -833,6 +837,7 @@ def damper_histogram_figs(
         "calibrated": calibrated,
         "quad_share": quad_share,
         "quad_p95": quad_p95,
+        "samples": samples,
         "bump_share_by_axle": {
             "front": float(
                 np.mean(
@@ -958,6 +963,7 @@ def roll_gradient_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
         "rear": ("Rear", "#F28C40", roll_rear),
     }.items():
         m = in_corner & np.isfinite(roll) & np.isfinite(ay_g)
+        kpis[f"{axle}_samples"] = int(m.sum())
         if not m.any():
             kpis[f"{axle}_gradient_deg_per_g"] = np.nan
             kpis[f"{axle}_r2"] = np.nan
@@ -2952,11 +2958,11 @@ def static_fz_reference_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
         & (arr["Throttle"] < 5.0)
         & (arr["Brake"] < 5.0)
     )
-    DESIGN_N = (288.0 / 4.0) * G_MPS2  # 706.32 N per corner (288 kg / 4)
+    DESIGN_N = MASS_KG / 4.0 * G_MPS2  # 706.32 N per corner (288 kg / 4)
     corners = ["FL", "FR", "RL", "RR"]
     keys = ["Est_FZFL", "Est_FZFR", "Est_FZRL", "Est_FZRR"]
     meas: dict[str, float] = {
-        c: float(np.nanmean(arr[k][m])) if m.any() else np.nan for c, k in zip(corners, keys)
+        c: float(np.nanmedian(arr[k][m])) if m.any() else np.nan for c, k in zip(corners, keys)
     }
     total = sum(meas.values()) if all(np.isfinite(v) for v in meas.values()) else np.nan
     dev_pct = {c: (meas[c] - DESIGN_N) / DESIGN_N * 100.0 for c in corners}
@@ -3023,141 +3029,6 @@ def static_fz_reference_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
         "design_corner_n": DESIGN_N,
         "warnings": [] if m.any() else ["No straight low-input samples for static Fz reference."],
     }
-
-
-def aero_load_heave_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
-    """Measured heave vs speed in straight samples."""
-    required = ["VN_vx", "Filtering_VN_ay", "Throttle", "Brake", "Heave_Front", "Heave_Rear"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise KeyError(f"Missing aero-load columns: {missing}")
-    if not _t1_calibration_ok(df):
-        raise ValueError("T1 potentiometer calibration is not validated.")
-    df = ensure_complete_laps_df(df)
-    arr = cols_to_numpy(df, required)
-    m = (
-        (np.abs(arr["VN_vx"]) > 4.0)
-        & (np.abs(arr["Filtering_VN_ay"]) < 0.5)
-        & (arr["Throttle"] < 5.0)
-        & (arr["Brake"] < 5.0)
-    )
-    fig = make_dark_figure("Aero Load  ·  Heave vs Speed", "Vehicle speed [m/s]", "Heave [mm]")
-    for name, color in [("Heave_Front", "#4DB3F2"), ("Heave_Rear", "#F28C40")]:
-        fig.add_trace(
-            go.Scattergl(
-                x=np.abs(arr["VN_vx"][m]),
-                y=arr[name][m],
-                mode="markers",
-                marker=dict(color=color, size=4, opacity=0.36),
-                name=name.replace("_", " "),
-            )
-        )
-    fig.update_layout(height=520, margin=dict(l=70, r=30, t=55, b=65))
-    return fig, {"samples": int(m.sum()), "warnings": []}
-
-
-def spring_velocity_histogram_figs(
-    df: pl.DataFrame,
-    phase: Literal["all", "brake", "corner", "accel", "straight"] = "all",
-) -> tuple[list[go.Figure], dict]:
-    """Heave/roll spring velocity histograms split by setup phase."""
-    speed_cols = [
-        "Length_front_heave_Speed",
-        "Length_front_roll_Speed",
-        "Length_rear_heave_Speed",
-        "Length_rear_roll_Speed",
-    ]
-    required = ["TimeStamp"] + _DAMPER_PHASE_COLS + speed_cols
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise KeyError(f"Missing spring velocity columns: {missing}")
-    if not _t1_calibration_ok(df):
-        raise ValueError("T1 potentiometer calibration is not validated.")
-    df = ensure_complete_laps_df(df)
-    arr = cols_to_numpy(df, required)
-    time_s = arr["TimeStamp"] - arr["TimeStamp"][0]
-    dt = robust_dt(time_s)
-    sample_mask = _setup_phase_mask(arr, phase, dt)
-    from plotly.subplots import make_subplots
-
-    fig = make_subplots(
-        rows=2,
-        cols=2,
-        subplot_titles=("Front heave", "Front roll", "Rear heave", "Rear roll"),
-        horizontal_spacing=0.08,
-        vertical_spacing=0.14,
-    )
-    positions = {
-        "Length_front_heave_Speed": (1, 1, "#4DB3F2"),
-        "Length_front_roll_Speed": (1, 2, "#D973D9"),
-        "Length_rear_heave_Speed": (2, 1, "#F28C40"),
-        "Length_rear_roll_Speed": (2, 2, "#73D973"),
-    }
-    split = DAMPER_LSHS_SPLIT_MMPS
-    hs_share: dict[str, float] = {}
-    for col, (row, col_idx, color) in positions.items():
-        vel = arr[col][sample_mask]
-        vel = vel[np.isfinite(vel)]
-        if vel.size == 0:
-            continue
-        bound = max(
-            abs(float(np.nanpercentile(vel, 1))), abs(float(np.nanpercentile(vel, 99))), split * 2.0
-        )
-        hs_share[col] = float(np.nanmean(np.abs(vel) >= split))
-        fig.add_trace(
-            go.Histogram(
-                x=vel,
-                xbins=dict(start=-bound, end=bound, size=(2.0 * bound) / 80.0),
-                marker_color=color,
-                opacity=0.82,
-                name=col.replace("_Speed", "").replace("_", " "),
-                showlegend=False,
-            ),
-            row=row,
-            col=col_idx,
-        )
-        fig.add_vline(
-            x=-split,
-            line=dict(color="rgba(255,255,255,0.35)", dash="dot", width=1),
-            row=row,
-            col=col_idx,
-        )
-        fig.add_vline(
-            x=split,
-            line=dict(color="rgba(255,255,255,0.35)", dash="dot", width=1),
-            row=row,
-            col=col_idx,
-        )
-        fig.add_vline(
-            x=0.0,
-            line=dict(color="rgba(255,255,255,0.55)", dash="dash", width=1),
-            row=row,
-            col=col_idx,
-        )
-    fig.update_layout(
-        title=dict(
-            text=f"Spring velocity histograms · {phase.upper()}",
-            font=dict(size=14, color="#EBEBEB"),
-        ),
-        paper_bgcolor="#141417",
-        plot_bgcolor="#141417",
-        font=dict(color="#EBEBEB", size=11),
-        barmode="overlay",
-        height=620,
-        margin=dict(l=60, r=20, t=70, b=50),
-    )
-    for row in (1, 2):
-        for col_idx in (1, 2):
-            fig.update_xaxes(
-                title_text="Spring velocity [mm/s]",
-                gridcolor="rgba(128,128,128,0.2)",
-                row=row,
-                col=col_idx,
-            )
-            fig.update_yaxes(
-                title_text="Samples", gridcolor="rgba(128,128,128,0.2)", row=row, col=col_idx
-            )
-    return [fig], {"phase": phase, "hs_share": hs_share, "warnings": []}
 
 
 # ── Aero load helper ─────────────────────────────────────────────────────────

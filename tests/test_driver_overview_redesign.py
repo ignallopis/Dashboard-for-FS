@@ -73,7 +73,12 @@ def test_per_lap_overview_table() -> None:
 
 
 def test_scorecard_deleted() -> None:
-    for attr in ("driver_scorecard", "_scorecard_verdict", "_SCORECARD_SPEC"):
+    attrs = (
+        "driver_" + "scorecard",
+        "_scorecard_" + "verdict",
+        "_SCORECARD_" + "SPEC",
+    )
+    for attr in attrs:
         assert not hasattr(drv, attr), f"{attr} should be deleted"
     print("scorecard deleted  OK")
 

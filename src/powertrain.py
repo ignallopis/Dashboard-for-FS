@@ -1,26 +1,23 @@
 """powertrain.py
 --------------
-Powertrain KPIs:
-  1. Energy per lap       (kWh, mean power, trend, correlation)
-  2. Power per wheel      (per-wheel distribution, front/rear & left/right balance)
-  3. Battery status       (SoC evolution, voltage sag, cell balance)
-  4. Thermal evolution    (motor, inverter, battery temps + thermal slope)
+Powertrain figures for the dashboard's three sub-sections.
 
-Public API:
-    Standalone CLI (use CSV_PATH):
-        energy_per_lap()      -> go.Figure
-        power_per_wheel()     -> go.Figure
-        battery_status()      -> go.Figure
-        thermal_evolution()   -> go.Figure
-        main()                — calls all of the above + .show()
+Motors & Inverters:
+    power_per_wheel_fig(dfs)        -> tuple[go.Figure, dict]
+    torque_speed_envelope_fig(dfs)  -> tuple[go.Figure, dict]
+    torque_fidelity_fig(dfs)        -> tuple[go.Figure, dict]
+    inverter_limits_fig(dfs)        -> tuple[go.Figure, dict]
+    pc_function_kpis(df)            -> tuple[list[go.Figure], dict]
 
-    Dashboard (take dfs dict):
-        energy_per_lap_fig(dfs)    -> tuple[go.Figure, dict]
-        energy_budget_per_lap_fig(dfs) -> tuple[go.Figure, dict]
-        energy_budget_breakdown_fig(dfs, run_name, lap) -> go.Figure
-        power_per_wheel_fig(dfs)   -> tuple[go.Figure, dict]
-        battery_status_fig(dfs)    -> tuple[go.Figure, dict]
-        thermal_evolution_fig(dfs) -> tuple[go.Figure, dict]
+Battery:
+    energy_per_lap_fig(dfs)         -> tuple[go.Figure, dict]
+    soc_per_lap_fig(dfs)            -> tuple[go.Figure, dict]
+    voltage_sag_fig(dfs)            -> tuple[go.Figure, dict]
+    pack_capacity_fig(dfs)          -> tuple[go.Figure, dict]
+
+Temperatures:
+    thermal_evolution_fig(dfs)      -> tuple[go.Figure, dict]
+    thermal_headroom_fig(dfs)       -> tuple[go.Figure, dict]
 
 Requires lapcount.py to have been run first.
 """
@@ -36,7 +33,6 @@ import numpy as np
 import plotly.graph_objects as go
 import polars as pl
 from plotly.subplots import make_subplots
-from scipy.integrate import cumulative_trapezoid
 
 from utils import (
     apply_dark_layout,
@@ -46,37 +42,28 @@ from utils import (
     cols_to_numpy,
     driver_color,
     ensure_complete_laps_df,
-    exclude_lap0_and_last_lap,
-    lap_dist_from_gps,
     per_lap_axis,
-    series_or_nan,
     unique_laps,
     WHEEL_COLORS,
 )
-from src.dynamics import (
-    A_AERO_M2,
-    CD_AERO,
-    CL_AERO,
-    G_MS2,
-    MASS_KG,
-    RHO_AIR_KGM3,
-)
 
-CSV_PATH = "data/run4_2025-08-24.csv"
 WHEELS = ("FL", "FR", "RL", "RR")
 
-# Energy-budget model assumptions. Keep these explicit because they are
-# calibration candidates, not measured CAT17x constants.
-CRR_TIRE = 0.015
-CALPHA_AXLE_TOTAL = 120_000.0  # [N/rad], front + rear axle cornering stiffness assumption
-
-# Endurance strategy inputs. The pack capacity is NOT in Parameters.m — this is
-# a placeholder the team must set to the accumulator's usable energy. The OT
-# limits come from Parameters.m (Motor/Inverter "OT error"); real derating
-# usually begins a few °C below these, so headroom-to-limit is conservative.
-ACCUMULATOR_USABLE_KWH_DEFAULT = 6.0  # [kWh] PLACEHOLDER — confirm per car
+# OT limits from Parameters.m (Motor/Inverter "OT error"); real derating usually
+# begins a few °C below these, so headroom-to-limit is conservative.
 MOTOR_OT_LIMIT_C = 120.0  # [°C] Parameters.m: Motor OT error
 INVERTER_OT_LIMIT_C = 75.0  # [°C] Parameters.m: Inverter OT error
+# Motor limits from Parameters.m (docs/context/cat17x_parameters.md).
+MOTOR_MAX_TORQUE_NM = 27.5
+MOTOR_MAX_SPEED_RADS = 16_000.0 * 2.0 * np.pi / 60.0
+# FS-rule accumulator cell temperature limit; NOT in Parameters.m.
+BATTERY_TEMP_LIMIT_C = 60.0
+# Per-motor share of the 80 kW FS power cap (equal-split approximation).
+PER_MOTOR_POWER_CAP_W = 80_000.0 / 4.0
+# Plausibility bands: samples outside are sensor glitches -> NaN.
+_CELL_V_BAND = (2.0, 4.5)  # [V] single cell
+_PACK_V_BAND = (300.0, 650.0)  # [V] accumulator
+_TEMP_BAND_C = (-20.0, 150.0)  # [°C] any temperature channel
 
 # Dark theme (mirrors utils.py for subplot figures)
 _BG = "#141417"
@@ -88,9 +75,16 @@ _AXIS = "#E5E5E5"
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def _load(columns: list[str]) -> dict[str, np.ndarray]:
-    df = pl.read_csv(CSV_PATH, columns=columns)
-    return cols_to_numpy(df, columns)
+def _clean_band(a: np.ndarray, band: tuple[float, float]) -> np.ndarray:
+    """Replace values outside a plausibility band (sensor glitches) with NaN."""
+    out = np.asarray(a, dtype=float).copy()
+    out[~np.isfinite(out) | (out < band[0]) | (out > band[1])] = np.nan
+    return out
+
+
+def _decimate(n: int, max_points: int = 4000) -> slice:
+    """Stride slice that keeps at most ~max_points samples."""
+    return slice(None, None, max(1, n // max_points))
 
 
 def _dark_subplots(rows: int, titles: list[str], ylabels: list[str]) -> go.Figure:
@@ -131,381 +125,68 @@ def _dark_subplots(rows: int, titles: list[str], ylabels: list[str]) -> go.Figur
     return fig
 
 
-# ── 1. Energy per lap (standalone) ──────────────────────────────────────────
+def _per_wheel_run_grid(
+    runs: dict[str, tuple[np.ndarray, dict[str, np.ndarray]]],
+    *,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    lap_ticks: np.ndarray | None = None,
+) -> go.Figure:
+    """2×2 per-wheel grid for multi-run per-lap figures: one line per run.
 
-
-def energy_per_lap() -> go.Figure:
-    d = _load(["TimeStamp", "laps", "Vbat", "Current"])
-    time = d["TimeStamp"] - d["TimeStamp"][0]
-    laps = d["laps"]
-
-    valid = (
-        np.isfinite(time) & np.isfinite(laps) & np.isfinite(d["Vbat"]) & np.isfinite(d["Current"])
-    )
-    time = time[valid]
-    laps = laps[valid]
-    p_kw = (d["Vbat"][valid] * d["Current"][valid]) / 1000.0
-    e_cum = cumulative_trapezoid(p_kw, time, initial=0.0) / 3600.0
-
-    # Filter out lap 0
-    mask = laps > 0
-    time = time[mask]
-    laps = laps[mask]
-    p_kw = p_kw[mask]
-    e_cum = e_cum[mask]
-
-    lap_list = unique_laps(laps)
-    if len(lap_list) >= 2:
-        lap_list = lap_list[:-1]
-
-    n = len(lap_list)
-    e_lap = np.full(n, np.nan)
-    lt_s = np.full(n, np.nan)
-    p_avg = np.full(n, np.nan)
-
-    for i, lap in enumerate(lap_list):
-        idx = np.where(laps == lap)[0]
-        if len(idx) < 2:
-            continue
-        e_lap[i] = e_cum[idx[-1]] - e_cum[idx[0]]
-        lt_s[i] = time[idx[-1]] - time[idx[0]]
-        p_avg[i] = np.nanmean(p_kw[idx])
-
-    ok = np.isfinite(e_lap) & np.isfinite(lt_s) & (e_lap > 0)
-    e_ok = e_lap[ok]
-    lt_ok = lt_s[ok]
-    l_ok = lap_list[ok]
-    p_ok = p_avg[ok]
-
-    e_mean = np.nanmean(e_ok)
-    e_std = np.nanstd(e_ok)
-    cv = 100.0 * e_std / e_mean if e_mean > 0 else np.nan
-    e_total = np.nansum(e_ok)
-    p_mean = np.nanmean(p_ok)
-    p_std = np.nanstd(p_ok)
-
-    if len(e_ok) >= 2:
-        poly_et = np.polyfit(lt_ok, e_ok, 1)
-        slope_e_t = poly_et[0]
-        y_pred = np.polyval(poly_et, lt_ok)
-        ss_res = np.sum((e_ok - y_pred) ** 2)
-        ss_tot = np.sum((e_ok - e_mean) ** 2)
-        r2_e_t = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
-        corr = float(np.corrcoef(lt_ok, e_ok)[0, 1])
-        slope_e_lap = np.polyfit(l_ok, e_ok, 1)[0]
-    else:
-        slope_e_t = r2_e_t = corr = slope_e_lap = np.nan
-
-    i_fastest = int(np.argmin(lt_ok))
-    i_slowest = int(np.argmax(lt_ok))
-    i_min_e = int(np.argmin(e_ok))
-    i_max_e = int(np.argmax(e_ok))
-
-    print("\n===== ENERGY KPIs =====")
-    print(f"Mean energy per lap       : {e_mean:.5f} kWh")
-    print(f"Std energy per lap        : {e_std:.5f} kWh")
-    print(f"Coefficient of variation  : {cv:.2f} %")
-    print(f"Total energy consumed     : {e_total:.4f} kWh")
-    print(f"Lowest energy lap         : L{int(l_ok[i_min_e])} -> {e_ok.min():.5f} kWh")
-    print(f"Highest energy lap        : L{int(l_ok[i_max_e])} -> {e_ok.max():.5f} kWh")
-    print(f"Fastest lap               : L{int(l_ok[i_fastest])} -> {lt_ok.min():.3f} s")
-    print(f"Slowest lap               : L{int(l_ok[i_slowest])} -> {lt_ok.max():.3f} s")
-    print(f"Energy trend              : {slope_e_lap:+.5f} kWh/lap")
-    print(f"Energy sensitivity vs t   : {slope_e_t:+.5f} kWh/s")
-    print(f"Correlation E_lap vs t    : {corr:.3f}")
-    print(f"R² (energy vs laptime)    : {r2_e_t:.3f}")
-    print(f"Mean battery power        : {p_mean:.3f} kW")
-    print(f"Std battery power         : {p_std:.3f} kW")
-
-    print(f"\n{'Lap':>4}  {'LapTime[s]':>10}  {'E_lap[kWh]':>11}  {'P_avg[kW]':>10}")
-    for i, (lap, lt, e, pa) in enumerate(zip(l_ok, lt_ok, e_ok, p_ok)):
-        tag = ""
-        if i == i_fastest:
-            tag = "  <- fastest"
-        elif i == i_min_e:
-            tag = "  <- min energy"
-        print(f"{int(lap):>4}  {lt:>10.3f}  {e:>11.5f}  {pa:>10.3f}{tag}")
-
-    fig = make_dark_figure(
-        title=f"Energy per Lap vs Lap Time  (R² = {r2_e_t:.3f})",
-        xlabel="Lap time [s]",
-        ylabel="Energy per lap [kWh]",
-    )
-    add_lap_scatter(fig, lt_ok, e_ok, l_ok)
-    add_trend_line(fig, lt_ok, e_ok)
-    fig.add_hline(
-        y=e_mean,
-        line=dict(color="rgba(200,200,200,0.4)", dash="dot", width=1),
-    )
-    fig.add_hrect(
-        y0=e_mean - e_std,
-        y1=e_mean + e_std,
-        fillcolor="rgba(77,179,242,0.08)",
-        line_width=0,
-    )
-    return fig
-
-
-# ── 2. Power per wheel (standalone) ─────────────────────────────────────────
-
-
-def power_per_wheel() -> go.Figure:
-    power_cols = [f"{w}_actualPower" for w in WHEELS]
-    d = _load(["laps"] + power_cols)
-    d = exclude_lap0_and_last_lap(d)
-    laps = d["laps"]
-    lap_list = unique_laps(laps)
-    n = len(lap_list)
-
-    p_wheel_kw = np.full((n, 4), np.nan)
-
-    for i, lap in enumerate(lap_list):
-        idx = laps == lap
-        if idx.sum() < 5:
-            continue
-        for j, w in enumerate(WHEELS):
-            p_wheel_kw[i, j] = np.nanmean(d[f"{w}_actualPower"][idx]) / 1000.0
-
-    ok = np.isfinite(p_wheel_kw[:, 0])
-    lp = lap_list[ok]
-    pw = p_wheel_kw[ok]
-
-    p_total = np.nansum(pw, axis=1)
-    p_front = pw[:, 0] + pw[:, 1]
-    mean_total = np.nanmean(p_total)
-    fr_pct = np.nanmean(p_front) / mean_total * 100 if mean_total > 0 else np.nan
-    p_left = pw[:, 0] + pw[:, 2]
-    lr_pct = np.nanmean(p_left) / mean_total * 100 if mean_total > 0 else np.nan
-
-    print("\n===== POWER DISTRIBUTION KPIs =====")
-    print(f"Mean total power          : {mean_total:.3f} kW")
-    print(f"Front/Rear split          : {fr_pct:.1f}% / {100 - fr_pct:.1f}%")
-    print(f"Left/Right split          : {lr_pct:.1f}% / {100 - lr_pct:.1f}%")
-    for j, w in enumerate(WHEELS):
-        w_pct = np.nanmean(pw[:, j]) / mean_total * 100 if mean_total > 0 else np.nan
-        print(f"  {w} mean power            : {np.nanmean(pw[:, j]):.3f} kW ({w_pct:.1f}%)")
-
-    print(f"\n{'Lap':>4}", end="")
-    for w in WHEELS:
-        print(f"  {w + '[kW]':>9}", end="")
-    print(f"  {'Total[kW]':>10}  {'F/R%':>6}")
-    for i in range(len(lp)):
-        total = np.nansum(pw[i])
-        fr = (pw[i, 0] + pw[i, 1]) / total * 100 if total > 0 else np.nan
-        print(f"{int(lp[i]):>4}", end="")
-        for j in range(4):
-            print(f"  {pw[i, j]:>9.3f}", end="")
-        print(f"  {total:>10.3f}  {fr:>5.1f}%")
-
-    fig = make_dark_figure(
-        title="Mean Electrical Power per Wheel",
-        xlabel="Lap",
-        ylabel="Power [kW]",
-    )
-    for j, w in enumerate(WHEELS):
-        fig.add_trace(
-            go.Scatter(
-                x=lp,
-                y=pw[:, j],
-                mode="lines+markers",
-                name=w,
-                line=dict(color=WHEEL_COLORS[w], width=1.5),
-                marker=dict(size=7),
-            )
-        )
-    fig.update_xaxes(tickvals=lp.astype(int))
-    return fig
-
-
-# ── 3. Battery status (standalone) ──────────────────────────────────────────
-
-
-def battery_status() -> go.Figure:
-    d = _load(["laps", "TimeStamp", "SoC", "Vbat", "Current", "Vmin"])
-    d = exclude_lap0_and_last_lap(d)
-    laps = d["laps"]
-    lap_list = unique_laps(laps)
-    n = len(lap_list)
-
-    soc_end = np.full(n, np.nan)
-    soc_drop = np.full(n, np.nan)
-    vbat_mean_v = np.full(n, np.nan)
-    vbat_min_v = np.full(n, np.nan)
-    i_mean_a = np.full(n, np.nan)
-
-    for i, lap in enumerate(lap_list):
-        idx = np.where(laps == lap)[0]
-        if len(idx) < 5:
-            continue
-        soc_end[i] = d["SoC"][idx[-1]]
-        soc_drop[i] = d["SoC"][idx[0]] - d["SoC"][idx[-1]]
-        vbat_mean_v[i] = np.nanmean(d["Vbat"][idx])
-        vbat_min_v[i] = np.nanmin(d["Vbat"][idx])
-        i_mean_a[i] = np.nanmean(d["Current"][idx])
-
-    ok = np.isfinite(soc_end)
-    lp = lap_list[ok]
-    soc = soc_end[ok]
-    sd = soc_drop[ok]
-    vm = vbat_mean_v[ok]
-    vn = vbat_min_v[ok]
-    im = i_mean_a[ok]
-
-    soc_start = soc[0] + sd[0] if len(soc) > 0 else np.nan
-
-    print("\n===== BATTERY KPIs =====")
-    print(f"SoC start                 : {soc_start:.1f} %")
-    print(f"SoC end                   : {soc[-1]:.1f} %")
-    print(f"Total SoC consumed        : {np.nansum(sd):.1f} %")
-    print(f"Mean SoC drop per lap     : {np.nanmean(sd):.2f} %")
-    print(f"Mean battery voltage      : {np.nanmean(vm):.2f} V")
-    print(f"Min battery voltage       : {np.nanmin(vn):.2f} V")
-    print(f"Voltage sag (mean-min)    : {np.nanmean(vm) - np.nanmin(vn):.2f} V")
-    print(f"Mean current draw         : {np.nanmean(im):.1f} A")
-
-    print(f"\n{'Lap':>4}  {'SoC[%]':>7}  {'dSoC[%]':>8}  {'Vbat[V]':>8}  {'Vmin[V]':>8}")
-    for lap, s, drop, v, vmin in zip(lp, soc, sd, vm, vn):
-        print(f"{int(lap):>4}  {s:>7.1f}  {drop:>8.2f}  {v:>8.2f}  {vmin:>8.2f}")
-
-    fig = _dark_subplots(
+    *runs* maps run_name -> (x values, {wheel: y values}). Run identity is
+    colour (driver_color); wheel identity is the panel position.
+    """
+    pos = {"FL": (1, 1), "FR": (1, 2), "RL": (2, 1), "RR": (2, 2)}
+    fig = make_subplots(
         rows=2,
-        titles=["SoC Evolution", "Battery Voltage"],
-        ylabels=["SoC [%]", "Voltage [V]"],
+        cols=2,
+        subplot_titles=list(WHEELS),
+        shared_xaxes=True,
+        shared_yaxes=True,
+        horizontal_spacing=0.07,
+        vertical_spacing=0.12,
     )
-    fig.add_trace(
-        go.Scatter(
-            x=lp,
-            y=soc,
-            mode="lines+markers",
-            name="SoC",
-            line=dict(color="#4DB3F2", width=2),
-            marker=dict(size=7),
-        ),
-        row=1,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=lp,
-            y=vm,
-            mode="lines+markers",
-            name="Vbat mean",
-            line=dict(color="#73D973", width=1.5),
-            marker=dict(size=6),
-        ),
-        row=2,
-        col=1,
-    )
-    fig.update_xaxes(title_text="Lap", tickvals=lp.astype(int), row=2, col=1)
-    fig.update_layout(
-        height=560,
-        title_text="Battery Status per Lap",
-        title_font=dict(color=_TEXT, size=14),
-    )
-    return fig
-
-
-# ── 4. Thermal evolution (standalone) ───────────────────────────────────────
-
-
-def thermal_evolution() -> go.Figure:
-    motor_cols = [f"{w}_motorTemperature" for w in WHEELS]
-    inv_cols = [f"{w}_inverterTemperature" for w in WHEELS]
-    batt_cols = ["Tmax", "Tavg"]
-
-    d = _load(["laps"] + motor_cols + inv_cols + batt_cols)
-    d = exclude_lap0_and_last_lap(d)
-    laps = d["laps"]
-    lap_list = unique_laps(laps)
-    n = len(lap_list)
-
-    T_motor = np.full((n, 4), np.nan)
-    T_inv = np.full((n, 4), np.nan)
-    T_batt = np.full((n, 2), np.nan)
-
-    for i, lap in enumerate(lap_list):
-        idx = laps == lap
-        if idx.sum() < 5:
-            continue
-        for j, w in enumerate(WHEELS):
-            T_motor[i, j] = np.nanpercentile(d[f"{w}_motorTemperature"][idx], 95)
-            T_inv[i, j] = np.nanpercentile(d[f"{w}_inverterTemperature"][idx], 95)
-        T_batt[i, 0] = np.nanmax(d["Tmax"][idx])
-        T_batt[i, 1] = np.nanpercentile(d["Tavg"][idx], 95)
-
-    ok = np.isfinite(T_motor[:, 0])
-    lp = lap_list[ok]
-    Tm = T_motor[ok]
-    Ti = T_inv[ok]
-    Tb = T_batt[ok]
-
-    def slope(x: np.ndarray, y: np.ndarray) -> float:
-        return float(np.polyfit(x, y, 1)[0]) if len(x) >= 2 else np.nan
-
-    motor_lr = (Tm[:, 0] + Tm[:, 2]) / 2 - (Tm[:, 1] + Tm[:, 3]) / 2
-    inv_lr = (Ti[:, 0] + Ti[:, 2]) / 2 - (Ti[:, 1] + Ti[:, 3]) / 2
-
-    print("\n===== THERMAL KPIs =====")
-    print(f"Motor dT Left-Right (mean)  : {np.nanmean(motor_lr):+.2f} C")
-    print(f"Inverter dT Left-Right (mean): {np.nanmean(inv_lr):+.2f} C")
-    for j, w in enumerate(WHEELS):
-        print(f"  Motor peak P95 ({w})       : {np.nanmax(Tm[:, j]):.1f} C")
-    for j, w in enumerate(WHEELS):
-        print(f"  Inverter peak P95 ({w})     : {np.nanmax(Ti[:, j]):.1f} C")
-    print(f"Battery Tmax peak           : {np.nanmax(Tb[:, 0]):.1f} C")
-    print(f"Battery Tavg peak P95       : {np.nanmax(Tb[:, 1]):.1f} C")
-    print(f"Motor avg thermal slope     : {slope(lp, np.nanmean(Tm, axis=1)):+.2f} C/lap")
-    print(f"Inverter avg thermal slope  : {slope(lp, np.nanmean(Ti, axis=1)):+.2f} C/lap")
-    print(f"Battery Tmax slope          : {slope(lp, Tb[:, 0]):+.2f} C/lap")
-    for j, w in enumerate(WHEELS):
-        mi_delta = np.nanmean(Tm[:, j] - Ti[:, j])
-        print(f"  Motor-Inverter dT ({w})   : {mi_delta:+.2f} C")
-
-    fig = make_dark_figure(
-        title="Thermal Evolution per Lap (P95)",
-        xlabel="Lap",
-        ylabel="Temperature [C]",
-    )
-    for j, w in enumerate(WHEELS):
-        fig.add_trace(
-            go.Scatter(
-                x=lp,
-                y=Tm[:, j],
-                mode="lines+markers",
-                name=f"Motor {w}",
-                line=dict(color=WHEEL_COLORS[w], width=1.5),
-                marker=dict(size=7),
+    apply_dark_layout(fig, single_axes=False)
+    for run_name, (x, ys) in runs.items():
+        for w, (r, c) in pos.items():
+            if w not in ys:
+                continue
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=ys[w],
+                    mode="lines+markers",
+                    name=run_name,
+                    legendgroup=run_name,
+                    showlegend=(w == "FL"),
+                    line=dict(color=driver_color(run_name), width=2),
+                    marker=dict(size=6),
+                ),
+                row=r,
+                col=c,
             )
+    for _w, (r, c) in pos.items():
+        fig.update_xaxes(
+            title_text=xlabel if r == 2 else None,
+            tickvals=lap_ticks,
+            gridcolor=_GRID,
+            color=_AXIS,
+            row=r,
+            col=c,
         )
-        fig.add_trace(
-            go.Scatter(
-                x=lp,
-                y=Ti[:, j],
-                mode="lines",
-                name=f"Inv {w}",
-                line=dict(color=WHEEL_COLORS[w], dash="dash", width=1.0),
-            )
+        fig.update_yaxes(
+            title_text=ylabel if c == 1 else None,
+            gridcolor=_GRID,
+            color=_AXIS,
+            row=r,
+            col=c,
         )
-    fig.add_trace(
-        go.Scatter(
-            x=lp,
-            y=Tb[:, 0],
-            mode="lines+markers",
-            name="Battery Tmax",
-            line=dict(color="white", width=2),
-            marker=dict(size=7),
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=lp,
-            y=Tb[:, 1],
-            mode="lines",
-            name="Battery Tavg",
-            line=dict(color="white", dash="dot", width=1.2),
-        )
-    )
-    fig.update_xaxes(tickvals=lp.astype(int))
+    fig.update_layout(height=560, title=dict(text=title, font=dict(color=_TEXT, size=14)))
+    for ann in fig.layout.annotations:
+        ann.font.color = _TEXT
+        ann.font.size = 12
     return fig
 
 
@@ -706,486 +387,6 @@ def energy_per_lap_fig(
     return fig, kpis
 
 
-# ── Energy budget ────────────────────────────────────────────────────────────
-
-
-_BATTERY_POWER_COLS = (
-    "BMS_power",
-    "BMS_Power",
-    "BatteryPower",
-    "Battery_power",
-    "P_batt",
-)
-_VOLT_CURRENT_COLS = (
-    ("BMS_voltage", "BMS_current"),
-    ("BMS_Voltage", "BMS_Current"),
-    ("Vbat", "Current"),
-)
-
-
-def _empty_energy_budget_fig(message: str) -> go.Figure:
-    fig = make_dark_figure(
-        title="Energy Budget per Lap — No data",
-        xlabel="Lap",
-        ylabel="Energy [kJ]",
-    )
-    fig.add_annotation(
-        text=message,
-        x=0.5,
-        y=0.5,
-        xref="paper",
-        yref="paper",
-        showarrow=False,
-        font=dict(color=_TEXT, size=13),
-    )
-    return fig
-
-
-def _battery_power_w(df: pl.DataFrame) -> tuple[np.ndarray | None, str, list[str]]:
-    """Return battery power [W], source label and warnings."""
-    for col in _BATTERY_POWER_COLS:
-        if col in df.columns:
-            return df[col].to_numpy().astype(float), col, []
-
-    for voltage_col, current_col in _VOLT_CURRENT_COLS:
-        if voltage_col in df.columns and current_col in df.columns:
-            voltage = df[voltage_col].to_numpy().astype(float)
-            current = df[current_col].to_numpy().astype(float)
-            return voltage * current, f"{voltage_col}*{current_col}", []
-
-    power_cols = [f"{w}_actualPower" for w in WHEELS]
-    if all(c in df.columns for c in power_cols):
-        p_w = np.zeros(len(df), dtype=float)
-        for col in power_cols:
-            p_w += df[col].to_numpy().astype(float)
-        return (
-            p_w,
-            "sum(*_actualPower)",
-            ["Battery power unavailable; using summed inverter `*_actualPower` as fallback."],
-        )
-
-    return None, "unavailable", ["No battery or inverter power signal found."]
-
-
-def _energy_budget_lap_rows(
-    dfs: dict[str, pl.DataFrame],
-    *,
-    include_samples: bool = False,
-) -> tuple[list[dict[str, object]], dict[str, dict[str, float]], list[str]]:
-    rows: list[dict[str, object]] = []
-    warnings: list[str] = []
-    run_kpis: dict[str, dict[str, float]] = {}
-
-    for run_name, df in dfs.items():
-        try:
-            df = ensure_complete_laps_df(df)
-        except Exception as exc:
-            warnings.append(f"{run_name}: {exc}")
-            continue
-
-        speed_col = "VN_vx" if "VN_vx" in df.columns else "Est_vxCOG"
-        ay_col = "Filtering_VN_ay" if "Filtering_VN_ay" in df.columns else "VN_ay"
-        required = ["TimeStamp", "laps", "laptime", speed_col, ay_col]
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            warnings.append(f"{run_name}: missing {missing}")
-            continue
-
-        p_batt_w, power_source, source_warnings = _battery_power_w(df)
-        warnings.extend([f"{run_name}: {w}" for w in source_warnings])
-        if p_batt_w is None:
-            continue
-
-        cols = cols_to_numpy(df, required)
-        time_s = cols["TimeStamp"]
-        laps = cols["laps"]
-        laptime_s = cols["laptime"]
-        vx_mps = np.abs(cols[speed_col])
-        ay_mps2 = cols[ay_col]
-        dist_m = lap_dist_from_gps(df)
-
-        run_rows: list[dict[str, object]] = []
-        for lap in unique_laps(laps):
-            idx = np.where(laps == lap)[0]
-            if len(idx) < 5:
-                continue
-
-            valid = (
-                np.isfinite(time_s[idx])
-                & np.isfinite(vx_mps[idx])
-                & np.isfinite(ay_mps2[idx])
-                & np.isfinite(p_batt_w[idx])
-            )
-            if int(valid.sum()) < 5:
-                continue
-
-            lap_idx = idx[valid]
-            order = np.argsort(time_s[lap_idx])
-            lap_idx = lap_idx[order]
-            t_s = time_s[lap_idx] - time_s[lap_idx][0]
-            if not np.isfinite(t_s[-1]) or t_s[-1] <= 0.0:
-                continue
-
-            v = vx_mps[lap_idx]
-            ay = ay_mps2[lap_idx]
-            p_batt = p_batt_w[lap_idx]
-
-            f_aero_n = 0.5 * RHO_AIR_KGM3 * v**2 * abs(CL_AERO) * A_AERO_M2
-            f_drag_n = 0.5 * RHO_AIR_KGM3 * v**2 * CD_AERO * A_AERO_M2
-            f_rolling_n = CRR_TIRE * (MASS_KG * G_MS2 + f_aero_n)
-            p_drag_w = f_drag_n * v
-            p_rolling_w = f_rolling_n * v
-            p_corn_w = ((MASS_KG * ay) ** 2 / (2.0 * CALPHA_AXLE_TOTAL)) * v
-            p_model_w = p_drag_w + p_rolling_w + p_corn_w
-
-            e_drag_j = float(np.trapezoid(p_drag_w, t_s))
-            e_rolling_j = float(np.trapezoid(p_rolling_w, t_s))
-            e_corn_j = float(np.trapezoid(p_corn_w, t_s))
-            e_model_j = e_drag_j + e_rolling_j + e_corn_j
-            e_measured_j = float(np.trapezoid(p_batt, t_s))
-            e_regen_j = float(np.trapezoid(np.clip(-p_batt, 0.0, None), t_s))
-            e_consumed_j = float(np.trapezoid(np.clip(p_batt, 0.0, None), t_s))
-            e_residual_j = e_measured_j - e_model_j
-
-            lt = float(np.nanmax(laptime_s[lap_idx]))
-            if not np.isfinite(lt) or lt <= 0.0:
-                lt = float(t_s[-1])
-
-            row: dict[str, object] = {
-                "run": run_name,
-                "lap": int(lap),
-                "laptime_s": lt,
-                "power_source": power_source,
-                "e_drag_j": e_drag_j,
-                "e_rolling_j": e_rolling_j,
-                "e_corn_j": e_corn_j,
-                "e_model_j": e_model_j,
-                "e_measured_j": e_measured_j,
-                "e_residual_j": e_residual_j,
-                "e_regen_j": e_regen_j,
-                "e_consumed_j": e_consumed_j,
-                "mean_speed_mps": float(np.nanmean(v)),
-            }
-            if include_samples:
-                row["samples"] = {
-                    "distance_m": dist_m[lap_idx],
-                    "time_s": t_s,
-                    "p_drag_w": p_drag_w,
-                    "p_rolling_w": p_rolling_w,
-                    "p_corn_w": p_corn_w,
-                    "p_residual_w": p_batt - p_model_w,
-                    "p_batt_w": p_batt,
-                    "p_model_w": p_model_w,
-                }
-            rows.append(row)
-            run_rows.append(row)
-
-        if not run_rows:
-            warnings.append(f"{run_name}: no valid laps for energy budget.")
-            continue
-
-        measured = np.array([float(r["e_measured_j"]) for r in run_rows])
-        model = np.array([float(r["e_model_j"]) for r in run_rows])
-        residual = np.array([float(r["e_residual_j"]) for r in run_rows])
-        regen = np.array([float(r["e_regen_j"]) for r in run_rows])
-        drag = np.array([float(r["e_drag_j"]) for r in run_rows])
-        corn = np.array([float(r["e_corn_j"]) for r in run_rows])
-        measured_pos = np.where(np.abs(measured) > 1e-6, measured, np.nan)
-        run_kpis[run_name] = {
-            "mean_energy_per_lap_kj": float(np.nanmean(measured) / 1000.0),
-            "mean_model_efficiency": float(np.nanmean(model / measured_pos)),
-            "mean_residual_kj": float(np.nanmean(residual) / 1000.0),
-            "mean_regen_recovery_kj": float(np.nanmean(regen) / 1000.0),
-            "mean_drag_share": float(np.nanmean(drag / measured_pos)),
-            "mean_corn_share": float(np.nanmean(corn / measured_pos)),
-            "laps": float(len(run_rows)),
-            "power_source": power_source,
-        }
-        if np.nanmean(model / measured_pos) > 1.0:
-            warnings.append(
-                f"{run_name}: model energy exceeds measured battery energy on average; "
-                "check current sign or vehicle parameters."
-            )
-
-    return rows, run_kpis, warnings
-
-
-def energy_budget_per_lap_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
-    """Per-lap physical energy model compared with measured battery energy."""
-    rows, run_kpis, warnings = _energy_budget_lap_rows(dfs)
-    if not rows:
-        fig = _empty_energy_budget_fig("No valid energy-budget data.")
-        return fig, {"runs": run_kpis, "warnings": warnings + ["No valid energy-budget data."]}
-
-    rows = sorted(rows, key=lambda r: (str(r["run"]), int(r["lap"])))
-    n = len(rows)
-    centers = np.arange(n, dtype=float)
-    x_model = centers - 0.18
-    x_meas = centers + 0.18
-    width = 0.34
-
-    drag_kj = np.array([float(r["e_drag_j"]) for r in rows]) / 1000.0
-    rolling_kj = np.array([float(r["e_rolling_j"]) for r in rows]) / 1000.0
-    corn_kj = np.array([float(r["e_corn_j"]) for r in rows]) / 1000.0
-    residual_kj = np.array([float(r["e_residual_j"]) for r in rows]) / 1000.0
-    model_kj = drag_kj + rolling_kj + corn_kj
-    measured_kj = np.array([float(r["e_measured_j"]) for r in rows]) / 1000.0
-    laptime_s = np.array([float(r["laptime_s"]) for r in rows])
-    run_names = [str(r["run"]) for r in rows]
-    laps = np.array([int(r["lap"]) for r in rows])
-    power_sources = [str(r["power_source"]) for r in rows]
-    ticktext = [
-        f"L{lap}<br>{run}" if len(dfs) > 1 else f"L{lap}" for lap, run in zip(laps, run_names)
-    ]
-
-    unique_runs = list(dict.fromkeys(run_names))
-    run_color = {name: driver_color(name) for name in unique_runs}
-    border_colors = [run_color[name] for name in run_names]
-
-    fig = make_dark_figure(
-        title="Energy Budget per Lap — Predicted vs Measured",
-        xlabel="Lap",
-        ylabel="Energy [kJ]",
-    )
-
-    custom = np.array(list(zip(run_names, laps, laptime_s, power_sources)), dtype=object)
-
-    def _bar(
-        *,
-        x: np.ndarray,
-        y: np.ndarray,
-        base: np.ndarray,
-        name: str,
-        color: str,
-        opacity: float,
-        legendgroup: str,
-        customdata: np.ndarray = custom,
-    ) -> None:
-        fig.add_trace(
-            go.Bar(
-                x=x,
-                y=y,
-                base=base,
-                width=width,
-                name=name,
-                legendgroup=legendgroup,
-                marker=dict(
-                    color=color,
-                    opacity=opacity,
-                    line=dict(color=border_colors, width=1.2),
-                ),
-                customdata=customdata,
-                hovertemplate=(
-                    "Run=%{customdata[0]}<br>"
-                    "Lap=%{customdata[1]}<br>"
-                    "Laptime=%{customdata[2]:.2f} s<br>"
-                    "Power source=%{customdata[3]}<br>"
-                    f"{name}=%{{y:.1f}} kJ<extra></extra>"
-                ),
-            )
-        )
-
-    zeros = np.zeros(n)
-    _bar(
-        x=x_model,
-        y=drag_kj,
-        base=zeros,
-        name="Model drag",
-        color="#4DB3F2",
-        opacity=0.95,
-        legendgroup="model",
-    )
-    _bar(
-        x=x_model,
-        y=rolling_kj,
-        base=drag_kj,
-        name="Model rolling",
-        color="#9CA3AF",
-        opacity=0.95,
-        legendgroup="model",
-    )
-    _bar(
-        x=x_model,
-        y=corn_kj,
-        base=drag_kj + rolling_kj,
-        name="Model cornering scrub",
-        color="#F28C40",
-        opacity=0.95,
-        legendgroup="model",
-    )
-
-    _bar(
-        x=x_meas,
-        y=drag_kj,
-        base=zeros,
-        name="Measured: model drag",
-        color="#4DB3F2",
-        opacity=0.35,
-        legendgroup="measured",
-    )
-    _bar(
-        x=x_meas,
-        y=rolling_kj,
-        base=drag_kj,
-        name="Measured: model rolling",
-        color="#9CA3AF",
-        opacity=0.35,
-        legendgroup="measured",
-    )
-    _bar(
-        x=x_meas,
-        y=corn_kj,
-        base=drag_kj + rolling_kj,
-        name="Measured: model scrub",
-        color="#F28C40",
-        opacity=0.35,
-        legendgroup="measured",
-    )
-    _bar(
-        x=x_meas,
-        y=residual_kj,
-        base=model_kj,
-        name="Measured residual",
-        color="#F25555",
-        opacity=0.85,
-        legendgroup="measured",
-    )
-
-    y_top = np.maximum(model_kj, measured_kj)
-    pad = max(3.0, float(np.nanmax(np.abs(y_top))) * 0.03)
-    for x, y, lt in zip(centers, y_top, laptime_s):
-        if np.isfinite(y) and np.isfinite(lt):
-            fig.add_annotation(
-                x=float(x),
-                y=float(y + pad),
-                text=f"{lt:.1f}s",
-                showarrow=False,
-                font=dict(color="rgba(235,235,235,0.72)", size=10),
-                textangle=-35,
-            )
-
-    sources = ", ".join(sorted(set(power_sources)))
-    fig.add_annotation(
-        x=1.0,
-        y=1.03,
-        xref="paper",
-        yref="paper",
-        text=f"Measured source: {sources}",
-        showarrow=False,
-        xanchor="right",
-        font=dict(color="rgba(235,235,235,0.65)", size=11),
-    )
-    fig.update_layout(
-        height=760,
-        barmode="overlay",
-        bargap=0.25,
-        title_font=dict(color=_TEXT, size=14),
-        legend=dict(orientation="h", yanchor="bottom", y=1.06, xanchor="center", x=0.5),
-    )
-    fig.update_xaxes(tickvals=centers, ticktext=ticktext)
-
-    table = pl.DataFrame(
-        {
-            "Run": run_names,
-            "Lap": laps,
-            "Laptime [s]": np.round(laptime_s, 3),
-            "Measured [kJ]": np.round(measured_kj, 2),
-            "Model [kJ]": np.round(model_kj, 2),
-            "Residual [kJ]": np.round(residual_kj, 2),
-            "Drag [kJ]": np.round(drag_kj, 2),
-            "Rolling [kJ]": np.round(rolling_kj, 2),
-            "Cornering [kJ]": np.round(corn_kj, 2),
-            "Regen [kJ]": np.round(np.array([float(r["e_regen_j"]) for r in rows]) / 1000.0, 2),
-            "Consumed [kJ]": np.round(
-                np.array([float(r["e_consumed_j"]) for r in rows]) / 1000.0, 2
-            ),
-            "Mean speed [m/s]": np.round(np.array([float(r["mean_speed_mps"]) for r in rows]), 2),
-            "Power source": power_sources,
-        }
-    )
-    kpis: dict[str, object] = {
-        **run_kpis,
-        "runs": run_kpis,
-        "table": table,
-        "warnings": warnings,
-        "power_sources": sorted(set(power_sources)),
-    }
-    return fig, kpis
-
-
-def energy_budget_breakdown_fig(
-    dfs: dict[str, pl.DataFrame],
-    run_name: str | None = None,
-    lap: int | None = None,
-) -> go.Figure:
-    """Power-budget breakdown along distance for one lap."""
-    rows, _run_kpis, warnings = _energy_budget_lap_rows(dfs, include_samples=True)
-    rows_with_samples = [r for r in rows if "samples" in r]
-    if not rows_with_samples:
-        message = warnings[0] if warnings else "No valid energy-budget lap samples."
-        return _empty_energy_budget_fig(message)
-
-    if run_name is not None and lap is not None:
-        selected = [
-            r
-            for r in rows_with_samples
-            if str(r["run"]) == str(run_name) and int(r["lap"]) == int(lap)
-        ]
-    else:
-        first_run = next(iter(dfs.keys()))
-        selected = [r for r in rows_with_samples if str(r["run"]) == str(first_run)]
-
-    if not selected:
-        selected = rows_with_samples
-
-    row = min(selected, key=lambda r: float(r["laptime_s"]))
-    samples = row["samples"]
-    assert isinstance(samples, dict)
-
-    dist_m = np.asarray(samples["distance_m"], dtype=float)
-    if not np.any(np.isfinite(dist_m)) or float(np.nanmax(dist_m)) <= 1.0:
-        dist_m = np.asarray(samples["time_s"], dtype=float)
-        xlabel = "Lap time [s]"
-    else:
-        xlabel = "Distance [m]"
-
-    fig = make_dark_figure(
-        title=f"Energy Budget Breakdown — {row['run']} L{int(row['lap'])}",
-        xlabel=xlabel,
-        ylabel="Power [kW]",
-    )
-    series = [
-        ("Drag", np.asarray(samples["p_drag_w"], dtype=float) / 1000.0, "#4DB3F2"),
-        ("Rolling", np.asarray(samples["p_rolling_w"], dtype=float) / 1000.0, "#9CA3AF"),
-        ("Cornering scrub", np.asarray(samples["p_corn_w"], dtype=float) / 1000.0, "#F28C40"),
-        ("Residual", np.asarray(samples["p_residual_w"], dtype=float) / 1000.0, "#F25555"),
-    ]
-    for name, values, color in series:
-        fig.add_trace(
-            go.Scatter(
-                x=dist_m,
-                y=values,
-                mode="lines",
-                name=name,
-                stackgroup="budget",
-                line=dict(color=color, width=1.2),
-                hovertemplate=f"{name}: %{{y:.1f}} kW<extra></extra>",
-            )
-        )
-    fig.add_trace(
-        go.Scatter(
-            x=dist_m,
-            y=np.asarray(samples["p_batt_w"], dtype=float) / 1000.0,
-            mode="lines",
-            name="Measured battery",
-            line=dict(color="#FFFFFF", width=1.6),
-            hovertemplate="Measured battery: %{y:.1f} kW<extra></extra>",
-        )
-    )
-    fig.update_layout(height=520, title_font=dict(color=_TEXT, size=14))
-    return fig
-
-
 # ── Power per wheel ──────────────────────────────────────────────────────────
 
 
@@ -1246,25 +447,39 @@ def power_per_wheel_fig(
     fr_pct = float(np.nanmean(p_front) / mean_total * 100) if mean_total > 0 else np.nan
     lr_pct = float(np.nanmean(p_left) / mean_total * 100) if mean_total > 0 else np.nan
 
-    x_arr, order, xlabel = per_lap_axis(lp_arr, lt_arr, x_mode)
-    fig = make_dark_figure(
-        title=f"Mean Electrical Power per Wheel vs {'Lap Time' if x_mode == 'laptime' else 'Lap'}",
-        xlabel=xlabel,
-        ylabel="Power [kW]",
-    )
-    for j, w in enumerate(WHEELS):
-        fig.add_trace(
-            go.Scatter(
-                x=x_arr,
-                y=pw_arr[order, j],
-                mode="lines+markers",
-                name=w,
-                line=dict(color=WHEEL_COLORS[w], width=1.5),
-                marker=dict(size=7),
-            )
+    title = f"Mean Electrical Power per Wheel vs {'Lap Time' if x_mode == 'laptime' else 'Lap'}"
+    run_names = list(dict.fromkeys(run_all))
+    if len(run_names) > 1:
+        grid_runs: dict[str, tuple[np.ndarray, dict[str, np.ndarray]]] = {}
+        xlabel = "Lap"
+        for rn in run_names:
+            m = np.array([r == rn for r in run_all])
+            x_run, order_run, xlabel = per_lap_axis(lp_arr[m], lt_arr[m], x_mode)
+            pw_run = pw_arr[m]
+            grid_runs[rn] = (x_run, {w: pw_run[order_run, j] for j, w in enumerate(WHEELS)})
+        fig = _per_wheel_run_grid(
+            grid_runs,
+            title=title,
+            xlabel=xlabel,
+            ylabel="Power [kW]",
+            lap_ticks=np.unique(lp_arr.astype(int)) if x_mode == "laps" else None,
         )
-    if x_mode == "laps":
-        fig.update_xaxes(tickvals=np.sort(lp_arr.astype(int)))
+    else:
+        x_arr, order, xlabel = per_lap_axis(lp_arr, lt_arr, x_mode)
+        fig = make_dark_figure(title=title, xlabel=xlabel, ylabel="Power [kW]")
+        for j, w in enumerate(WHEELS):
+            fig.add_trace(
+                go.Scatter(
+                    x=x_arr,
+                    y=pw_arr[order, j],
+                    mode="lines+markers",
+                    name=w,
+                    line=dict(color=WHEEL_COLORS[w], width=2),
+                    marker=dict(size=7),
+                )
+            )
+        if x_mode == "laps":
+            fig.update_xaxes(tickvals=np.sort(lp_arr.astype(int)))
 
     table: dict[str, object] = {"Lap": lp_arr, "LapTime [s]": np.round(lt_arr, 3)}
     for j, w in enumerate(WHEELS):
@@ -1289,30 +504,411 @@ def power_per_wheel_fig(
     return fig, kpis
 
 
-# ── Battery status ───────────────────────────────────────────────────────────
+# ── Inverter load (overload + i²t) ─────────────────────────────────────────────
 
 
-def battery_status_fig(
+def inverter_limits_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """How much of each inverter's overload / i²t thermal budget is being used?
+
+    Two per-lap reads: % time the OverloadActive flag is set, and the P95 i²t load
+    (IxTLoad, 1.0 = budget exhausted). The front inverters run markedly harder than
+    the rear in these logs. kpis: overload_pct / ixt_peak (per wheel, whole run),
+    table, warnings. FWActive is flat-zero in these logs (not shown).
+    """
+    warnings: list[str] = []
+    laps_all: list[int] = []
+    ov_all: list[list[float]] = []
+    ixt_all: list[list[float]] = []
+    run_all: list[str] = []
+    ov_run: dict[str, list[np.ndarray]] = {w: [] for w in WHEELS}
+    ixt_run: dict[str, list[np.ndarray]] = {w: [] for w in WHEELS}
+
+    for run_name, df in dfs.items():
+        df = ensure_complete_laps_df(df)
+        needed = (
+            ["laps"] + [f"{w}_OverloadActive" for w in WHEELS] + [f"{w}_IxTLoad" for w in WHEELS]
+        )
+        missing = [c for c in needed if c not in df.columns]
+        if missing:
+            warnings.append(f"{run_name}: missing {missing}")
+            continue
+        cols = cols_to_numpy(df, needed)
+        laps = cols["laps"]
+        for w in WHEELS:
+            ov_run[w].append(cols[f"{w}_OverloadActive"])
+            ixt_run[w].append(cols[f"{w}_IxTLoad"])
+        for lap in unique_laps(laps):
+            idx = laps == lap
+            if idx.sum() < 50:
+                continue
+            ov = [
+                float(np.nanmean(cols[f"{w}_OverloadActive"][idx] == 1.0) * 100.0) for w in WHEELS
+            ]
+            ix = [float(np.nanpercentile(cols[f"{w}_IxTLoad"][idx], 95)) for w in WHEELS]
+            laps_all.append(int(lap))
+            ov_all.append(ov)
+            ixt_all.append(ix)
+            run_all.append(run_name)
+
+    if not ov_all:
+        return make_dark_figure(title="Inverter Limits — No data"), {
+            "warnings": warnings + ["No overload / IxT data."]
+        }
+
+    lp = np.array(laps_all)
+    ov = np.array(ov_all)
+    ix = np.array(ixt_all)
+    lap_ticks = np.sort(np.unique(lp.astype(int)))
+    run_names = list(dict.fromkeys(run_all))
+    if len(run_names) > 1:
+        # Rows = metric (overload / i²t), columns = wheel; one line per run.
+        fig = make_subplots(
+            rows=2,
+            cols=4,
+            subplot_titles=list(WHEELS),
+            shared_xaxes=True,
+            shared_yaxes=True,
+            horizontal_spacing=0.045,
+            vertical_spacing=0.10,
+        )
+        apply_dark_layout(fig, single_axes=False)
+        for rn in run_names:
+            m = np.array([r == rn for r in run_all])
+            color = driver_color(rn)
+            for j in range(len(WHEELS)):
+                for row, vals in ((1, ov), (2, ix)):
+                    fig.add_trace(
+                        go.Scatter(
+                            x=lp[m],
+                            y=vals[m][:, j],
+                            mode="lines+markers",
+                            name=rn,
+                            legendgroup=rn,
+                            showlegend=(row == 1 and j == 0),
+                            line=dict(color=color, width=2),
+                            marker=dict(size=5),
+                        ),
+                        row=row,
+                        col=j + 1,
+                    )
+        for j in range(1, len(WHEELS) + 1):
+            fig.add_hline(y=1.0, line=dict(color="#E74C3C", dash="dash", width=1.0), row=2, col=j)
+            for row in (1, 2):
+                fig.update_xaxes(
+                    title_text="Lap" if row == 2 else None,
+                    tickvals=lap_ticks,
+                    gridcolor=_GRID,
+                    color=_AXIS,
+                    row=row,
+                    col=j,
+                )
+                fig.update_yaxes(gridcolor=_GRID, color=_AXIS, row=row, col=j)
+        fig.update_yaxes(title_text="Overload [% lap]", row=1, col=1)
+        fig.update_yaxes(title_text="IxT P95 [–]", row=2, col=1)
+        fig.update_layout(height=520)
+        for ann in fig.layout.annotations:
+            ann.font.color = _TEXT
+            ann.font.size = 12
+    else:
+        fig = _dark_subplots(
+            rows=2,
+            titles=["Time in Overload per Lap", "i²t Load per Lap (P95)"],
+            ylabels=["Overload [% lap]", "IxT load [–]"],
+        )
+        for j, w in enumerate(WHEELS):
+            fig.add_trace(
+                go.Scatter(
+                    x=lp,
+                    y=ov[:, j],
+                    mode="lines+markers",
+                    name=w,
+                    legendgroup=w,
+                    line=dict(color=WHEEL_COLORS[w], width=2),
+                    marker=dict(size=6),
+                ),
+                row=1,
+                col=1,
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=lp,
+                    y=ix[:, j],
+                    mode="lines+markers",
+                    name=w,
+                    legendgroup=w,
+                    showlegend=False,
+                    line=dict(color=WHEEL_COLORS[w], width=2),
+                    marker=dict(size=6),
+                ),
+                row=2,
+                col=1,
+            )
+        fig.add_hline(y=1.0, line=dict(color="#E74C3C", dash="dash", width=1.0), row=2, col=1)
+        fig.update_xaxes(title_text="Lap", tickvals=lap_ticks, row=2, col=1)
+        fig.update_layout(height=560)
+    fig.update_layout(
+        title_text="Inverter Overload & i²t Utilisation",
+        title_font=dict(color=_TEXT, size=14),
+    )
+
+    table: dict[str, object] = {"Lap": lp}
+    for j, w in enumerate(WHEELS):
+        table[f"{w} overload [%]"] = np.round(ov[:, j], 1)
+        table[f"{w} IxT P95"] = np.round(ix[:, j], 3)
+    if len(dfs) > 1:
+        table["Run"] = run_all
+    kpis = {
+        "overload_pct": {
+            w: float(np.nanmean(np.concatenate(ov_run[w]) == 1.0) * 100.0)
+            for w in WHEELS
+            if ov_run[w]
+        },
+        "ixt_peak": {w: float(np.nanmax(np.concatenate(ixt_run[w]))) for w in WHEELS if ixt_run[w]},
+        "table": pl.DataFrame(table),
+        "warnings": warnings,
+    }
+    return fig, kpis
+
+
+# ── Torque fidelity (actual vs target) ─────────────────────────────────────────
+
+
+def torque_fidelity_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Do the inverters deliver the torque they are commanded?
+
+    Per-lap MAE of (actual − target) torque per wheel, on samples with |target| >
+    0.5 Nm. A signed mean bias exposes systematic under/over-delivery (the front
+    inverters under-deliver slightly in these logs). kpis: mae_nm / bias_nm
+    (per wheel), pct_within_1nm, samples, table, warnings.
+    """
+    warnings: list[str] = []
+    laps_all: list[int] = []
+    mae_all: list[list[float]] = []
+    run_all: list[str] = []
+    err_pool: list[np.ndarray] = []
+    bias_pool: dict[str, list[np.ndarray]] = {w: [] for w in WHEELS}
+
+    for run_name, df in dfs.items():
+        df = ensure_complete_laps_df(df)
+        needed = ["laps"] + [f"{w}_{s}" for w in WHEELS for s in ("actualTorque", "targetTorque")]
+        missing = [c for c in needed if c not in df.columns]
+        if missing:
+            warnings.append(f"{run_name}: missing {missing}")
+            continue
+        cols = cols_to_numpy(df, needed)
+        laps = cols["laps"]
+        for lap in unique_laps(laps):
+            idx = laps == lap
+            if idx.sum() < 50:
+                continue
+            row: list[float] = []
+            for w in WHEELS:
+                tgt = cols[f"{w}_targetTorque"][idx]
+                act = cols[f"{w}_actualTorque"][idx]
+                m = np.isfinite(tgt) & np.isfinite(act) & (np.abs(tgt) > 0.5)
+                err = act[m] - tgt[m]
+                row.append(float(np.nanmean(np.abs(err))) if err.size else np.nan)
+                if err.size:
+                    err_pool.append(err)
+                    bias_pool[w].append(err)
+            laps_all.append(int(lap))
+            mae_all.append(row)
+            run_all.append(run_name)
+
+    if not mae_all:
+        return make_dark_figure(title="Torque Fidelity — No data"), {
+            "warnings": warnings + ["No valid torque target/actual data."]
+        }
+
+    lp = np.array(laps_all)
+    mae = np.array(mae_all)
+    err_cat = np.concatenate(err_pool)
+    title = "Torque Tracking Error per Lap (MAE, |target| > 0.5 Nm)"
+    lap_ticks = np.sort(np.unique(lp.astype(int)))
+    run_names = list(dict.fromkeys(run_all))
+    if len(run_names) > 1:
+        grid_runs: dict[str, tuple[np.ndarray, dict[str, np.ndarray]]] = {}
+        for rn in run_names:
+            m = np.array([r == rn for r in run_all])
+            mae_run = mae[m]
+            grid_runs[rn] = (lp[m], {w: mae_run[:, j] for j, w in enumerate(WHEELS)})
+        fig = _per_wheel_run_grid(
+            grid_runs, title=title, xlabel="Lap", ylabel="MAE [Nm]", lap_ticks=lap_ticks
+        )
+    else:
+        fig = make_dark_figure(title=title, xlabel="Lap", ylabel="MAE [Nm]")
+        for j, w in enumerate(WHEELS):
+            fig.add_trace(
+                go.Scatter(
+                    x=lp,
+                    y=mae[:, j],
+                    mode="lines+markers",
+                    name=w,
+                    line=dict(color=WHEEL_COLORS[w], width=2),
+                    marker=dict(size=6),
+                )
+            )
+        fig.update_xaxes(tickvals=lap_ticks)
+
+    table: dict[str, object] = {"Lap": lp}
+    for j, w in enumerate(WHEELS):
+        table[f"{w} MAE [Nm]"] = np.round(mae[:, j], 3)
+    if len(dfs) > 1:
+        table["Run"] = run_all
+    kpis = {
+        "mae_nm": {w: float(np.nanmean(mae[:, j])) for j, w in enumerate(WHEELS)},
+        "bias_nm": {
+            w: float(np.nanmean(np.concatenate(bias_pool[w]))) if bias_pool[w] else np.nan
+            for w in WHEELS
+        },
+        "pct_within_1nm": float(np.nanmean(np.abs(err_cat) <= 1.0) * 100.0),
+        "samples": int(err_cat.size),
+        "table": pl.DataFrame(table),
+        "warnings": warnings,
+    }
+    return fig, kpis
+
+
+# ── Torque–speed operating map ─────────────────────────────────────────────────
+
+
+def torque_speed_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Where in the torque-speed map does each motor operate, vs its limits?
+
+    Per-wheel scatter of actualTorque vs actualVelocity [rad/s] against the ±27.5 Nm
+    motor limit, the 20 kW (=80/4) power hyperbola and the rev-limit clamp. The
+    saturation KPIs make it informative regardless of how hard the run was pushed.
+    kpis per wheel: torque_p95_nm, speed_p95_rads, pct_torque_saturated,
+    pct_rev_limited; plus samples, warnings.
+    """
+    warnings: list[str] = []
+    pos = {"FL": (1, 1), "FR": (1, 2), "RL": (2, 1), "RR": (2, 2)}
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        subplot_titles=list(WHEELS),
+        shared_xaxes=True,
+        shared_yaxes=True,
+        horizontal_spacing=0.08,
+        vertical_spacing=0.12,
+    )
+    apply_dark_layout(fig, single_axes=False)
+
+    pw_t: dict[str, list[np.ndarray]] = {w: [] for w in WHEELS}
+    pw_w: dict[str, list[np.ndarray]] = {w: [] for w in WHEELS}
+
+    for run_name, df in dfs.items():
+        df = ensure_complete_laps_df(df)
+        needed = [f"{w}_{s}" for w in WHEELS for s in ("actualTorque", "actualVelocity")]
+        missing = [c for c in needed if c not in df.columns]
+        if missing:
+            warnings.append(f"{run_name}: missing {missing}")
+            continue
+        for w in WHEELS:
+            tq = df[f"{w}_actualTorque"].to_numpy().astype(float)
+            om = df[f"{w}_actualVelocity"].to_numpy().astype(float)
+            ok = np.isfinite(tq) & np.isfinite(om) & (om > 1.0)
+            tq, om = tq[ok], om[ok]
+            pw_t[w].append(tq)
+            pw_w[w].append(om)
+            sl = _decimate(len(tq))
+            r, c = pos[w]
+            fig.add_trace(
+                go.Scattergl(
+                    x=om[sl],
+                    y=tq[sl],
+                    mode="markers",
+                    name=run_name,
+                    legendgroup=run_name,
+                    showlegend=(w == "FL"),
+                    marker=dict(color=driver_color(run_name), size=3, opacity=0.35),
+                ),
+                row=r,
+                col=c,
+            )
+
+    om_line = np.linspace(60.0, MOTOR_MAX_SPEED_RADS, 200)
+    hyper = np.minimum(PER_MOTOR_POWER_CAP_W / om_line, MOTOR_MAX_TORQUE_NM * 1.2)
+    for w, (r, c) in pos.items():
+        for y in (MOTOR_MAX_TORQUE_NM, -MOTOR_MAX_TORQUE_NM):
+            fig.add_hline(y=y, line=dict(color="#E74C3C", dash="dash", width=1.0), row=r, col=c)
+        fig.add_trace(
+            go.Scatter(
+                x=om_line,
+                y=hyper,
+                mode="lines",
+                name="20 kW (80/4)",
+                legendgroup="cap",
+                showlegend=(w == "FL"),
+                line=dict(color="rgba(235,235,235,0.55)", dash="dot", width=1.2),
+            ),
+            row=r,
+            col=c,
+        )
+        fig.update_xaxes(
+            title_text="Motor speed [rad/s]" if r == 2 else None,
+            gridcolor=_GRID,
+            color=_AXIS,
+            row=r,
+            col=c,
+        )
+        fig.update_yaxes(
+            title_text="Torque [Nm]" if c == 1 else None,
+            gridcolor=_GRID,
+            color=_AXIS,
+            row=r,
+            col=c,
+        )
+
+    rev_limit = 1113.44  # Param_desiredMaximumVelocity clamp [rad/s]
+    wheel_kpis: dict[str, dict[str, float]] = {}
+    n_total = 0
+    for w in WHEELS:
+        if not pw_t[w]:
+            continue
+        tq = np.concatenate(pw_t[w])
+        om = np.concatenate(pw_w[w])
+        drive = tq > 1.0
+        n_total += len(tq)
+        wheel_kpis[w] = {
+            "torque_p95_nm": float(np.nanpercentile(tq[drive], 95)) if drive.any() else np.nan,
+            "speed_p95_rads": float(np.nanpercentile(om, 95)),
+            "pct_torque_saturated": float(
+                np.nanmean(np.abs(tq) > 0.9 * MOTOR_MAX_TORQUE_NM) * 100.0
+            ),
+            "pct_rev_limited": float(np.nanmean(om > 0.95 * rev_limit) * 100.0),
+        }
+    fig.update_layout(
+        height=640,
+        title=dict(
+            text=f"Torque–Speed Operating Map (limits ±{MOTOR_MAX_TORQUE_NM:.1f} Nm, 20 kW)",
+            font=dict(color=_TEXT, size=14),
+        ),
+    )
+    for ann in fig.layout.annotations:
+        ann.font.color = _TEXT
+        ann.font.size = 12
+    return fig, {"wheels": wheel_kpis, "samples": n_total, "warnings": warnings}
+
+
+# ── SoC per lap ────────────────────────────────────────────────────────────────
+
+
+def soc_per_lap_fig(
     dfs: dict[str, pl.DataFrame],
     x_mode: str = "laps",
 ) -> tuple[go.Figure, dict]:
-    """Battery status figure + KPIs.
+    """Battery autonomy: end-of-lap SoC and the per-lap SoC drop.
 
-    kpis keys: soc_start, soc_end, soc_total_drop, voltage_sag,
-               soc_drop_per_lap, mean_voltage, min_voltage,
-               mean_current, table, warnings.
+    SoC is high-resolution and trustworthy in these logs (Ah/%SoC is stable
+    run-to-run). kpis: soc_start, soc_end, soc_total_drop, soc_drop_per_lap,
+    table, warnings (start/end only meaningful for one continuous run).
     """
-    cols_needed = ["laps", "laptime", "TimeStamp", "SoC", "Vbat", "Current", "Vmin"]
-
+    cols_needed = ["laps", "laptime", "SoC"]
     laps_all: list[int] = []
     lt_all: list[float] = []
     soc_all: list[float] = []
     sd_all: list[float] = []
-    vm_all: list[float] = []
-    vn_all: list[float] = []
-    vp05_all: list[float] = []
-    im_all: list[float] = []
-    sag_all: list[float] = []
     run_all: list[str] = []
     warnings: list[str] = []
     run_soc_start: list[float] = []
@@ -1324,77 +920,50 @@ def battery_status_fig(
         if missing:
             warnings.append(f"{run_name}: missing {missing}")
             continue
-
-        cols = cols_to_numpy(df, ["laps", "laptime", "SoC", "Vbat", "Current", "Vmin"])
-        laps = cols["laps"]
-        laptime = cols["laptime"]
-        soc_arr = cols["SoC"]
-        vbat = cols["Vbat"]
-        current = cols["Current"]
-        vmin = cols["Vmin"]
-
+        cols = cols_to_numpy(df, cols_needed)
+        laps, laptime, soc_arr = cols["laps"], cols["laptime"], cols["SoC"]
         run_laps = unique_laps(laps)
         if len(run_laps) > 0:
-            first_idx = np.where(laps == run_laps[0])[0]
-            last_idx = np.where(laps == run_laps[-1])[0]
-            if len(first_idx) > 0 and len(last_idx) > 0:
-                run_soc_start.append(float(soc_arr[first_idx[0]]))
-                run_soc_end.append(float(soc_arr[last_idx[-1]]))
-
+            first = np.where(laps == run_laps[0])[0]
+            last = np.where(laps == run_laps[-1])[0]
+            if len(first) and len(last):
+                run_soc_start.append(float(soc_arr[first[0]]))
+                run_soc_end.append(float(soc_arr[last[-1]]))
         for lap in run_laps:
             idx = np.where(laps == lap)[0]
             if len(idx) < 5:
                 continue
-            soc_end_val = float(soc_arr[idx[-1]])
-            soc_drop = float(soc_arr[idx[0]] - soc_arr[idx[-1]])
-            if not np.isfinite(soc_end_val):
+            end_v = float(soc_arr[idx[-1]])
+            if not np.isfinite(end_v):
                 continue
             laps_all.append(int(lap))
             lt_all.append(float(np.nanmax(laptime[idx])))
-            soc_all.append(soc_end_val)
-            sd_all.append(soc_drop)
-            vm_all.append(float(np.nanmean(vbat[idx])))
-            vn_all.append(float(np.nanmin(vbat[idx])))
-            vp05_all.append(float(np.nanpercentile(vbat[idx], 5)))
-            im_all.append(float(np.nanmean(current[idx])))
-            sag_all.append(float(np.nanmean(vbat[idx]) - np.nanpercentile(vbat[idx], 5)))
+            soc_all.append(end_v)
+            sd_all.append(float(soc_arr[idx[0]] - soc_arr[idx[-1]]))
             run_all.append(run_name)
 
     if not laps_all:
-        fig = make_dark_figure(title="Battery Status — No data")
-        return fig, {"warnings": warnings + ["No valid battery data."]}
+        return make_dark_figure(title="SoC per Lap — No data"), {
+            "warnings": warnings + ["No valid SoC data."]
+        }
 
     lp = np.array(laps_all)
     lt = np.array(lt_all)
     soc = np.array(soc_all)
     sd = np.array(sd_all)
-    vm = np.array(vm_all)
-    vn = np.array(vn_all)
-    vp05 = np.array(vp05_all)
-    im = np.array(im_all)
-    sag = np.array(sag_all)
-
-    if len(run_soc_start) == 1 and len(run_soc_end) == 1:
-        soc_start = run_soc_start[0]
-        soc_end = run_soc_end[0]
+    if len(run_soc_start) == 1:
+        soc_start, soc_end = run_soc_start[0], run_soc_end[0]
         soc_total_drop = soc_start - soc_end
     else:
-        soc_start = np.nan
-        soc_end = np.nan
-        soc_total_drop = np.nan
+        soc_start = soc_end = soc_total_drop = np.nan
         if len(run_soc_start) > 1:
-            warnings.append(
-                "Battery SoC start/end and total drop are only meaningful for a single continuous run."
-            )
+            warnings.append("SoC start/end only meaningful for a single continuous run.")
 
     x_arr, order, xlabel = per_lap_axis(lp, lt, x_mode)
     fig = _dark_subplots(
         rows=2,
-        titles=[
-            "End-of-Lap SoC",
-            "Battery Voltage",
-        ],
-        ylabels=["SoC [%]", "Voltage [V]"],
+        titles=["End-of-Lap SoC", "SoC Drop per Lap"],
+        ylabels=["SoC [%]", "ΔSoC [%]"],
     )
     fig.add_trace(
         go.Scatter(
@@ -1409,14 +978,7 @@ def battery_status_fig(
         col=1,
     )
     fig.add_trace(
-        go.Scatter(
-            x=x_arr,
-            y=vm[order],
-            mode="lines+markers",
-            name="Vbat mean",
-            line=dict(color="#73D973", width=1.5),
-            marker=dict(size=6),
-        ),
+        go.Bar(x=x_arr, y=sd[order], name="ΔSoC", marker=dict(color="#F28C40")),
         row=2,
         col=1,
     )
@@ -1425,7 +987,7 @@ def battery_status_fig(
         fig.update_xaxes(tickvals=np.sort(lp.astype(int)), row=2, col=1)
     fig.update_layout(
         height=560,
-        title_text=f"Battery Status {'vs Lap Time' if x_mode == 'laptime' else 'per Lap'}",
+        title_text="Battery SoC per Lap",
         title_font=dict(color=_TEXT, size=14),
     )
 
@@ -1434,47 +996,204 @@ def battery_status_fig(
         "LapTime [s]": np.round(lt, 3),
         "SoC [%]": np.round(soc, 1),
         "dSoC [%]": np.round(sd, 2),
-        "Vbat [V]": np.round(vm, 2),
-        "Vmin [V]": np.round(vn, 2),
-        "Vbat P05 [V]": np.round(vp05, 2),
-        "Voltage sag [V]": np.round(sag, 2),
     }
     if len(dfs) > 1:
         table["Run"] = run_all
-
     kpis = {
         "soc_start": soc_start,
         "soc_end": soc_end,
         "soc_total_drop": soc_total_drop,
-        "voltage_sag": float(np.nanmean(sag)),
         "soc_drop_per_lap": float(np.nanmean(sd)),
-        "mean_voltage": float(np.nanmean(vm)),
-        "min_voltage": float(np.nanmin(vn)),
-        "mean_current": float(np.nanmean(im)),
         "table": pl.DataFrame(table),
         "warnings": warnings,
     }
     return fig, kpis
 
 
-# ── Thermal evolution ────────────────────────────────────────────────────────
+# ── HV delivery efficiency ─────────────────────────────────────────────────────
 
 
-def thermal_evolution_fig(
+def hv_delivery_efficiency_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """How much pack DC power actually reaches the inverters?
+
+    Measured-vs-measured: Σ(inverter electrical power) ÷ (Vbat·Current) under drive
+    (P_bat > 3 kW). The shortfall is HV-distribution loss (wiring, contactors, busbars).
+    kpis: delivery_eff_median, mean_loss_kw, samples, table, warnings.
+    """
+    warnings: list[str] = []
+    laps_all: list[int] = []
+    eff_all: list[float] = []
+    loss_all: list[float] = []
+    run_all: list[str] = []
+    eff_pool: list[np.ndarray] = []
+    loss_pool: list[np.ndarray] = []
+    power_cols = [f"{w}_actualPower" for w in WHEELS]
+
+    for run_name, df in dfs.items():
+        df = ensure_complete_laps_df(df)
+        needed = ["laps", "Vbat", "Current", *power_cols]
+        missing = [c for c in needed if c not in df.columns]
+        if missing:
+            warnings.append(f"{run_name}: missing {missing}")
+            continue
+        cols = cols_to_numpy(df, needed)
+        laps = cols["laps"]
+        p_inv = np.zeros(len(laps))
+        for c in power_cols:
+            p_inv = p_inv + cols[c]
+        p_bat = _clean_band(cols["Vbat"], _PACK_V_BAND) * cols["Current"]  # W
+        for lap in unique_laps(laps):
+            idx = laps == lap
+            drive = idx & np.isfinite(p_inv) & np.isfinite(p_bat) & (p_bat > 3000.0)
+            if int(drive.sum()) < 50:
+                continue
+            eff = p_inv[drive] / p_bat[drive]
+            loss_kw = (p_bat[drive] - p_inv[drive]) / 1000.0
+            eff_all.append(float(np.nanmedian(eff)))
+            loss_all.append(float(np.nanmean(loss_kw)))
+            laps_all.append(int(lap))
+            run_all.append(run_name)
+            eff_pool.append(eff)
+            loss_pool.append(loss_kw)
+
+    if not eff_all:
+        return make_dark_figure(title="HV Delivery Efficiency — No data"), {
+            "warnings": warnings + ["No valid drive samples for HV efficiency."]
+        }
+
+    lp = np.array(laps_all)
+    eff = np.array(eff_all)
+    fig = make_dark_figure(
+        title="HV Delivery Efficiency per Lap  (Σ inverter P ÷ battery P, drive only)",
+        xlabel="Lap",
+        ylabel="Delivery efficiency [–]",
+    )
+    if len(dfs) > 1:
+        for run_name in dict.fromkeys(run_all):
+            m = np.array([r == run_name for r in run_all])
+            fig.add_trace(
+                go.Scatter(
+                    x=lp[m],
+                    y=eff[m],
+                    mode="lines+markers",
+                    name=run_name,
+                    line=dict(color=driver_color(run_name), width=1.5),
+                    marker=dict(size=6),
+                )
+            )
+    else:
+        fig.add_trace(
+            go.Scatter(
+                x=lp,
+                y=eff,
+                mode="lines+markers",
+                name="η_delivery",
+                line=dict(color="#4DB3F2", width=1.8),
+                marker=dict(size=7),
+            )
+        )
+        fig.update_xaxes(tickvals=np.sort(lp.astype(int)))
+    fig.add_hline(y=1.0, line=dict(color="rgba(235,235,235,0.4)", dash="dot", width=1.0))
+
+    table: dict[str, object] = {
+        "Lap": lp,
+        "η delivery": np.round(eff, 4),
+        "Mean loss [kW]": np.round(np.array(loss_all), 2),
+    }
+    if len(dfs) > 1:
+        table["Run"] = run_all
+    eff_cat = np.concatenate(eff_pool)
+    loss_cat = np.concatenate(loss_pool)
+    kpis = {
+        "delivery_eff_median": float(np.nanmedian(eff_cat)),
+        "mean_loss_kw": float(np.nanmean(loss_cat)),
+        "samples": int(eff_cat.size),
+        "table": pl.DataFrame(table),
+        "warnings": warnings,
+    }
+    return fig, kpis
+
+
+# ── Weakest cell under load ────────────────────────────────────────────────────
+
+
+def weakest_cell_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Does the weakest cell approach its discharge floor when current is drawn?
+
+    Scatter of the cleaned minimum cell voltage (Vmin) vs battery current. A safety
+    read, not a resistance fit. kpis: vmin_under_load_v (min clean Vmin at I>20 A),
+    vmin_at_peak_current_v, samples, warnings.
+    """
+    warnings: list[str] = []
+    runs: dict[str, dict[str, float]] = {}
+    floor_v = 2.5  # cell discharge floor reference [V]
+    fig = make_dark_figure(
+        title="Weakest Cell Voltage vs Current",
+        xlabel="Battery current [A] (+ = discharge)",
+        ylabel="Min cell voltage [V]",
+    )
+    any_data = False
+    for run_name, df in dfs.items():
+        df = ensure_complete_laps_df(df)
+        missing = [c for c in ("Vmin", "Current") if c not in df.columns]
+        if missing:
+            warnings.append(f"{run_name}: missing {missing}")
+            continue
+        vmin = _clean_band(df["Vmin"].to_numpy(), _CELL_V_BAND)
+        cur = df["Current"].to_numpy().astype(float)
+        ok = np.isfinite(vmin) & np.isfinite(cur)
+        vmin, cur = vmin[ok], cur[ok]
+        if vmin.size < 100:
+            warnings.append(f"{run_name}: not enough clean Vmin samples.")
+            continue
+        any_data = True
+        sl = _decimate(len(vmin))
+        fig.add_trace(
+            go.Scattergl(
+                x=cur[sl],
+                y=vmin[sl],
+                mode="markers",
+                name=run_name,
+                marker=dict(color=driver_color(run_name), size=3, opacity=0.30),
+            )
+        )
+        load = cur > 20.0
+        under = vmin[load]
+        i_peak = int(np.argmax(cur))
+        runs[run_name] = {
+            "vmin_under_load_v": float(np.nanmin(under)) if under.size else np.nan,
+            "vmin_at_peak_current_v": float(vmin[i_peak]),
+            "samples": int(vmin.size),
+        }
+    if not any_data:
+        return make_dark_figure(title="Weakest Cell Under Load — No data"), {
+            "runs": runs,
+            "warnings": warnings + ["No valid cell-voltage data."],
+        }
+    fig.add_hline(
+        y=floor_v,
+        line=dict(color="#E74C3C", dash="dash", width=1.2),
+        annotation_text=f"discharge floor {floor_v:.1f} V",
+        annotation_position="bottom right",
+    )
+    return fig, {"runs": runs, "warnings": warnings}
+
+
+# ── Thermal evolution + headroom ───────────────────────────────────────────────
+
+
+def _thermal_lap_stats(
     dfs: dict[str, pl.DataFrame],
-    x_mode: str = "laps",
-) -> tuple[go.Figure, dict]:
-    """Thermal evolution figure + KPIs.
+) -> tuple[dict[str, np.ndarray], list[str], list[str]]:
+    """Per-lap P95 temps: motors/inverters per wheel + glitch-cleaned battery.
 
-    kpis keys: peak_motor, peak_inverter, peak_batt_tmax,
-               motor_thermal_slope, motor_peak_by_wheel (dict),
-               table (pl.DataFrame), warnings (list[str]).
+    Returns (data, run_all, warnings) where data has keys laps, laptime, Tm (N,4),
+    Ti (N,4), Tb (N,2). All temps are band-cleaned (_TEMP_BAND_C); battery 'Tmax'
+    uses lap P99 of the cleaned signal (never nanmax — it glitches to ~600 °C).
     """
     motor_cols = [f"{w}_motorTemperature" for w in WHEELS]
     inv_cols = [f"{w}_inverterTemperature" for w in WHEELS]
-    batt_cols = ["Tmax", "Tavg"]
-    cols_needed = ["laps", "laptime"] + motor_cols + inv_cols + batt_cols
-
+    cols_needed = ["laps", "laptime"] + motor_cols + inv_cols + ["Tmax", "Tavg"]
     laps_all: list[int] = []
     lt_all: list[float] = []
     tm_all: list[list[float]] = []
@@ -1489,99 +1208,55 @@ def thermal_evolution_fig(
         if missing:
             warnings.append(f"{run_name}: missing {missing}")
             continue
-
-        temp_cols = [
-            *[f"{w}_motorTemperature" for w in WHEELS],
-            *[f"{w}_inverterTemperature" for w in WHEELS],
-            "Tmax",
-            "Tavg",
-        ]
-        cols = cols_to_numpy(df, ["laps", "laptime", *temp_cols])
+        cols = cols_to_numpy(df, cols_needed)
+        for c in (*motor_cols, *inv_cols, "Tmax", "Tavg"):
+            cols[c] = _clean_band(cols[c], _TEMP_BAND_C)
         laps = cols["laps"]
-        laptime = cols["laptime"]
-
         for lap in unique_laps(laps):
             idx = laps == lap
-            if idx.sum() < 5:
+            if idx.sum() < 50:
                 continue
-
             tm = [float(np.nanpercentile(cols[f"{w}_motorTemperature"][idx], 95)) for w in WHEELS]
             ti = [
                 float(np.nanpercentile(cols[f"{w}_inverterTemperature"][idx], 95)) for w in WHEELS
             ]
-            tb_max = float(np.nanmax(cols["Tmax"][idx]))
-            tb_avg = float(np.nanpercentile(cols["Tavg"][idx], 95))
-
+            tb = [
+                float(np.nanpercentile(cols["Tmax"][idx], 99)),
+                float(np.nanpercentile(cols["Tavg"][idx], 95)),
+            ]
             if not all(np.isfinite(tm)):
                 continue
-
             laps_all.append(int(lap))
-            lt_all.append(float(np.nanmax(laptime[idx])))
+            lt_all.append(float(np.nanmax(cols["laptime"][idx])))
             tm_all.append(tm)
             ti_all.append(ti)
-            tb_all.append([tb_max, tb_avg])
+            tb_all.append(tb)
             run_all.append(run_name)
 
-    if not laps_all:
-        fig = make_dark_figure(title="Thermal Evolution — No data")
-        return fig, {"warnings": warnings + ["No valid thermal data."]}
+    data = {
+        "laps": np.array(laps_all),
+        "laptime": np.array(lt_all),
+        "Tm": np.array(tm_all),
+        "Ti": np.array(ti_all),
+        "Tb": np.array(tb_all),
+    }
+    return data, run_all, warnings
 
-    lp = np.array(laps_all)
-    lt = np.array(lt_all)
-    Tm = np.array(tm_all)
-    Ti = np.array(ti_all)
-    Tb = np.array(tb_all)
+
+def _thermal_kpis(
+    lp: np.ndarray,
+    lt: np.ndarray,
+    Tm: np.ndarray,
+    Ti: np.ndarray,
+    Tb: np.ndarray,
+    run_all: list[str],
+    n_runs: int,
+    warnings: list[str],
+) -> dict:
+    """Whole-run thermal KPIs + per-lap table (shared by single- and multi-run)."""
 
     def _slope(x: np.ndarray, y: np.ndarray) -> float:
         return float(np.polyfit(x, y, 1)[0]) if len(x) >= 2 else np.nan
-
-    x_arr, order, xlabel = per_lap_axis(lp, lt, x_mode)
-    fig = make_dark_figure(
-        title=f"Thermal Evolution {'vs Lap Time' if x_mode == 'laptime' else 'per Lap'} (P95)",
-        xlabel=xlabel,
-        ylabel="Temperature [°C]",
-    )
-    for j, w in enumerate(WHEELS):
-        fig.add_trace(
-            go.Scatter(
-                x=x_arr,
-                y=Tm[order, j],
-                mode="lines+markers",
-                name=f"Motor {w}",
-                line=dict(color=WHEEL_COLORS[w], width=1.5),
-                marker=dict(size=7),
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=x_arr,
-                y=Ti[order, j],
-                mode="lines",
-                name=f"Inv {w}",
-                line=dict(color=WHEEL_COLORS[w], dash="dash", width=1.0),
-            )
-        )
-    fig.add_trace(
-        go.Scatter(
-            x=x_arr,
-            y=Tb[order, 0],
-            mode="lines+markers",
-            name="Battery Tmax",
-            line=dict(color="white", width=2),
-            marker=dict(size=7),
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=x_arr,
-            y=Tb[order, 1],
-            mode="lines",
-            name="Battery Tavg",
-            line=dict(color="white", dash="dot", width=1.2),
-        )
-    )
-    if x_mode == "laps":
-        fig.update_xaxes(tickvals=np.sort(lp.astype(int)))
 
     table: dict[str, object] = {"Lap": lp, "LapTime [s]": np.round(lt, 3)}
     for j, w in enumerate(WHEELS):
@@ -1589,10 +1264,9 @@ def thermal_evolution_fig(
         table[f"Inv {w} [°C]"] = np.round(Ti[:, j], 1)
     table["Batt Tmax [°C]"] = np.round(Tb[:, 0], 1)
     table["Batt Tavg [°C]"] = np.round(Tb[:, 1], 1)
-    if len(dfs) > 1:
+    if n_runs > 1:
         table["Run"] = run_all
-
-    kpis = {
+    return {
         "peak_motor": float(np.nanmax(Tm)),
         "peak_inverter": float(np.nanmax(Ti)),
         "peak_batt_tmax": float(np.nanmax(Tb[:, 0])),
@@ -1601,147 +1275,312 @@ def thermal_evolution_fig(
         "table": pl.DataFrame(table),
         "warnings": warnings,
     }
-    return fig, kpis
 
 
-# ── Endurance strategy (pure projections — reuse energy/battery/thermal KPIs) ─
+def _thermal_multirun_fig(
+    run_names: list[str],
+    run_all: list[str],
+    lp: np.ndarray,
+    lt: np.ndarray,
+    Tm: np.ndarray,
+    Ti: np.ndarray,
+    Tb: np.ndarray,
+    x_mode: str,
+    lap_ticks: np.ndarray,
+) -> go.Figure:
+    """Multi-run thermal grid: motors (4 wheels) · inverters (4 wheels) · battery.
 
-
-def _finish_level(soc_proj_end: float, energy_margin_pct: float) -> str:
-    """Most-conservative finish verdict from SoC reserve and energy margin.
-
-    SHORT  = projected to run out before the flag.
-    TIGHT  = finishes with < 5 % reserve (SoC points or pack %).
-    OK     = comfortable margin.
+    One line per run coloured by driver_color; wheel identity is the column.
+    Battery spans the bottom row (Tmax solid · Tavg dot).
     """
-    levels: list[str] = []
-    if np.isfinite(soc_proj_end):
-        levels.append("SHORT" if soc_proj_end < 0 else "TIGHT" if soc_proj_end < 5.0 else "OK")
-    if np.isfinite(energy_margin_pct):
-        levels.append(
-            "SHORT" if energy_margin_pct < 0 else "TIGHT" if energy_margin_pct < 5.0 else "OK"
+    fig = make_subplots(
+        rows=3,
+        cols=4,
+        specs=[[{}, {}, {}, {}], [{}, {}, {}, {}], [{"colspan": 4}, None, None, None]],
+        subplot_titles=[*WHEELS, "", "", "", "", "Battery — Tmax (solid) · Tavg (dot)"],
+        shared_xaxes=True,
+        shared_yaxes=True,
+        horizontal_spacing=0.05,
+        vertical_spacing=0.13,
+        row_heights=[0.3, 0.3, 0.4],
+    )
+    apply_dark_layout(fig, single_axes=False)
+    xlabel = "Lap time [s]" if x_mode == "laptime" else "Lap"
+    for rn in run_names:
+        m = np.array([r == rn for r in run_all])
+        x_run, order_run, _ = per_lap_axis(lp[m], lt[m], x_mode)
+        color = driver_color(rn)
+        Tm_r, Ti_r, Tb_r = Tm[m][order_run], Ti[m][order_run], Tb[m][order_run]
+        for j in range(len(WHEELS)):
+            fig.add_trace(
+                go.Scatter(
+                    x=x_run,
+                    y=Tm_r[:, j],
+                    mode="lines+markers",
+                    name=rn,
+                    legendgroup=rn,
+                    showlegend=(j == 0),
+                    line=dict(color=color, width=2),
+                    marker=dict(size=5),
+                ),
+                row=1,
+                col=j + 1,
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=x_run,
+                    y=Ti_r[:, j],
+                    mode="lines+markers",
+                    name=rn,
+                    legendgroup=rn,
+                    showlegend=False,
+                    line=dict(color=color, width=2),
+                    marker=dict(size=5),
+                ),
+                row=2,
+                col=j + 1,
+            )
+        fig.add_trace(
+            go.Scatter(
+                x=x_run,
+                y=Tb_r[:, 0],
+                mode="lines+markers",
+                name=rn,
+                legendgroup=rn,
+                showlegend=False,
+                line=dict(color=color, width=2),
+                marker=dict(size=5),
+            ),
+            row=3,
+            col=1,
         )
-    for level in ("SHORT", "TIGHT", "OK"):
-        if level in levels:
-            return level
-    return "UNKNOWN"
+        fig.add_trace(
+            go.Scatter(
+                x=x_run,
+                y=Tb_r[:, 1],
+                mode="lines",
+                name=rn,
+                legendgroup=rn,
+                showlegend=False,
+                line=dict(color=color, dash="dot", width=1.4),
+            ),
+            row=3,
+            col=1,
+        )
+    ticks = lap_ticks if x_mode == "laps" else None
+    for j in range(1, len(WHEELS) + 1):
+        fig.add_hline(
+            y=MOTOR_OT_LIMIT_C, line=dict(color="#E74C3C", dash="dash", width=1.0), row=1, col=j
+        )
+        fig.add_hline(
+            y=INVERTER_OT_LIMIT_C, line=dict(color="#E74C3C", dash="dash", width=1.0), row=2, col=j
+        )
+        for row in (1, 2):
+            fig.update_xaxes(
+                tickvals=ticks,
+                gridcolor=_GRID,
+                color=_AXIS,
+                row=row,
+                col=j,
+            )
+            fig.update_yaxes(gridcolor=_GRID, color=_AXIS, row=row, col=j)
+    fig.add_hline(
+        y=BATTERY_TEMP_LIMIT_C, line=dict(color="#E74C3C", dash="dash", width=1.0), row=3, col=1
+    )
+    fig.update_xaxes(title_text=xlabel, tickvals=ticks, gridcolor=_GRID, color=_AXIS, row=3, col=1)
+    fig.update_yaxes(gridcolor=_GRID, color=_AXIS, row=3, col=1)
+    fig.update_yaxes(title_text="Motor T [°C]", row=1, col=1)
+    fig.update_yaxes(title_text="Inverter T [°C]", row=2, col=1)
+    fig.update_yaxes(title_text="Battery T [°C]", row=3, col=1)
+    fig.update_layout(
+        height=980,
+        title=dict(
+            text="Thermal Evolution per Lap (P95, glitch-cleaned) — limits 120 / 75 / 60 °C",
+            font=dict(color=_TEXT, size=14),
+        ),
+    )
+    for ann in fig.layout.annotations:
+        ann.font.color = _TEXT
+        ann.font.size = 12
+    return fig
 
 
-def endurance_projection(
-    runs: dict[str, dict],
-    target_laps: int,
-    usable_pack_kwh: float,
-) -> dict[str, dict]:
-    """Per-run finish-the-endurance projection from logged energy + SoC.
+def thermal_evolution_fig(
+    dfs: dict[str, pl.DataFrame],
+    x_mode: str = "laps",
+) -> tuple[go.Figure, dict]:
+    """Motor / inverter / battery temperatures per lap (P95, glitch-cleaned).
 
-    `runs[name]` must provide scalars already computed elsewhere (no recompute):
-    ``e_mean`` (net kWh/lap), ``soc_start``/``soc_end`` (%), ``soc_drop_per_lap``
-    (%/lap), ``laps_done`` (int). Two complementary framings:
-      • SoC:    soc_proj_end = soc_end − soc_drop_per_lap · remaining_laps
-      • Energy: margin = usable_pack_kwh − e_mean · target_laps, plus the
-                lift&coast (% energy cut/lap) needed to fit the budget.
-    Returns a per-run dict including a conservative ``verdict``.
+    Single run: three stacked subplots (motors/inverters/battery), each with its
+    OT-limit line and per-wheel lines. Multi-run: per-wheel small multiples with
+    one line per run (driver_color), battery on a wide bottom panel. kpis:
+    peak_motor, peak_inverter, peak_batt_tmax, motor_thermal_slope,
+    motor_peak_by_wheel, table, warnings.
     """
-    out: dict[str, dict] = {}
-    target_laps = int(target_laps)
-    for name, k in runs.items():
-        e_mean = float(k.get("e_mean", float("nan")))
-        soc_start = float(k.get("soc_start", float("nan")))
-        soc_end = float(k.get("soc_end", float("nan")))
-        soc_drop = float(k.get("soc_drop_per_lap", float("nan")))
-        laps_done = int(k.get("laps_done", 0) or 0)
-        remaining = max(target_laps - laps_done, 0)
-
-        # SoC framing
-        soc_needed = soc_drop * remaining if np.isfinite(soc_drop) else float("nan")
-        soc_proj_end = (
-            soc_end - soc_needed
-            if np.isfinite(soc_needed) and np.isfinite(soc_end)
-            else float("nan")
-        )
-
-        # Energy-budget framing
-        energy_total = e_mean * target_laps if np.isfinite(e_mean) else float("nan")
-        energy_margin = (
-            usable_pack_kwh - energy_total if np.isfinite(energy_total) else float("nan")
-        )
-        energy_margin_pct = (
-            energy_margin / usable_pack_kwh * 100.0
-            if np.isfinite(energy_margin) and usable_pack_kwh > 0
-            else float("nan")
-        )
-        liftcoast = float("nan")
-        if np.isfinite(e_mean) and e_mean > 0 and target_laps > 0:
-            allowed_per_lap = usable_pack_kwh / target_laps
-            liftcoast = max(0.0, (1.0 - allowed_per_lap / e_mean) * 100.0)
-
-        out[name] = {
-            "laps_done": laps_done,
-            "remaining_laps": remaining,
-            "e_mean_kwh": e_mean,
-            "soc_start": soc_start,
-            "soc_end": soc_end,
-            "soc_drop_per_lap": soc_drop,
-            "soc_needed_to_finish": soc_needed,
-            "soc_projected_end": soc_proj_end,
-            "finish_on_soc": bool(np.isfinite(soc_proj_end) and soc_proj_end >= 0.0),
-            "energy_total_projected_kwh": energy_total,
-            "energy_margin_kwh": energy_margin,
-            "finish_on_energy": bool(np.isfinite(energy_margin) and energy_margin >= 0.0),
-            "liftcoast_required_pct": liftcoast,
-            "verdict": _finish_level(soc_proj_end, energy_margin_pct),
+    data, run_all, warnings = _thermal_lap_stats(dfs)
+    if data["laps"].size == 0:
+        return make_dark_figure(title="Thermal Evolution — No data"), {
+            "warnings": warnings + ["No valid thermal data."]
         }
-    return out
+    lp, lt, Tm, Ti, Tb = data["laps"], data["laptime"], data["Tm"], data["Ti"], data["Tb"]
+    run_names = list(dict.fromkeys(run_all))
+    lap_ticks = np.sort(np.unique(lp.astype(int)))
+    if len(run_names) > 1:
+        fig = _thermal_multirun_fig(run_names, run_all, lp, lt, Tm, Ti, Tb, x_mode, lap_ticks)
+        return fig, _thermal_kpis(lp, lt, Tm, Ti, Tb, run_all, len(dfs), warnings)
+    x_arr, order, xlabel = per_lap_axis(lp, lt, x_mode)
 
-
-def thermal_headroom(
-    peak_motor_c: float,
-    peak_inverter_c: float,
-    motor_slope_c_per_lap: float,
-    remaining_laps: int,
-) -> dict:
-    """Headroom-to-OT-limit and end-of-stint projection for motor/inverter.
-
-    `peak_*` are the observed P95 peaks (from thermal_evolution_fig kpis),
-    `motor_slope_c_per_lap` is its per-lap thermal slope. Projects the motor peak
-    forward by the slope and flags derate risk if it would cross MOTOR_OT_LIMIT_C.
-    """
-    motor_headroom = MOTOR_OT_LIMIT_C - peak_motor_c if np.isfinite(peak_motor_c) else float("nan")
-    inv_headroom = (
-        INVERTER_OT_LIMIT_C - peak_inverter_c if np.isfinite(peak_inverter_c) else float("nan")
+    fig = _dark_subplots(
+        rows=3,
+        titles=[
+            f"Motors (limit {MOTOR_OT_LIMIT_C:.0f} °C)",
+            f"Inverters (limit {INVERTER_OT_LIMIT_C:.0f} °C)",
+            f"Battery (FS rule {BATTERY_TEMP_LIMIT_C:.0f} °C)",
+        ],
+        ylabels=["T [°C]", "T [°C]", "T [°C]"],
     )
-    motor_proj = (
-        peak_motor_c + motor_slope_c_per_lap * max(int(remaining_laps), 0)
-        if np.isfinite(peak_motor_c) and np.isfinite(motor_slope_c_per_lap)
-        else float("nan")
-    )
-    if np.isfinite(motor_proj):
-        derate_risk = (
-            "SHORT"
-            if motor_proj >= MOTOR_OT_LIMIT_C
-            else ("TIGHT" if motor_proj >= MOTOR_OT_LIMIT_C - 10.0 else "OK")
+    for j, w in enumerate(WHEELS):
+        fig.add_trace(
+            go.Scatter(
+                x=x_arr,
+                y=Tm[order, j],
+                mode="lines+markers",
+                name=w,
+                legendgroup=w,
+                line=dict(color=WHEEL_COLORS[w], width=1.5),
+                marker=dict(size=6),
+            ),
+            row=1,
+            col=1,
         )
-    else:
-        derate_risk = "UNKNOWN"
-    return {
-        "motor_peak_c": peak_motor_c,
-        "inverter_peak_c": peak_inverter_c,
-        "motor_headroom_c": motor_headroom,
-        "inverter_headroom_c": inv_headroom,
-        "motor_slope_c_per_lap": motor_slope_c_per_lap,
-        "motor_projected_end_c": motor_proj,
-        "derate_risk": derate_risk,
+        fig.add_trace(
+            go.Scatter(
+                x=x_arr,
+                y=Ti[order, j],
+                mode="lines+markers",
+                name=w,
+                legendgroup=w,
+                showlegend=False,
+                line=dict(color=WHEEL_COLORS[w], width=1.5),
+                marker=dict(size=6),
+            ),
+            row=2,
+            col=1,
+        )
+    fig.add_trace(
+        go.Scatter(
+            x=x_arr,
+            y=Tb[order, 0],
+            mode="lines+markers",
+            name="Batt Tmax",
+            line=dict(color="white", width=2),
+            marker=dict(size=6),
+        ),
+        row=3,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x_arr,
+            y=Tb[order, 1],
+            mode="lines",
+            name="Batt Tavg",
+            line=dict(color="white", dash="dot", width=1.2),
+        ),
+        row=3,
+        col=1,
+    )
+    for row, limit in ((1, MOTOR_OT_LIMIT_C), (2, INVERTER_OT_LIMIT_C), (3, BATTERY_TEMP_LIMIT_C)):
+        fig.add_hline(y=limit, line=dict(color="#E74C3C", dash="dash", width=1.2), row=row, col=1)
+    fig.update_xaxes(title_text=xlabel, row=3, col=1)
+    if x_mode == "laps":
+        fig.update_xaxes(tickvals=np.sort(np.unique(lp.astype(int))), row=3, col=1)
+    fig.update_layout(
+        height=820,
+        title_text="Thermal Evolution per Lap (P95, glitch-cleaned)",
+        title_font=dict(color=_TEXT, size=14),
+    )
+    return fig, _thermal_kpis(lp, lt, Tm, Ti, Tb, run_all, len(dfs), warnings)
+
+
+def thermal_headroom_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Margin to the OT limits and heat-soak rate per component.
+
+    Headroom = limit − worst observed lap P95 (worst wheel). Slope = °C/lap of the
+    component mean. laps_to_limit = headroom / slope (∞ if slope ≤ 0.05 °C/lap).
+    kpis per component (motor/inverter/battery): peak_c, headroom_c, slope_c_per_lap,
+    laps_to_limit; plus dt_lr_motor_c / dt_lr_inverter_c (left − right), warnings.
+    """
+    data, _run_all, warnings = _thermal_lap_stats(dfs)
+    if data["laps"].size == 0:
+        return make_dark_figure(title="Thermal Headroom — No data"), {
+            "warnings": warnings + ["No valid thermal data."]
+        }
+    lp, Tm, Ti, Tb = data["laps"], data["Tm"], data["Ti"], data["Tb"]
+
+    def _slope(y: np.ndarray) -> float:
+        return float(np.polyfit(lp, y, 1)[0]) if len(lp) >= 2 else np.nan
+
+    comps = {
+        "Motor": (float(np.nanmax(Tm)), MOTOR_OT_LIMIT_C, _slope(np.nanmean(Tm, axis=1))),
+        "Inverter": (float(np.nanmax(Ti)), INVERTER_OT_LIMIT_C, _slope(np.nanmean(Ti, axis=1))),
+        "Battery": (float(np.nanmax(Tb[:, 0])), BATTERY_TEMP_LIMIT_C, _slope(Tb[:, 0])),
     }
+    names: list[str] = []
+    headrooms: list[float] = []
+    colors: list[str] = []
+    texts: list[str] = []
+    comp_kpis: dict[str, dict[str, float]] = {}
+    for name, (peak, limit, slope) in comps.items():
+        headroom = limit - peak
+        laps_to = (
+            headroom / slope if (np.isfinite(slope) and slope > 0.05 and headroom > 0) else np.inf
+        )
+        comp_kpis[name.lower()] = {
+            "peak_c": peak,
+            "headroom_c": headroom,
+            "slope_c_per_lap": slope,
+            "laps_to_limit": laps_to,
+        }
+        names.append(name)
+        headrooms.append(headroom)
+        colors.append(
+            "#F25555"
+            if (np.isfinite(laps_to) and laps_to < 8)
+            else "#F2C744"
+            if (np.isfinite(laps_to) and laps_to < 20)
+            else "#73D973"
+        )
+        lt_txt = "∞" if np.isinf(laps_to) else f"{laps_to:.0f} laps"
+        texts.append(f"{headroom:+.1f} °C · {slope:+.2f} °C/lap · {lt_txt} to limit")
 
+    fig = make_dark_figure(
+        title="Thermal Headroom to OT Limit (worst wheel, P95)",
+        xlabel="Headroom [°C]",
+        ylabel="",
+    )
+    fig.add_trace(
+        go.Bar(
+            x=headrooms,
+            y=names,
+            orientation="h",
+            marker=dict(color=colors),
+            text=texts,
+            textposition="auto",
+        )
+    )
+    fig.add_vline(x=0.0, line=dict(color="#E74C3C", dash="dash", width=1.4))
+    fig.update_layout(height=360)
 
-# ── Entry point (standalone CLI) ────────────────────────────────────────────
-
-
-def main() -> None:
-    energy_per_lap().show()
-    power_per_wheel().show()
-    battery_status().show()
-    thermal_evolution().show()
+    kpis = {
+        **comp_kpis,
+        "dt_lr_motor_c": float(np.nanmean((Tm[:, 0] + Tm[:, 2]) / 2 - (Tm[:, 1] + Tm[:, 3]) / 2)),
+        "dt_lr_inverter_c": float(
+            np.nanmean((Ti[:, 0] + Ti[:, 2]) / 2 - (Ti[:, 1] + Ti[:, 3]) / 2)
+        ),
+        "warnings": warnings,
+    }
+    return fig, kpis
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1902,290 +1741,3 @@ def pc_function_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
         "pct_at_cap_per_lap": dict(zip(lap_ids, pct_at_cap_per_lap)),
     }
     return [fig_p, fig_hist, fig_peak], kpis
-
-
-CTRL_TORQUE_ALIASES = {
-    "tv": {
-        "FL": ("TV_FL_Trq", "tv_fl_torque"),
-        "FR": ("TV_FR_Trq", "tv_fr_torque"),
-        "RL": ("TV_RL_Trq", "tv_rl_torque"),
-        "RR": ("TV_RR_Trq", "tv_rr_torque"),
-    },
-    "tc": {
-        "FL": ("TC_FL_MaxTrq", "tc_fl_torque"),
-        "FR": ("TC_FR_MaxTrq", "tc_fr_torque"),
-        "RL": ("TC_RL_MaxTrq", "tc_rl_torque"),
-        "RR": ("TC_RR_MaxTrq", "tc_rr_torque"),
-    },
-    "pc": {
-        "FL": ("PC_FL_Trq", "pc_fl_torque"),
-        "FR": ("PC_FR_Trq", "pc_fr_torque"),
-        "RL": ("PC_RL_Trq", "pc_rl_torque"),
-        "RR": ("PC_RR_Trq", "pc_rr_torque"),
-    },
-    "rb": {
-        "FL": ("RB_FL_Trq", "rb_fl_torque"),
-        "FR": ("RB_FR_Trq", "rb_fr_torque"),
-        "RL": ("RB_RL_Trq", "rb_rl_torque"),
-        "RR": ("RB_RR_Trq", "rb_rr_torque"),
-    },
-    "master": {
-        "FL": ("Master_frontLeftTrq", "master_fl_torque", "master_front_left_torque"),
-        "FR": ("Master_frontRightTrq", "master_fr_torque", "master_front_right_torque"),
-        "RL": ("Master_rearLeftTrq", "master_rl_torque", "master_rear_left_torque"),
-        "RR": ("Master_rearRightTrq", "master_rr_torque", "master_rear_right_torque"),
-    },
-    "actual": {
-        "FL": ("FL_actualTorque", "fl_actual_torque"),
-        "FR": ("FR_actualTorque", "fr_actual_torque"),
-        "RL": ("RL_actualTorque", "rl_actual_torque"),
-        "RR": ("RR_actualTorque", "rr_actual_torque"),
-    },
-}
-
-
-def _torque_matrix(df: pl.DataFrame, group: str) -> np.ndarray:
-    return np.stack([series_or_nan(df, CTRL_TORQUE_ALIASES[group][w]) for w in WHEELS], axis=1)
-
-
-def pc_master_attribution_figs_kpis(df: pl.DataFrame) -> tuple[list[go.Figure], dict]:
-    """Observable PC/Master behaviour: pedal fidelity and power-cap performance loss."""
-    df = ensure_complete_laps_df(df)
-    if len(df) == 0:
-        raise ValueError("No valid samples for PC/Master behaviour metrics.")
-
-    time_s = df["TimeStamp"].to_numpy().astype(float) - float(df["TimeStamp"][0])
-    dist_m = lap_dist_from_gps(df)
-    ax_col = "Filtering_VN_ax" if "Filtering_VN_ax" in df.columns else "VN_ax"
-    ax = df[ax_col].to_numpy().astype(float) if ax_col in df.columns else np.full(len(df), np.nan)
-    vx_col = "Est_vxCOG" if "Est_vxCOG" in df.columns else "VN_vx"
-    vx = df[vx_col].to_numpy().astype(float) if vx_col in df.columns else np.full(len(df), np.nan)
-    command = series_or_nan(df, ("LLC_Command", "llc_command"))
-    throttle = series_or_nan(df, ("Throttle", "throttle"))
-    vbat = series_or_nan(df, ("Vbat", "v_bat", "V_bat"))
-    current = series_or_nan(df, ("Current", "current"))
-    p_bat_kw = vbat * current / 1000.0
-
-    pc = _torque_matrix(df, "pc")
-    master = _torque_matrix(df, "master")
-    actual = _torque_matrix(df, "actual")
-    master_total = np.nansum(master, axis=1)
-    actual_total = np.nansum(actual, axis=1)
-    pc_total = np.nansum(pc, axis=1)
-    actual_track_err = actual_total - master_total
-    pc_active = np.any(pc < -1.0e-6, axis=1)
-    pc_cut_nm = -np.nansum(np.minimum(pc, 0.0), axis=1)
-    accel_mask = (command >= 0.0) & (throttle >= 5.0) & np.isfinite(ax) & (np.abs(vx) >= 4.0)
-    full_throttle = accel_mask & (throttle >= 95.0)
-    pc_full = full_throttle & pc_active
-    no_pc_full = full_throttle & ~pc_active
-    ax_loss_pc = (
-        float(np.nanmedian(ax[no_pc_full]) - np.nanmedian(ax[pc_full]))
-        if pc_full.any() and no_pc_full.any()
-        else np.nan
-    )
-    pbat_over_78 = np.isfinite(p_bat_kw) & (p_bat_kw >= 78.0)
-    cap_near_pct = (
-        float(np.nanmean(pbat_over_78[full_throttle]) * 100.0) if full_throttle.any() else np.nan
-    )
-
-    def _corr(x: np.ndarray, y: np.ndarray, mask: np.ndarray) -> float:
-        valid = mask & np.isfinite(x) & np.isfinite(y)
-        if int(valid.sum()) < 20:
-            return np.nan
-        return float(np.corrcoef(x[valid], y[valid])[0, 1])
-
-    pedal_ax_corr = _corr(throttle, ax, accel_mask)
-    pedal_torque_corr = _corr(throttle, actual_total, accel_mask)
-    pc_cut_ax_corr = _corr(pc_cut_nm, ax, full_throttle)
-
-    order = np.argsort(dist_m)
-    fig = make_subplots(
-        rows=3,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.055,
-        subplot_titles=("Driver demand", "Car acceleration", "Power cap / PC cut"),
-    )
-    fig.add_trace(
-        go.Scattergl(
-            x=dist_m[order],
-            y=throttle[order],
-            mode="lines",
-            name="Throttle",
-            line=dict(color="#F28C40", width=1.1),
-        ),
-        row=1,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scattergl(
-            x=dist_m[order],
-            y=command[order] * 100.0,
-            mode="lines",
-            name="LLC command x100",
-            line=dict(color="#EBEBEB", width=0.9, dash="dot"),
-        ),
-        row=1,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scattergl(
-            x=dist_m[order],
-            y=ax[order],
-            mode="markers",
-            name="ax",
-            marker=dict(
-                color=pc_cut_nm[order],
-                colorscale="Turbo",
-                size=3,
-                opacity=0.50,
-                colorbar=dict(title="PC cut"),
-            ),
-        ),
-        row=2,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scattergl(
-            x=dist_m[order],
-            y=p_bat_kw[order],
-            mode="lines",
-            name="Pbat",
-            line=dict(color="#4DB3F2", width=1.0),
-        ),
-        row=3,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scattergl(
-            x=dist_m[order],
-            y=pc_cut_nm[order],
-            mode="lines",
-            name="PC cut",
-            line=dict(color="#F28C40", width=1.1, dash="dash"),
-        ),
-        row=3,
-        col=1,
-    )
-    fig.update_layout(
-        title=dict(
-            text="PC/Master: pedal fidelity and power-cap performance loss",
-            font=dict(size=14, color="#EBEBEB"),
-        ),
-        paper_bgcolor="#141417",
-        plot_bgcolor="#141417",
-        font=dict(color="#EBEBEB", size=11),
-        height=830,
-        legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="left", x=0.0),
-    )
-    fig.update_xaxes(title_text="Distance [m]", row=3, col=1, gridcolor="rgba(128,128,128,0.2)")
-    fig.update_yaxes(title_text="Demand [%]", row=1, col=1, gridcolor="rgba(128,128,128,0.2)")
-    fig.update_yaxes(title_text="ax [m/s²]", row=2, col=1, gridcolor="rgba(128,128,128,0.2)")
-    fig.update_yaxes(title_text="kW / Nm", row=3, col=1, gridcolor="rgba(128,128,128,0.2)")
-
-    fig_rel = make_subplots(
-        rows=1,
-        cols=2,
-        horizontal_spacing=0.10,
-        subplot_titles=("Throttle vs acceleration", "PC cut vs acceleration at full throttle"),
-    )
-    rel_mask = accel_mask & np.isfinite(throttle) & np.isfinite(ax)
-    fig_rel.add_trace(
-        go.Scattergl(
-            x=throttle[rel_mask],
-            y=ax[rel_mask],
-            mode="markers",
-            name="Pedal -> ax",
-            marker=dict(
-                color=p_bat_kw[rel_mask],
-                colorscale="Turbo",
-                size=4,
-                opacity=0.45,
-                colorbar=dict(title="Pbat"),
-            ),
-        ),
-        row=1,
-        col=1,
-    )
-    pc_rel = full_throttle & np.isfinite(pc_cut_nm) & np.isfinite(ax)
-    fig_rel.add_trace(
-        go.Scattergl(
-            x=pc_cut_nm[pc_rel],
-            y=ax[pc_rel],
-            mode="markers",
-            name="PC cut -> ax",
-            marker=dict(
-                color=p_bat_kw[pc_rel],
-                colorscale="Turbo",
-                size=4,
-                opacity=0.45,
-                colorbar=dict(title="Pbat"),
-            ),
-        ),
-        row=1,
-        col=2,
-    )
-    fig_rel.update_layout(
-        title=dict(text="PC/Master variable relationships", font=dict(size=14, color="#EBEBEB")),
-        paper_bgcolor="#141417",
-        plot_bgcolor="#141417",
-        font=dict(color="#EBEBEB", size=11),
-        height=520,
-        legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="left", x=0.0),
-    )
-    fig_rel.update_xaxes(title_text="Throttle [%]", row=1, col=1, gridcolor="rgba(128,128,128,0.2)")
-    fig_rel.update_yaxes(title_text="ax [m/s²]", row=1, col=1, gridcolor="rgba(128,128,128,0.2)")
-    fig_rel.update_xaxes(title_text="PC cut [Nm]", row=1, col=2, gridcolor="rgba(128,128,128,0.2)")
-    fig_rel.update_yaxes(title_text="ax [m/s²]", row=1, col=2, gridcolor="rgba(128,128,128,0.2)")
-
-    laps = df["laps"].to_numpy().astype(float)
-    lap_rows: list[dict[str, object]] = []
-    for lap in unique_laps(laps):
-        lm = laps == lap
-        if int(lm.sum()) < 20:
-            continue
-        lem = lm & accel_mask
-        lpc = lm & pc_full
-        lnopc = lm & no_pc_full
-        lap_ax_loss = (
-            float(np.nanmedian(ax[lnopc]) - np.nanmedian(ax[lpc]))
-            if lpc.any() and lnopc.any()
-            else np.nan
-        )
-        lap_rows.append(
-            {
-                "Lap": int(lap),
-                "Pedal-ax corr": round(_corr(throttle, ax, lem), 3),
-                "Pedal-torque corr": round(_corr(throttle, actual_total, lem), 3),
-                "PC active @ WOT [%]": round(
-                    float(np.nanmean(pc_active[lm & full_throttle]) * 100.0), 1
-                )
-                if (lm & full_throttle).any()
-                else np.nan,
-                "ax loss PC [m/s²]": round(lap_ax_loss, 3) if np.isfinite(lap_ax_loss) else np.nan,
-                "Actual/Master MAE [Nm]": round(float(np.nanmean(np.abs(actual_track_err[lm]))), 2),
-                "Peak Pbat [kW]": round(float(np.nanmax(p_bat_kw[lm])), 1),
-            }
-        )
-
-    kpis = {
-        "actual_master_mae_nm": float(np.nanmean(np.abs(actual_track_err))),
-        "pedal_ax_corr": pedal_ax_corr,
-        "pedal_torque_corr": pedal_torque_corr,
-        "pc_active_wot_pct": float(np.nanmean(pc_active[full_throttle]) * 100.0)
-        if full_throttle.any()
-        else np.nan,
-        "ax_loss_pc_ms2": ax_loss_pc,
-        "pc_cut_ax_corr": pc_cut_ax_corr,
-        "cap_near_wot_pct": cap_near_pct,
-        "peak_pbat_kw": float(np.nanmax(p_bat_kw)) if np.any(np.isfinite(p_bat_kw)) else np.nan,
-        "eval_samples": int(accel_mask.sum()),
-        "table": pl.DataFrame(lap_rows) if lap_rows else pl.DataFrame(),
-        "warnings": [],
-    }
-    return [fig, fig_rel], kpis
-
-
-if __name__ == "__main__":
-    main()

@@ -150,16 +150,28 @@ def apply_dark_layout(
     """Apply shared dark motorsport styling to *fig* (single source of truth).
 
     Sets the layout-level look every chart shares — backgrounds, typography,
-    legend, dark hover box and modebar — plus the primary x/y axes when the
-    figure is single-panel. Multi-panel helpers pass ``single_axes=False`` and
-    style their per-row axes themselves.
+    horizontal legend, dark hover box and modebar — plus the primary x/y axes
+    when the figure is single-panel. Multi-panel helpers pass
+    ``single_axes=False`` and style their per-row axes themselves.
     """
     fig.update_layout(
-        title=dict(text=title, font=dict(size=15, color=_TEXT, family=FONT_DISPLAY)),
+        title=dict(
+            text=title,
+            font=dict(size=15, color=_TEXT, family=FONT_DISPLAY),
+            y=0.985,
+            yref="container",
+            yanchor="top",
+            pad=dict(b=12),
+        ),
         paper_bgcolor=_BG,
         plot_bgcolor=_BG,
         font=dict(color=_TEXT, size=11, family=FONT_FAMILY),
         legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.0,
+            xanchor="left",
+            x=0.0,
             bgcolor="rgba(20,20,23,0.85)",
             bordercolor="rgba(128,128,128,0.3)",
             font=dict(color=_TEXT, family=FONT_FAMILY),

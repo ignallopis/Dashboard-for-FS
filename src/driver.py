@@ -1733,9 +1733,17 @@ def run_speed_stats(df: pl.DataFrame) -> dict:
     vx = np.abs(np.asarray(d["VN_vx"], dtype=float))
     vx = vx[np.isfinite(vx)]
     if vx.size == 0:
-        return {"v_max_kmh": float("nan"), "v_avg_kmh": float("nan"), "samples": 0}
+        return {
+            "v_max_kmh": float("nan"),
+            "v_min_kmh": float("nan"),
+            "v_avg_kmh": float("nan"),
+            "samples": 0,
+        }
     return {
         "v_max_kmh": float(np.max(vx) * 3.6),
+        # Robust slowest-corner speed: raw min catches one-off near-stops
+        # (spin, cone, line crossing); P2 is the representative slow corner.
+        "v_min_kmh": float(np.percentile(vx, 2.0) * 3.6),
         "v_avg_kmh": float(np.mean(vx) * 3.6),
         "samples": int(vx.size),
     }
