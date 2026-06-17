@@ -33,16 +33,30 @@ BRAND_BLUE_400 = "#4DB3F2"  # data on dark background (chart accent)
 FONT_DISPLAY = '"Archivo", system-ui, -apple-system, "Segoe UI", sans-serif'
 FONT_FAMILY = '"IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif'
 FONT_MONO = '"IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace'
+PLOT_FONT_SIZE = 22
+PLOT_HOVER_FONT_SIZE = 20
+PLOT_AXIS_TITLE_STANDOFF = 24
 
 # Per-wheel colours: FL=blue, FR=orange, RL=green, RR=purple
 WHEEL_COLORS = {"FL": "#4DB3F2", "FR": "#F28C40", "RL": "#73D973", "RR": "#D973D9"}
 WHEEL_SYMBOLS = {"FL": "circle", "FR": "square", "RL": "triangle-up", "RR": "diamond"}
 
+# ── Vehicle / phase-detection constants (single source for every module) ──────
+# Tyre grip and the corner/brake gating thresholds live here so that the grip
+# factors, dynamics and driver sections all flag the same phases. Numbers trace
+# to Parameters.m / the dashboard's existing detectors (see docs/context).
+MU_TIRE = 1.70  # [-]   estimated FS slick peak friction coefficient (Vhcl tyre μ)
+MIN_SPEED_MPS = 3.0  # [m/s] below this the car is ~stationary; exclude from dynamics
+CORNER_RADIUS_M = 60.0  # [m]   path radius below which a sample counts as cornering
+CORNER_MIN_DURATION_S = 0.20  # [s] minimum cornering event length
+BRAKE_PRESS_MIN = 5.0  # brake-system pressure above this = genuinely braking
+BRAKE_DECEL_MIN_MPS2 = 1.0  # [m/s²] |long. decel| with brake applied = braking phase
+
 # ── Driver / run identity colours ──────────────────────────────────────────────
 # Single source of truth for "which colour is this driver/run". Used by every
 # module so a given driver keeps the same colour across all tabs. Colours are
-# assigned by name (not by load order), so e.g. Martinez is the same colour
-# whether loaded alone or next to Cerpa.
+# assigned by name (not by load order), with explicit A/B aliases for renamed
+# comparison CSVs so Driver_A/FSG_A stay blue and Driver_B/FSG_B stay orange.
 DRIVER_PALETTE: tuple[str, ...] = (
     "#4DB3F2",  # blue
     "#F28C40",  # orange
@@ -71,6 +85,19 @@ def _palette_index(key: str) -> int:
     return int(digest, 16) % len(DRIVER_PALETTE)
 
 
+def _run_slot_color(key: str) -> str | None:
+    """Return fixed colours for comparison aliases ending in A/B."""
+    tail = key.strip()
+    for sep in ("_", "-", " "):
+        tail = tail.rsplit(sep, 1)[-1]
+    slot = tail.upper()
+    if slot == "A":
+        return DRIVER_PALETTE[0]
+    if slot == "B":
+        return DRIVER_PALETTE[1]
+    return None
+
+
 def set_run_colors(names: Iterable[object]) -> None:
     """Seed stable, collision-free colours for the currently loaded runs.
 
@@ -88,14 +115,19 @@ def set_run_colors(names: Iterable[object]) -> None:
     used: set[str] = set()
     mapping: dict[str, str] = {}
     for key in keys:
-        idx = _palette_index(key)
-        start = idx
-        while DRIVER_PALETTE[idx] in used:
-            idx = (idx + 1) % len(DRIVER_PALETTE)
-            if idx == start:
-                break
-        used.add(DRIVER_PALETTE[idx])
-        mapping[key] = DRIVER_PALETTE[idx]
+        fixed_color = _run_slot_color(key)
+        if fixed_color is not None and fixed_color not in used:
+            color = fixed_color
+        else:
+            idx = _palette_index(key)
+            start = idx
+            while DRIVER_PALETTE[idx] in used:
+                idx = (idx + 1) % len(DRIVER_PALETTE)
+                if idx == start:
+                    break
+            color = DRIVER_PALETTE[idx]
+        used.add(color)
+        mapping[key] = color
 
     _RUN_COLOR_REGISTRY.clear()
     _RUN_COLOR_REGISTRY.update(mapping)
@@ -112,6 +144,9 @@ def driver_color(name: object) -> str:
         return _SPECIAL_RUN_COLORS[key]
     if key in _RUN_COLOR_REGISTRY:
         return _RUN_COLOR_REGISTRY[key]
+    fixed_color = _run_slot_color(key)
+    if fixed_color is not None:
+        return fixed_color
     return DRIVER_PALETTE[_palette_index(key)]
 
 
@@ -157,7 +192,7 @@ def apply_dark_layout(
     fig.update_layout(
         title=dict(
             text=title,
-            font=dict(size=15, color=_TEXT, family=FONT_DISPLAY),
+            font=dict(size=PLOT_FONT_SIZE, color=_TEXT, family=FONT_DISPLAY),
             y=0.985,
             yref="container",
             yanchor="top",
@@ -165,7 +200,7 @@ def apply_dark_layout(
         ),
         paper_bgcolor=_BG,
         plot_bgcolor=_BG,
-        font=dict(color=_TEXT, size=11, family=FONT_FAMILY),
+        font=dict(color=_TEXT, size=PLOT_FONT_SIZE, family=FONT_FAMILY),
         legend=dict(
             orientation="h",
             yanchor="bottom",
@@ -174,12 +209,12 @@ def apply_dark_layout(
             x=0.0,
             bgcolor="rgba(20,20,23,0.85)",
             bordercolor="rgba(128,128,128,0.3)",
-            font=dict(color=_TEXT, family=FONT_FAMILY),
+            font=dict(color=_TEXT, family=FONT_FAMILY, size=PLOT_FONT_SIZE),
         ),
         hoverlabel=dict(
             bgcolor=_HOVER_BG,
             bordercolor=_SURFACE_BORDER,
-            font=dict(color=_TEXT, family=FONT_FAMILY, size=12),
+            font=dict(color=_TEXT, family=FONT_FAMILY, size=PLOT_HOVER_FONT_SIZE),
         ),
         modebar=dict(bgcolor="rgba(0,0,0,0)", color=_TEXT_MUTED, activecolor=BRAND_BLUE_400),
     )
@@ -187,22 +222,34 @@ def apply_dark_layout(
         # Consistent base margin for single-panel charts only; multi-panel
         # helpers keep their own spacing so subplot titles aren't clipped.
         fig.update_layout(
-            margin=dict(l=70, r=35, t=55, b=60),
+            margin=dict(l=95, r=45, t=55, b=85),
             xaxis=dict(
-                title=xlabel,
+                title=dict(
+                    text=xlabel,
+                    font=dict(size=PLOT_FONT_SIZE, family=FONT_FAMILY),
+                    standoff=PLOT_AXIS_TITLE_STANDOFF,
+                ),
+                tickfont=dict(size=PLOT_FONT_SIZE, family=FONT_FAMILY),
                 color=_AXIS,
                 gridcolor=_GRID,
                 linecolor=_AXIS,
                 tickcolor=_AXIS,
                 showgrid=True,
+                automargin=True,
             ),
             yaxis=dict(
-                title=ylabel,
+                title=dict(
+                    text=ylabel,
+                    font=dict(size=PLOT_FONT_SIZE, family=FONT_FAMILY),
+                    standoff=PLOT_AXIS_TITLE_STANDOFF,
+                ),
+                tickfont=dict(size=PLOT_FONT_SIZE, family=FONT_FAMILY),
                 color=_AXIS,
                 gridcolor=_GRID,
                 linecolor=_AXIS,
                 tickcolor=_AXIS,
                 showgrid=True,
+                automargin=True,
             ),
         )
     return fig
@@ -347,6 +394,53 @@ def keep_min_duration_segments(mask: np.ndarray, min_duration: float, dt: float)
         if e - s + 1 >= min_samples:
             clean[s : e + 1] = True
     return clean
+
+
+def radius_corner_mask(
+    vx_mps: np.ndarray,
+    ay_mps2: np.ndarray,
+    dt_s: float,
+    *,
+    radius_threshold_m: float = CORNER_RADIUS_M,
+    min_speed_mps: float = MIN_SPEED_MPS,
+    min_duration_s: float = CORNER_MIN_DURATION_S,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Corner mask from path curvature ``R = V²/|ay|`` (Lap-Analysis logic).
+
+    The driver / lap analysis detects corners from the path radius with a default
+    60 m threshold: smoothed inverse-radius, a minimum speed and a minimum event
+    length. This is the single shared implementation so every section (dynamics,
+    grip factors, …) flags the **same** corners. Returns ``(corner_mask,
+    smoothed_radius_m)``.
+    """
+    ay_abs = np.abs(np.asarray(ay_mps2, dtype=float))
+    vx = np.asarray(vx_mps, dtype=float)
+    radius_m = np.divide(
+        vx**2,
+        np.maximum(ay_abs, 0.05),
+        out=np.full_like(vx, np.nan, dtype=float),
+        where=np.isfinite(vx) & np.isfinite(ay_abs),
+    )
+    inv_radius = np.divide(
+        1.0,
+        radius_m,
+        out=np.zeros_like(radius_m, dtype=float),
+        where=np.isfinite(radius_m) & (radius_m > 0.0),
+    )
+    win = max(1, int(round(0.30 / dt_s)))
+    inv_radius_sm = smooth_signal(inv_radius, win)
+    radius_sm_m = np.divide(
+        1.0,
+        inv_radius_sm,
+        out=np.full_like(inv_radius_sm, np.nan, dtype=float),
+        where=np.isfinite(inv_radius_sm) & (inv_radius_sm > 0.0),
+    )
+    raw = (
+        np.isfinite(radius_sm_m)
+        & (np.abs(vx) >= min_speed_mps)
+        & (radius_sm_m < radius_threshold_m)
+    )
+    return keep_min_duration_segments(raw, min_duration_s, dt_s), radius_sm_m
 
 
 def fill_short_false_gaps(
@@ -1248,19 +1342,6 @@ _TBL_GREEN = "#2A9D8F"  # 2nd best — teal-green
 _TBL_YELLOW = "#D9A441"  # middle — amber
 _TBL_RED = "#C75D5D"  # worst — muted red
 
-_LOWER_BETTER_PATTERNS: tuple[str, ...] = (
-    "LapTime",
-    "laptime",
-    "lap time",
-    "Lap time",
-    "Off throttle",
-    "Steering smoothness",
-)
-
-
-def _table_lower_is_better(col: str) -> bool:
-    return any(p in col for p in _LOWER_BETTER_PATTERNS)
-
 
 def _hex_to_rgb(h: str) -> tuple[float, float, float]:
     h = h.lstrip("#")
@@ -1321,32 +1402,6 @@ def _rank_color_styles(vals: np.ndarray, lower_better: bool) -> list[str]:
     return styles
 
 
-def style_per_lap_table(df: pl.DataFrame) -> "pd.io.formats.style.Styler":
-    """Return a pandas Styler with rank-based colour gradient per numeric column.
-
-    Purple = best, green = 2nd best, red = worst,
-    green → yellow → red gradient for middle ranks.
-    Lower-is-better for LapTime / Off-throttle / Steering-smoothness columns.
-    """
-    import pandas as pd  # noqa: PLC0415
-
-    _SKIP = {"Lap", "lap", "Run", "run"}
-    pdf = df.to_pandas()
-
-    def _apply_all(frame: pd.DataFrame) -> pd.DataFrame:
-        result = pd.DataFrame("", index=frame.index, columns=frame.columns)
-        for col in frame.columns:
-            if col in _SKIP:
-                continue
-            if not pd.api.types.is_numeric_dtype(frame[col]):
-                continue
-            lb = _table_lower_is_better(col)
-            result[col] = _rank_color_styles(frame[col].to_numpy(dtype=float, na_value=np.nan), lb)
-        return result
-
-    return pdf.style.apply(_apply_all, axis=None)
-
-
 def style_metrics_table(
     df: pl.DataFrame,
     *,
@@ -1374,3 +1429,34 @@ def style_metrics_table(
         return styles
 
     return pdf.style.apply(_apply_row, axis=1)
+
+
+def style_sector_times_table(df: pl.DataFrame) -> "pd.io.formats.style.Styler":
+    """Timing-sheet styler: rank every time column from best to worst."""
+    import pandas as pd  # noqa: PLC0415
+
+    pdf = df.to_pandas()
+    time_cols = [
+        col
+        for col in pdf.columns
+        if col not in ("Run", "Lap") and pd.api.types.is_numeric_dtype(pdf[col])
+    ]
+
+    def _rank_time_frame(frame: "pd.DataFrame") -> "pd.DataFrame":
+        styles = pd.DataFrame("", index=frame.index, columns=frame.columns)
+        if "Run" in frame.columns:
+            run_groups = frame.groupby("Run", sort=False, dropna=False).groups.values()
+        else:
+            run_groups = [frame.index]
+        for idx in run_groups:
+            for col in time_cols:
+                vals = pd.to_numeric(frame.loc[idx, col], errors="coerce").to_numpy(dtype=float)
+                styles.loc[idx, col] = _rank_color_styles(vals, lower_better=True)
+        return styles
+
+    styler = pdf.style.apply(_rank_time_frame, axis=None)
+    if "Run" in pdf.columns:
+        styler = styler.apply(
+            lambda col: [f"color: {driver_color(v)}" for v in col], axis=0, subset=["Run"]
+        )
+    return styler.format(precision=3, na_rep="")

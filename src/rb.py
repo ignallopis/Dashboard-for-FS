@@ -20,6 +20,7 @@ from utils import (
     WHEEL_COLORS,
     WHEEL_SYMBOLS,
     cols_to_numpy,
+    driver_color,
     ensure_complete_laps_df,
     exclude_lap0_and_last_lap,
     keep_min_duration_segments,
@@ -56,6 +57,334 @@ STEADY_BRAKE_STD_THRESHOLD = 5.0
 STEADY_JERK_THRESHOLD = 2.0
 STRAIGHT_STEER_THRESHOLD_RAD = 0.05
 STRAIGHT_AY_THRESHOLD_MS2 = 3.0
+
+# ── R3 regen distribution (Controls redesign 2026-06-17) ───────────────────────
+REGEN_BRAKE_CMD = -0.1  # LLC_Command below this = driver braking
+REGEN_MIN_SPEED = 5.0  # [m/s] below this slip/load estimates are unreliable
+REGEN_MIN_TORQUE = 2.0  # [Nm] total regen torque to count the sample
+FZ_COLS = {w: f"Est_FZ{w}" for w in WHEELS}
+
+# ── RB controller-quality figures (Controls redesign 2026-06-17) ───────────────
+# Channels published by the RB node (RegenerativeControl.cpp). DEAD/flat on the
+# FSG_A/FSG_B logs (intensity loop never ran, torque never published) → the figures
+# below render empty there and light up on logs where RB actually ran.
+RB_INTENSITY_TARGET_COL = "RB_intensityTarget"  # PI setpoint, published negative [A]
+RB_LIMITER_COL = "RB_enableIntensityLimiter"  # 1.0 while the intensity loop is active
+RB_FRONT_TRQ_COL = "RB_F_TotalTrq"  # RB front-axle regen torque [Nm] (>=0)
+RB_REAR_TRQ_COL = "RB_R_TotalTrq"  # RB rear-axle regen torque [Nm] (>=0)
+RB_CURRENT_COL = "Current"  # pack current [A], negative = regenerating
+PARAM_MAX_REGEN_TRQ_COL = "Param_desiredMaximumRegenTorque"  # logged torque ceiling [Nm]
+
+CURRENT_TRACK_BAND_A = 5.0  # ±A around the target that counts as "on target"
+SATURATION_FRAC = 0.95  # >= this fraction of a limit counts as saturated
+# Ceiling reconciliation: docs/context/cat17x_parameters.md says 80 A / -27.5 Nm, but the
+# logs carry i_max = 100 A (RB_intensityTarget) and Param_desiredMaximumRegenTorque = 905.
+# We trust the LOGGED channels at runtime (never hardcode the doc values here).
+
+
+def rb_current_fidelity_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """R1 — Current-loop fidelity: does RB drive pack current to its target?
+
+    During armed regulation (intensity limiter on + braking), plots achieved regen current
+    |Current| vs the controller's target |RB_intensityTarget|; y=x = perfect tracking, above
+    the line = overshoot. The transient/onset is folded in (the ramp samples live in the same
+    scatter). Pure control quality — what RB regulates — not vehicle behaviour. Renders empty
+    on logs where the intensity loop never ran (RB_enableIntensityLimiter never 1).
+    """
+    fig = make_dark_figure(
+        "RB current-loop fidelity  ·  achieved vs target pack current",
+        "Target regen current |target| [A]",
+        "Achieved regen current |I| [A]",
+    )
+    runs: dict[str, dict] = {}
+    warnings: list[str] = []
+    lo_all: list[float] = []
+    hi_all: list[float] = []
+    any_pts = False
+    for run_name, df in dfs.items():
+        need = [RB_LIMITER_COL, RB_INTENSITY_TARGET_COL, RB_CURRENT_COL, "LLC_Command", "Est_vxCOG"]
+        missing = [c for c in need if c not in df.columns]
+        if missing:
+            warnings.append(f"{run_name}: missing {missing[:3]}…")
+            continue
+        try:
+            d = ensure_complete_laps_df(df)
+        except ValueError as exc:
+            warnings.append(f"{run_name}: {exc}")
+            continue
+        limiter = d[RB_LIMITER_COL].to_numpy().astype(float)
+        target = d[RB_INTENSITY_TARGET_COL].to_numpy().astype(float)
+        cur = d[RB_CURRENT_COL].to_numpy().astype(float)
+        cmd = d["LLC_Command"].to_numpy().astype(float)
+        vx = d["Est_vxCOG"].to_numpy().astype(float)
+        x = np.abs(target)  # target magnitude [A]
+        y = np.clip(-cur, 0.0, None)  # achieved regen magnitude [A]
+        armed = (limiter == 1.0) & (cmd < REGEN_BRAKE_CMD) & (vx > REGEN_MIN_SPEED)
+        m = armed & np.isfinite(x) & np.isfinite(y) & (x > 1.0)
+        if m.sum() < 20:
+            warnings.append(f"{run_name}: RB intensity loop not active in this log.")
+            continue
+        xm = x[m]
+        ym = y[m]
+        any_pts = True
+        color = driver_color(run_name)
+        stride = max(1, int(np.ceil(xm.size / 4000)))
+        fig.add_trace(
+            go.Scattergl(
+                x=xm[::stride],
+                y=ym[::stride],
+                mode="markers",
+                marker=dict(color=color, size=3, opacity=0.3),
+                name=run_name,
+                hovertemplate=f"{run_name}<br>target=%{{x:.0f}} A<br>achieved=%{{y:.0f}} A<extra></extra>",
+            )
+        )
+        err = ym - xm
+        ratio = ym / xm
+        runs[run_name] = {
+            "track_error_med_a": round(float(np.median(np.abs(err))), 1),
+            "within_band_pct": round(
+                100.0 * float(np.mean(np.abs(err) <= CURRENT_TRACK_BAND_A)), 1
+            ),
+            "overshoot_p95": round(float(np.nanpercentile(ratio, 95)), 2),
+            "samples": int(m.sum()),
+        }
+        lo_all.append(float(min(xm.min(), ym.min())))
+        hi_all.append(float(max(xm.max(), ym.max())))
+    if any_pts and lo_all:
+        lo = min(lo_all)
+        hi = max(hi_all)
+        fig.add_trace(
+            go.Scatter(
+                x=[lo, hi],
+                y=[lo, hi],
+                mode="lines",
+                line=dict(color="#73D973", dash="dash", width=2.0),
+                name="tracks target (y=x)",
+            )
+        )
+    else:
+        fig.add_annotation(
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            text="RB intensity loop inactive in this log",
+            font=dict(color="#EBEBEB", size=12),
+        )
+    return fig, {"runs": runs, "warnings": warnings}
+
+
+def rb_regen_distribution_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """R3 — Front regen-torque share vs front vertical-load share under braking.
+
+    Uses RB's own published axle regen torque (`RB_F_TotalTrq` / `RB_R_TotalTrq`), so it
+    isolates the RB distribution (no TV / base-map contamination). y=x = regen splits exactly
+    with load. NOTE: `Est_FZ*` are the controller's OWN estimated loads, so this verifies the
+    distribution code follows its own load model — not real grip. Empty when RB torque is not
+    logged/active.
+    """
+    fig = make_dark_figure(
+        "RB regen distribution  ·  front regen share vs front load share",
+        "Front vertical-load share [%]",
+        "Front regen-torque share [%]",
+    )
+    runs: dict[str, dict] = {}
+    warnings: list[str] = []
+    any_pts = False
+    for run_name, df in dfs.items():
+        need = [RB_FRONT_TRQ_COL, RB_REAR_TRQ_COL, "LLC_Command", "Est_vxCOG", *FZ_COLS.values()]
+        missing = [c for c in need if c not in df.columns]
+        if missing:
+            warnings.append(f"{run_name}: missing {missing[:3]}…")
+            continue
+        try:
+            d = ensure_complete_laps_df(df)
+        except ValueError as exc:
+            warnings.append(f"{run_name}: {exc}")
+            continue
+        cmd = d["LLC_Command"].to_numpy().astype(float)
+        vx = d["Est_vxCOG"].to_numpy().astype(float)
+        regen_f = np.clip(d[RB_FRONT_TRQ_COL].to_numpy().astype(float), 0.0, None)
+        regen_r = np.clip(d[RB_REAR_TRQ_COL].to_numpy().astype(float), 0.0, None)
+        tot = regen_f + regen_r
+        fz_f = d["Est_FZFL"].to_numpy() + d["Est_FZFR"].to_numpy()
+        fz_tot = fz_f + d["Est_FZRL"].to_numpy() + d["Est_FZRR"].to_numpy()
+        m = (
+            (cmd < REGEN_BRAKE_CMD)
+            & (vx > REGEN_MIN_SPEED)
+            & (tot > REGEN_MIN_TORQUE)
+            & np.isfinite(tot)
+            & (fz_tot > 1.0)
+        )
+        if m.sum() < 20:
+            warnings.append(f"{run_name}: no RB regen-torque samples (channel dead/inactive).")
+            continue
+        load_share = 100.0 * fz_f[m] / fz_tot[m]
+        regen_share = 100.0 * regen_f[m] / tot[m]
+        any_pts = True
+        color = driver_color(run_name)
+        stride = max(1, int(np.ceil(load_share.size / 4000)))
+        fig.add_trace(
+            go.Scattergl(
+                x=load_share[::stride],
+                y=regen_share[::stride],
+                mode="markers",
+                marker=dict(color=color, size=3, opacity=0.3),
+                name=run_name,
+                hovertemplate=f"{run_name}<br>load=%{{x:.0f}}%<br>regen=%{{y:.0f}}%<extra></extra>",
+            )
+        )
+        corr = (
+            np.nan
+            if np.nanstd(load_share) < 1e-9 or np.nanstd(regen_share) < 1e-9
+            else round(float(np.corrcoef(load_share, regen_share)[0, 1]), 2)
+        )
+        runs[run_name] = {
+            "front_regen_share_median": round(float(np.median(regen_share)), 1),
+            "front_load_share_median": round(float(np.median(load_share)), 1),
+            "delta_vs_load_pp": round(float(np.median(regen_share - load_share)), 1),
+            "corr_regen_load": corr,
+            "samples": int(m.sum()),
+        }
+    if any_pts:
+        fig.add_trace(
+            go.Scatter(
+                x=[40, 80],
+                y=[40, 80],
+                mode="lines",
+                line=dict(color="#73D973", dash="dash", width=2.0),
+                name="follows load (y=x)",
+            )
+        )
+        fig.update_xaxes(range=[40, 85])
+        fig.update_yaxes(range=[40, 85])
+    else:
+        fig.add_annotation(
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            text="No RB regen-torque samples in this log",
+            font=dict(color="#EBEBEB", size=12),
+        )
+    return fig, {"runs": runs, "warnings": warnings}
+
+
+def rb_saturation_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """R4 — Saturation / headroom: how much braking time is RB limited, and by what?
+
+    Each armed-braking sample is classed current-limited (|I| >= 0.95·|target|),
+    torque-limited (total RB torque >= 0.95·Param_desiredMaximumRegenTorque), or in free
+    regulation. Pairs with R1 (R1 = how well it tracks when regulating; R4 = how often it
+    can't). Limits come from the logged channels, not the doc. Empty when RB never ran.
+    """
+    fig = make_dark_figure(
+        "RB saturation  ·  share of braking time at each limit",
+        "Share of armed braking time [%]",
+        "Run",
+    )
+    runs: dict[str, dict] = {}
+    warnings: list[str] = []
+    rows: list[tuple[str, float, float, float]] = []  # (run, current%, torque%, free%)
+    for run_name, df in dfs.items():
+        need = [
+            RB_CURRENT_COL,
+            RB_INTENSITY_TARGET_COL,
+            RB_FRONT_TRQ_COL,
+            RB_REAR_TRQ_COL,
+            PARAM_MAX_REGEN_TRQ_COL,
+            "LLC_Command",
+            "Est_vxCOG",
+        ]
+        missing = [c for c in need if c not in df.columns]
+        if missing:
+            warnings.append(f"{run_name}: missing {missing[:3]}…")
+            continue
+        try:
+            d = ensure_complete_laps_df(df)
+        except ValueError as exc:
+            warnings.append(f"{run_name}: {exc}")
+            continue
+        cur = d[RB_CURRENT_COL].to_numpy().astype(float)
+        target = np.abs(d[RB_INTENSITY_TARGET_COL].to_numpy().astype(float))
+        trq = np.clip(d[RB_FRONT_TRQ_COL].to_numpy().astype(float), 0.0, None) + np.clip(
+            d[RB_REAR_TRQ_COL].to_numpy().astype(float), 0.0, None
+        )
+        trq_cap = d[PARAM_MAX_REGEN_TRQ_COL].to_numpy().astype(float)
+        cmd = d["LLC_Command"].to_numpy().astype(float)
+        vx = d["Est_vxCOG"].to_numpy().astype(float)
+        i_ach = np.clip(-cur, 0.0, None)
+        armed = (cmd < REGEN_BRAKE_CMD) & (vx > REGEN_MIN_SPEED) & (trq > REGEN_MIN_TORQUE)
+        m = armed & np.isfinite(i_ach) & (target > 1.0) & (trq_cap > 1.0)
+        if m.sum() < 20:
+            warnings.append(f"{run_name}: no RB regulation samples (channel dead/inactive).")
+            continue
+        if np.nanmax(trq[m]) > 1.2 * np.nanmax(trq_cap[m]):
+            warnings.append(f"{run_name}: regen torque exceeds logged ceiling — check units.")
+        cur_lim = i_ach[m] >= SATURATION_FRAC * target[m]
+        trq_lim = trq[m] >= SATURATION_FRAC * trq_cap[m]
+        n = int(m.sum())
+        pct_cur = 100.0 * float(np.mean(cur_lim))
+        pct_trq = 100.0 * float(np.mean(trq_lim & ~cur_lim))  # attribute overlap to current
+        pct_free = 100.0 - pct_cur - pct_trq
+        headroom = (
+            float(np.median((target[m] - i_ach[m])[~(cur_lim | trq_lim)]))
+            if (~(cur_lim | trq_lim)).any()
+            else 0.0
+        )
+        rows.append((run_name, pct_cur, pct_trq, pct_free))
+        runs[run_name] = {
+            "pct_saturated": round(pct_cur + pct_trq, 1),
+            "pct_current_limited": round(pct_cur, 1),
+            "pct_torque_limited": round(pct_trq, 1),
+            "headroom_med_a": round(headroom, 1),
+            "samples": n,
+        }
+    if rows:
+        labels = [r[0] for r in rows]
+        fig.add_trace(
+            go.Bar(
+                y=labels,
+                x=[r[1] for r in rows],
+                name="current-limited",
+                orientation="h",
+                marker_color="#E07A5F",
+            )
+        )
+        fig.add_trace(
+            go.Bar(
+                y=labels,
+                x=[r[2] for r in rows],
+                name="torque-limited",
+                orientation="h",
+                marker_color="#F2CC8F",
+            )
+        )
+        fig.add_trace(
+            go.Bar(
+                y=labels,
+                x=[r[3] for r in rows],
+                name="free regulation",
+                orientation="h",
+                marker_color="#73D973",
+            )
+        )
+        fig.update_layout(barmode="stack")
+        fig.update_xaxes(range=[0, 100])
+    else:
+        fig.add_annotation(
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            text="RB never reached regulation in this log",
+            font=dict(color="#EBEBEB", size=12),
+        )
+    return fig, {"runs": runs, "warnings": warnings}
 
 
 def _load(columns: list[str]) -> dict[str, np.ndarray]:

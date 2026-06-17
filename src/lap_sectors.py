@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import polars as pl
 
-from utils import available_laps, cols_to_numpy, lap_dist_from_gps
+from utils import COMPLETE_LAPS_MARKER, available_laps, cols_to_numpy, lap_dist_from_gps
 
 from src.driver import _classify_phases
 
@@ -48,6 +49,12 @@ def _analysis_lap_ids(df: pl.DataFrame) -> list[int]:
     lap_ids = available_laps(df).astype(int)
     if lap_ids.size == 0:
         return []
+    # When the df already carries the dashboard lap-selection marker, the user
+    # has chosen exactly these laps (invalid ones deselected in the sidebar) —
+    # honour all of them. Only raw dfs fall back to dropping the last
+    # (incomplete) lap, matching exclude_lap0_and_last_lap.
+    if COMPLETE_LAPS_MARKER in df.columns:
+        return [int(lap_id) for lap_id in lap_ids.tolist()]
     max_lap = int(np.max(lap_ids))
     return [int(lap_id) for lap_id in lap_ids.tolist() if int(lap_id) < max_lap]
 
@@ -232,6 +239,49 @@ def per_lap_sector_stats(
             )
         out[int(lap_id)] = lap_stats
     return out
+
+
+def sector_labels(sectors: list[Sector]) -> list[str]:
+    """Track-order column labels: T<turn_id> for corners, S<n> for straights."""
+    labels: list[str] = []
+    straight_count = 0
+    for sector in sectors:
+        if sector.kind == "corner" and sector.turn_id is not None:
+            labels.append(f"T{int(sector.turn_id)}")
+        else:
+            straight_count += 1
+            labels.append(f"S{straight_count}")
+    return labels
+
+
+def sector_times_matrix(dfs: dict[str, pl.DataFrame], sectors: list[Sector]) -> pl.DataFrame:
+    """Per-lap sector-time matrix across runs: one row per (run, lap).
+
+    Columns: Run, Lap, Lap time [s], then one column per sector in track order.
+    Cell = seconds spent in that sector on that lap (None when the lap never
+    covers the sector's distance range).
+    """
+    if not sectors:
+        return pl.DataFrame()
+    labels = sector_labels(sectors)
+    rows: list[dict[str, object]] = []
+    for run_name, df in dfs.items():
+        run_label = Path(run_name).stem
+        lap_metrics = whole_lap_metrics_by_lap(df)
+        per_lap = per_lap_sector_stats(df, sectors)
+        for lap_id in sorted(per_lap):
+            lap_time_s = float(lap_metrics.get(lap_id, {}).get("lap_time_s", np.nan))
+            row: dict[str, object] = {
+                "Run": run_label,
+                "Lap": int(lap_id),
+                "Lap time [s]": round(lap_time_s, 3) if np.isfinite(lap_time_s) else None,
+            }
+            for stat, label in zip(per_lap[lap_id], labels, strict=True):
+                row[label] = (
+                    round(float(stat.duration_s), 2) if np.isfinite(stat.duration_s) else None
+                )
+            rows.append(row)
+    return pl.DataFrame(rows)
 
 
 def potential_lap(

@@ -7,15 +7,14 @@ Metrics:
   2. Full Throttle Time per lap                 (seconds where TP > 95 %)
   3. Throttle Speed per lap                     (median |dTP/dt| with TP < 100 %
                                                  and brake released)
-  4. Braking Effort                             (Brake [%] vs Filtering_VN_ax [m/s²])
-  5. Brake Application Point                    (box plot by significant braking zone)
-  6. Braking Aggressiveness per lap             (mean dBrake/dt for dBrake/dt > 5 %/s)
-  7. Brake Release Smoothness per lap           (mean |dBrake/dt| for dBrake/dt < -5 %/s)
-  8. Steering Smoothness                        (mean |Steering - smooth_1s(Steering)|
+  4. Brake Application Point                    (box plot by significant braking zone)
+  5. Braking Aggressiveness per lap             (mean dBrake/dt for dBrake/dt > 5 %/s)
+  6. Brake Release Smoothness per lap           (mean |dBrake/dt| for dBrake/dt < -5 %/s)
+  7. Steering Smoothness                        (mean |Steering - smooth_1s(Steering)|
                                                  per lap)
-  9. Steering Integral                          (∫|Steering| ds per lap)
- 10. Corner Curvature                           (mean |ay| / vx² per lap)
- 11. Steering Stability                         (∫|dSteering/dt| over straight-line braking,
+  8. Steering Integral                          (∫|Steering| ds per lap)
+  9. Corner Curvature                           (mean |ay| / vx² per lap)
+ 10. Steering Stability                         (∫|dSteering/dt| over straight-line braking,
                                                  box plot per significant braking zone)
 
 All figure builders accept a `dfs: dict[str, pl.DataFrame]` so a single run
@@ -77,8 +76,7 @@ BRAKE_THRESHOLD = 1.0  # [%]  Brake above this means driver is braking
 G_MPS2 = 9.81  # gravitational acceleration [m/s^2]
 THROTTLE_BIN_WIDTH = 5.0  # [%]  histogram bin width
 BRAKE_DERIV_THRESHOLD = 5.0  # [%/s] threshold from the requested definition
-BRAKE_EFFORT_MIN = 5.0  # [%]   avoid low-pedal noise in the effort cloud
-BRAKE_EFFORT_AX_MAX = -0.5  # [m/s²] require actual longitudinal deceleration
+BRAKE_EVENT_MIN_BRAKE_PCT = 5.0  # [%] avoid low-pedal noise in braking events
 BRAKE_EVENT_MIN_TIME_S = 0.10  # [s]   ignore isolated brake spikes
 BRAKE_EVENT_MAX_GAP_S = 0.08  # [s]   bridge short drops inside one braking zone
 BRAKE_SMOOTH_WINDOW_S = 0.31  # [s]   light smoothing before differentiation
@@ -339,65 +337,6 @@ def _true_segments(mask: np.ndarray) -> list[tuple[int, int]]:
     return list(zip(starts.tolist(), ends.tolist()))
 
 
-def _braking_effort_events(
-    d: dict[str, np.ndarray],
-    accel_col: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return per-event max Brake and min longitudinal acceleration."""
-    valid = np.all(
-        np.stack(
-            [
-                np.isfinite(d["time"]),
-                np.isfinite(d["laps"]),
-                np.isfinite(d["Brake"]),
-                np.isfinite(d[accel_col]),
-            ],
-            axis=1,
-        ),
-        axis=1,
-    )
-    d = {k: v[valid] for k, v in d.items()}
-    d = exclude_lap0_and_last_lap(d)
-
-    time_s = d["time"]
-    laps = d["laps"]
-    brake_pct = d["Brake"]
-    accel_arr = d[accel_col]
-    dt_s = robust_dt(time_s)
-    brake_smooth = _smooth_brake_signal(brake_pct, dt_s)
-
-    event_mask = keep_min_duration_segments(
-        brake_smooth >= BRAKE_EFFORT_MIN,
-        BRAKE_EVENT_MIN_TIME_S,
-        dt_s,
-    )
-    event_mask = fill_short_false_gaps(event_mask, BRAKE_EVENT_MAX_GAP_S, dt_s)
-
-    event_laps: list[int] = []
-    max_brake_pct: list[float] = []
-    min_accel_mps2: list[float] = []
-    duration_s: list[float] = []
-
-    for lap in unique_laps(laps):
-        lap_mask = (laps == lap) & event_mask
-        for start_idx, end_idx in _true_segments(lap_mask):
-            seg = slice(start_idx, end_idx + 1)
-            event_min_accel = float(np.nanmin(accel_arr[seg]))
-            if event_min_accel > BRAKE_EFFORT_AX_MAX:
-                continue
-            event_laps.append(int(lap))
-            max_brake_pct.append(float(np.nanmax(brake_pct[seg])))
-            min_accel_mps2.append(event_min_accel)
-            duration_s.append(float(time_s[end_idx] - time_s[start_idx]))
-
-    return (
-        np.asarray(event_laps, dtype=int),
-        np.asarray(max_brake_pct, dtype=float),
-        np.asarray(min_accel_mps2, dtype=float),
-        np.asarray(duration_s, dtype=float),
-    )
-
-
 def _prep_brake_application(
     df: pl.DataFrame,
     accel_col: str,
@@ -437,7 +376,7 @@ def _iter_significant_brake_event_segments(
     brake_smooth = _smooth_brake_signal(brake_pct, dt_s)
 
     event_mask = keep_min_duration_segments(
-        brake_smooth >= BRAKE_EFFORT_MIN,
+        brake_smooth >= BRAKE_EVENT_MIN_BRAKE_PCT,
         BRAKE_EVENT_MIN_TIME_S,
         dt_s,
     )
@@ -1135,107 +1074,11 @@ def throttle_speed_fig(
     return fig
 
 
-def braking_effort_fig(dfs: dict[str, pl.DataFrame]) -> go.Figure:
-    """Per-event brake demand versus achieved longitudinal acceleration."""
-    accel_label = "Filtering_VN_ax [m/s²]"
-    fig = make_dark_figure(
-        title="Braking Effort — one point per braking event",
-        xlabel="Brake [%]",
-        ylabel=accel_label,
-    )
-    fig.update_layout(legend=dict(itemsizing="constant"))
-
-    any_trace = False
-    brake_max = 0.0
-    accel_min = 0.0
-
-    for i, (run_name, df) in enumerate(dfs.items()):
-        accel_col = _longitudinal_accel_col(df)
-        if accel_col != "Filtering_VN_ax":
-            accel_label = f"{accel_col} [m/s²]"
-            fig.update_yaxes(title_text=accel_label)
-        d = _prep(df, extra_cols=(accel_col,))
-        lap_ids, x_arr, y_arr, duration_s = _braking_effort_events(d, accel_col)
-        valid = np.isfinite(x_arr) & np.isfinite(y_arr) & np.isfinite(duration_s)
-        if not valid.any():
-            continue
-
-        any_trace = True
-        lap_ids = lap_ids[valid]
-        x_arr = x_arr[valid]
-        y_arr = y_arr[valid]
-        duration_s = duration_s[valid]
-        color = _driver_color(run_name, i)
-        brake_max = max(brake_max, float(np.nanmax(x_arr)))
-        accel_min = min(accel_min, float(np.nanmin(y_arr)))
-        customdata = np.column_stack([lap_ids, duration_s])
-
-        fig.add_trace(
-            go.Scattergl(
-                x=x_arr,
-                y=y_arr,
-                mode="markers",
-                name=run_name,
-                marker=dict(
-                    color=color,
-                    size=5 if len(dfs) == 1 else 4,
-                    opacity=0.42 if len(dfs) == 1 else 0.28,
-                    line=dict(width=0),
-                ),
-                customdata=customdata,
-                hovertemplate=(
-                    "Lap: %{customdata[0]:.0f}<br>"
-                    "Event duration: %{customdata[1]:.2f} s<br>"
-                    "Brake: %{x:.1f}%<br>"
-                    f"{accel_col}: " + "%{y:.2f} m/s²"
-                    f"<extra>{run_name}</extra>"
-                ),
-            )
-        )
-
-        brake_ref = float(np.nanmax(x_arr))
-        accel_ref = float(np.nanmin(y_arr))
-
-        fig.add_trace(
-            go.Scatter(
-                x=[0.0, brake_ref],
-                y=[accel_ref, accel_ref],
-                mode="lines",
-                line=dict(color=color, dash="dot", width=1.2),
-                showlegend=False,
-                hoverinfo="skip",
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=[brake_ref, brake_ref],
-                y=[0.0, accel_ref],
-                mode="lines",
-                line=dict(color=color, dash="dot", width=1.2),
-                showlegend=False,
-                hoverinfo="skip",
-            )
-        )
-
-    if not any_trace:
-        raise ValueError("No valid braking samples passed the Brake/ax filter.")
-
-    fig.update_xaxes(range=[0.0, max(80.0, min(100.0, brake_max + 5.0))], dtick=10)
-    fig.update_yaxes(range=[accel_min - 0.5, 0.5], zeroline=False)
-    return fig
-
-
-def brake_application_point_fig(
+def _brake_application_zoned(
     dfs: dict[str, pl.DataFrame],
-    turns: list[object] | None = None,
-) -> go.Figure:
-    """Box plot of brake application point for repeated significant braking zones."""
-    fig = make_dark_figure(
-        title="Brake Application Point — significant braking zones",
-        xlabel="Turn / braking zone",
-        ylabel="Brake application point [m]",
-    )
-
+    turns: list[object] | None,
+) -> tuple[list[dict], list[str], list[str]]:
+    """Return (zoned_events, ordered zone labels, run order) for brake zones."""
     events: list[dict] = []
     run_order = list(dfs.keys())
     for run_name, df in dfs.items():
@@ -1269,63 +1112,7 @@ def brake_application_point_fig(
             {str(row["zone"]) for row in zoned_events},
             key=lambda label: int(label.split()[-1]),
         )
-    any_trace = False
-    for run_idx, run_name in enumerate(run_order):
-        run_rows = [row for row in zoned_events if row["run"] == run_name]
-        if not run_rows:
-            continue
-
-        x_vals = [str(row["zone"]) for row in run_rows]
-        y_vals = [float(row["start_dist_m"]) for row in run_rows]
-        customdata = np.asarray(
-            [
-                [
-                    float(row["lap"]),
-                    float(row["duration_s"]),
-                    float(row["peak_brake_pct"]),
-                    float(row["min_accel_mps2"]),
-                    float(row["speed_drop_mps"]),
-                ]
-                for row in run_rows
-            ],
-            dtype=float,
-        )
-        color = _driver_color(run_name, run_idx)
-        any_trace = True
-        fig.add_trace(
-            go.Box(
-                x=x_vals,
-                y=y_vals,
-                name=run_name,
-                marker=dict(color=color, size=5, opacity=0.65),
-                line=dict(color=color, width=1.6),
-                boxmean=True,
-                boxpoints="all",
-                jitter=0.35,
-                pointpos=0.0,
-                customdata=customdata,
-                hovertemplate=(
-                    "Turn/zone: %{x}<br>"
-                    "Lap: %{customdata[0]:.0f}<br>"
-                    "Application: %{y:.1f} m<br>"
-                    "Duration: %{customdata[1]:.2f} s<br>"
-                    "Peak Brake: %{customdata[2]:.1f} %<br>"
-                    "Min ax: %{customdata[3]:.2f} m/s²<br>"
-                    "Speed drop: %{customdata[4]:.1f} m/s"
-                    f"<extra>{run_name}</extra>"
-                ),
-            )
-        )
-
-    if not any_trace:
-        raise ValueError("No valid brake-application points after zone grouping.")
-
-    fig.update_layout(
-        boxmode="group",
-        legend=dict(itemsizing="constant"),
-    )
-    fig.update_xaxes(categoryorder="array", categoryarray=zone_order)
-    return fig
+    return zoned_events, zone_order, run_order
 
 
 def braking_aggressiveness_fig(
@@ -1612,13 +1399,9 @@ def _fastest_valid_lap(df: pl.DataFrame) -> tuple[int, float]:
 
 
 def lap_time_progression_fig(dfs: dict[str, pl.DataFrame]) -> go.Figure:
-    """Lap time per lap (markers + line) and raising average per driver/run.
-
-    Raising average: cumulative mean x_n = (x_1 + ... + x_n) / n — the same
-    forward-looking trend shown in the lecture slide.
-    """
+    """Lap time per lap (markers + line) per driver/run."""
     fig = make_dark_figure(
-        title="Lap Time per Lap with Raising Average",
+        title="Lap Time per Lap",
         xlabel="Lap",
         ylabel="Lap time [s]",
     )
@@ -1631,7 +1414,6 @@ def lap_time_progression_fig(dfs: dict[str, pl.DataFrame]) -> go.Figure:
         order = np.argsort(lap_ids)
         lap_ids = lap_ids[order]
         lt = lt[order]
-        cum_avg = np.cumsum(lt) / np.arange(1, len(lt) + 1)
         color = _driver_color(run_name, i)
 
         fig.add_trace(
@@ -1639,24 +1421,10 @@ def lap_time_progression_fig(dfs: dict[str, pl.DataFrame]) -> go.Figure:
                 x=lap_ids,
                 y=lt,
                 mode="lines+markers",
-                name=f"{run_name} — Lap time",
-                legendgroup=run_name,
+                name=run_name,
                 line=dict(color=color, width=1.6),
                 marker=dict(color=color, size=8, line=dict(width=0)),
                 hovertemplate="Lap %{x}<br>Lap time: %{y:.3f} s<extra>" + run_name + "</extra>",
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=lap_ids,
-                y=cum_avg,
-                mode="lines+markers",
-                name=f"{run_name} — Raising avg",
-                legendgroup=run_name,
-                line=dict(color=color, width=1.4, dash="dash"),
-                marker=dict(color=color, size=6, symbol="diamond"),
-                opacity=0.85,
-                hovertemplate="Lap %{x}<br>Raising avg: %{y:.3f} s<extra>" + run_name + "</extra>",
             )
         )
         all_laps.append(lap_ids)
@@ -1667,134 +1435,6 @@ def lap_time_progression_fig(dfs: dict[str, pl.DataFrame]) -> go.Figure:
     return fig
 
 
-def lap_consistency_stats(dfs: dict[str, pl.DataFrame]) -> pl.DataFrame:
-    """Per-run lap-time variability/consistency statistics.
-
-    Columns:
-      - Laps             : number of valid laps used
-      - Best [s]         : fastest lap time
-      - Mean [s]         : arithmetic mean
-      - Median [s]       : median (robust)
-      - Std [s]          : standard deviation
-      - CV [%]           : 100 * std / mean (key consistency index — lower is better)
-      - MAD [s]          : median absolute deviation, robust to a single bad lap
-      - Range [s]        : max - min
-      - Gap to best [s]  : mean - best (avg time lost per lap vs. driver's best)
-    """
-    rows: list[dict] = []
-    multi_run = len(dfs) > 1
-
-    for run_name, df in dfs.items():
-        try:
-            _, lt = _lap_times_per_run(df)
-        except Exception:
-            continue
-        if lt.size == 0:
-            continue
-
-        best = float(np.nanmin(lt))
-        mean = float(np.nanmean(lt))
-        median = float(np.nanmedian(lt))
-        std = float(np.nanstd(lt, ddof=1)) if lt.size >= 2 else 0.0
-        cv_pct = 100.0 * std / mean if mean > 0 else np.nan
-        mad = float(np.nanmedian(np.abs(lt - median)))
-        rng = float(np.nanmax(lt) - np.nanmin(lt))
-        gap = mean - best
-
-        row: dict = {}
-        if multi_run:
-            row["Run"] = run_name
-        row["Laps"] = int(lt.size)
-        row["Best [s]"] = round(best, 3)
-        row["Mean [s]"] = round(mean, 3)
-        row["Median [s]"] = round(median, 3)
-        row["Std [s]"] = round(std, 3)
-        row["CV [%]"] = round(cv_pct, 2)
-        row["MAD [s]"] = round(mad, 3)
-        row["Range [s]"] = round(rng, 3)
-        row["Gap to best [s]"] = round(gap, 3)
-        rows.append(row)
-
-    return pl.DataFrame(rows) if rows else pl.DataFrame()
-
-
-def run_speed_stats(df: pl.DataFrame) -> dict:
-    """Per-run speed aggregates over valid laps (lap 0 + last lap excluded).
-
-    `VN_vx` is m/s, so values are reported in km/h. v_avg is a plain sample
-    mean; at uniform logger rate that is already time-weighted.
-    """
-    if "VN_vx" not in df.columns:
-        return {"v_max_kmh": float("nan"), "v_avg_kmh": float("nan"), "samples": 0}
-    d = _prep(df, extra_cols=("VN_vx",))
-    valid = np.isfinite(d["laps"]) & np.isfinite(d["laptime"])
-    d = {k: v[valid] for k, v in d.items()}
-    d = exclude_lap0_and_last_lap(d)
-    vx = np.abs(np.asarray(d["VN_vx"], dtype=float))
-    vx = vx[np.isfinite(vx)]
-    if vx.size == 0:
-        return {
-            "v_max_kmh": float("nan"),
-            "v_min_kmh": float("nan"),
-            "v_avg_kmh": float("nan"),
-            "samples": 0,
-        }
-    return {
-        "v_max_kmh": float(np.max(vx) * 3.6),
-        # Robust slowest-corner speed: raw min catches one-off near-stops
-        # (spin, cone, line crossing); P2 is the representative slow corner.
-        "v_min_kmh": float(np.percentile(vx, 2.0) * 3.6),
-        "v_avg_kmh": float(np.mean(vx) * 3.6),
-        "samples": int(vx.size),
-    }
-
-
-def _per_lap_speed(df: pl.DataFrame) -> dict[int, tuple[float, float]]:
-    """Return {lap_id: (v_max_kmh, v_avg_kmh)} over valid laps."""
-    if "VN_vx" not in df.columns:
-        return {}
-    d = _prep(df, extra_cols=("VN_vx",))
-    valid = np.isfinite(d["laps"]) & np.isfinite(d["laptime"])
-    d = {k: v[valid] for k, v in d.items()}
-    d = exclude_lap0_and_last_lap(d)
-    laps = np.asarray(d["laps"], dtype=float)
-    vx = np.abs(np.asarray(d["VN_vx"], dtype=float))
-    out: dict[int, tuple[float, float]] = {}
-    for lap in unique_laps(laps).astype(int):
-        m = (laps == lap) & np.isfinite(vx)
-        if m.any():
-            out[int(lap)] = (
-                float(np.max(vx[m]) * 3.6),
-                float(np.mean(vx[m]) * 3.6),
-            )
-    return out
-
-
-def per_lap_overview_table(dfs: dict[str, pl.DataFrame]) -> pl.DataFrame:
-    """Per-lap drill-down: Lap + (laptime, v_max, v_avg) per run, km/h."""
-    laptimes: dict[str, dict[int, float]] = {}
-    speeds: dict[str, dict[int, tuple[float, float]]] = {}
-    all_laps: set[int] = set()
-    for run_name, df in dfs.items():
-        lap_ids, lt = _lap_times_per_run(df)
-        laptimes[run_name] = {int(k): float(v) for k, v in zip(lap_ids, lt)}
-        speeds[run_name] = _per_lap_speed(df)
-        all_laps |= set(laptimes[run_name])
-
-    rows: list[dict] = []
-    for lap in sorted(all_laps):
-        row: dict = {"Lap": int(lap)}
-        for run_name in dfs:
-            label = _run_display_name(run_name)
-            lt = laptimes[run_name].get(lap)
-            vmax, vavg = speeds[run_name].get(lap, (float("nan"), float("nan")))
-            row[f"{label} laptime [s]"] = round(lt, 3) if lt is not None else None
-            row[f"{label} v_max [km/h]"] = round(vmax, 1) if np.isfinite(vmax) else None
-            row[f"{label} v_avg [km/h]"] = round(vavg, 1) if np.isfinite(vavg) else None
-        rows.append(row)
-    return pl.DataFrame(rows) if rows else pl.DataFrame()
-
-
 def _run_display_name(run_name: str) -> str:
     """File-stem style label for a run key (mirrors the dashboard display)."""
     stem = run_name.rsplit("/", 1)[-1]
@@ -1803,7 +1443,6 @@ def _run_display_name(run_name: str) -> str:
 
 _TRAIL_BRAKE_THR_PCT = 5.0
 _TRAIL_STEER_THR_DEG = 2.0
-_TRAIL_THROTTLE_THR_PCT = 5.0
 
 _COMBINED_BRAKE_THR_PCT = 5.0  # [%]   Brake/regen demand above this = braking
 _COMBINED_STEER_THR_DEG = 5.0  # [deg] |Steering| above this = steering (turning in)
@@ -1813,17 +1452,15 @@ def trail_braking_kpis(
     df: pl.DataFrame,
     brake_thr_pct: float = _TRAIL_BRAKE_THR_PCT,
     steer_thr_deg: float = _TRAIL_STEER_THR_DEG,
-    throttle_thr_pct: float = _TRAIL_THROTTLE_THR_PCT,
 ) -> dict:
-    """Trail-braking overlap and coasting share from Brake / Steering / Throttle.
+    """Trail-braking overlap from Brake and Steering.
 
       • trail_overlap_pct : % of braking samples with simultaneous steering input
                             (brake carried into the corner = trail-braking).
-      • coasting_pct      : % of samples with neither throttle nor brake applied.
     Valid laps only (lap 0 and the incomplete final lap excluded). `Steering` is
     the road-wheel angle (rad) → converted to deg for the threshold.
     """
-    needed = ["laps", "laptime", "Brake", "Steering", "Throttle"]
+    needed = ["laps", "laptime", "Brake", "Steering"]
     missing = [c for c in needed if c not in df.columns]
     if missing:
         return {"warnings": [f"Missing columns: {missing}"]}
@@ -1842,26 +1479,21 @@ def trail_braking_kpis(
 
     brake = d["Brake"]
     steer_deg = np.rad2deg(np.abs(d["Steering"]))
-    throttle = d["Throttle"]
-    finite = np.isfinite(brake) & np.isfinite(steer_deg) & np.isfinite(throttle)
+    finite = np.isfinite(brake) & np.isfinite(steer_deg)
     brake = brake[finite]
     steer_deg = steer_deg[finite]
-    throttle = throttle[finite]
     if brake.size < 50:
         return {"warnings": ["Not enough samples for trail-braking."]}
 
     braking = brake > brake_thr_pct
     steering = steer_deg > steer_thr_deg
-    throttle_on = throttle > throttle_thr_pct
     n_brake = int(braking.sum())
     trail_overlap = float(np.mean(steering[braking]) * 100.0) if n_brake else float("nan")
-    coasting_pct = float(np.mean((~braking) & (~throttle_on)) * 100.0)
 
     return {
         "trail_overlap_pct": round(trail_overlap, 1)
         if np.isfinite(trail_overlap)
         else float("nan"),
-        "coasting_pct": round(coasting_pct, 1),
         "braking_samples": n_brake,
         "samples": int(brake.size),
         "warnings": [],
@@ -2023,23 +1655,19 @@ def run_phase_distribution_fig(
 def fastest_lap_speed_map_fig(
     dfs: dict[str, pl.DataFrame],
 ) -> tuple[go.Figure, dict]:
-    """GPS track of each run's fastest valid lap, coloured by speed [km/h].
+    """GPS track of the overall-fastest valid lap, coloured by speed [km/h].
 
-    One subplot per run, side by side, on a shared colour range so the maps are
-    comparable. Grey full-session context is drawn underneath.
+    A single map that conveys the circuit shape and where speed is gained or
+    lost, drawn from whichever run holds the fastest valid lap. Grey
+    full-session context is drawn underneath. ``kpis`` still carries per-run
+    fastest-lap metadata so callers can report each driver's reference lap.
     """
-    runs = list(dfs)
-    n = max(len(runs), 1)
-    fig = make_subplots(
-        rows=1,
-        cols=n,
-        subplot_titles=[_run_display_name(r) for r in runs] or [""],
-        horizontal_spacing=0.04,
-    )
+    fig = go.Figure()
 
     kpis: dict[str, dict] = {}
     lap_data: dict[str, dict[str, np.ndarray]] = {}
-    vmax_all = 0.0
+    best_run: str | None = None
+    best_laptime = float("inf")
     for run_name, df in dfs.items():
         lap_id, laptime_s = _fastest_valid_lap(df)
         entry = {
@@ -2060,63 +1688,151 @@ def fastest_lap_speed_map_fig(
             continue
         lap_data[run_name] = {"lat": lat[ok], "lng": lng[ok], "spd": spd[ok]}
         entry["v_max_kmh"] = float(np.max(spd[ok]))
-        vmax_all = max(vmax_all, entry["v_max_kmh"])
         kpis[run_name] = entry
-
-    for col, run_name in enumerate(runs, start=1):
-        full_lat, full_lng = _full_session_gps(dfs.get(run_name))
-        if full_lat.size > 0:
-            fig.add_trace(
-                go.Scattergl(
-                    x=full_lng,
-                    y=full_lat,
-                    mode="lines",
-                    line=dict(color="rgba(160,160,160,0.18)", width=2),
-                    showlegend=False,
-                    hoverinfo="skip",
-                ),
-                row=1,
-                col=col,
-            )
-        data = lap_data.get(run_name)
-        if data is None:
-            fig.add_annotation(
-                text="GPS / lap not available",
-                showarrow=False,
-                xref=f"x{col} domain" if col > 1 else "x domain",
-                yref=f"y{col} domain" if col > 1 else "y domain",
-                x=0.5,
-                y=0.5,
-                font=dict(color="#EBEBEB"),
-            )
-            continue
-        fig.add_trace(
-            go.Scattergl(
-                x=data["lng"],
-                y=data["lat"],
-                mode="markers",
-                marker=dict(
-                    color=data["spd"],
-                    colorscale="Turbo",
-                    cmin=0.0,
-                    cmax=vmax_all or None,
-                    size=5,
-                    colorbar=dict(title="km/h") if col == n else None,
-                    showscale=(col == n),
-                ),
-                showlegend=False,
-                hovertemplate="%{marker.color:.0f} km/h<extra></extra>",
-            ),
-            row=1,
-            col=col,
-        )
+        if np.isfinite(laptime_s) and laptime_s < best_laptime:
+            best_laptime = laptime_s
+            best_run = run_name
 
     apply_dark_layout(fig)
-    fig.update_layout(title="Fastest-Lap Speed Map")
     fig.update_xaxes(showgrid=False, zeroline=False, visible=False)
-    fig.update_yaxes(showgrid=False, zeroline=False, visible=False)
-    for i in range(1, n + 1):
-        fig.update_yaxes(scaleanchor=("x" if i == 1 else f"x{i}"), row=1, col=i)
+    fig.update_yaxes(showgrid=False, zeroline=False, visible=False, scaleanchor="x")
+
+    if best_run is None:
+        fig.add_annotation(
+            text="GPS / lap not available",
+            showarrow=False,
+            xref="x domain",
+            yref="y domain",
+            x=0.5,
+            y=0.5,
+            font=dict(color="#EBEBEB"),
+        )
+        fig.update_layout(title="Fastest-Lap Speed Map")
+        return fig, kpis
+
+    full_lat, full_lng = _full_session_gps(dfs.get(best_run))
+    if full_lat.size > 0:
+        fig.add_trace(
+            go.Scattergl(
+                x=full_lng,
+                y=full_lat,
+                mode="lines",
+                line=dict(color="rgba(160,160,160,0.18)", width=2),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+    data = lap_data[best_run]
+    fig.add_trace(
+        go.Scattergl(
+            x=data["lng"],
+            y=data["lat"],
+            mode="markers",
+            marker=dict(
+                color=data["spd"],
+                colorscale="Turbo",
+                cmin=0.0,
+                cmax=float(np.max(data["spd"])) or None,
+                size=5,
+                colorbar=dict(title="km/h"),
+                showscale=True,
+            ),
+            showlegend=False,
+            hovertemplate="%{marker.color:.0f} km/h<extra></extra>",
+        )
+    )
+    fig.update_layout(title=f"Fastest Lap — {_run_display_name(best_run)} ({best_laptime:.2f}s)")
+    return fig, kpis
+
+
+def _hex_to_rgba(color: str, alpha: float) -> str:
+    """Translucent fill from a ``#rrggbb`` identity colour (passthrough otherwise)."""
+    c = color.lstrip("#")
+    if len(c) != 6:
+        return color
+    r, g, b = (int(c[i : i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def speed_distribution_fig(
+    dfs: dict[str, pl.DataFrame],
+    bin_width_kmh: float = 5.0,
+) -> tuple[go.Figure, dict]:
+    """Time-at-speed distribution per run — a fingerprint of the track.
+
+    Speed (|VN_vx| → km/h) over all valid laps, binned and normalised to % of
+    lap time (100 Hz uniform sampling ⇒ sample share = time share). The
+    high-speed tail tells you how much aerodynamics matter at this circuit. One
+    filled curve per run on shared bins; the dashboard chooses which runs to show.
+    """
+    # No in-figure title: the dashboard renders the section header already, so
+    # repeating it here only pushes the legend down and wastes vertical space.
+    fig = make_dark_figure(
+        title="",
+        xlabel="Speed [km/h]",
+        ylabel="Share of lap time [%]",
+    )
+    kpis: dict[str, dict] = {}
+    speeds: dict[str, np.ndarray] = {}
+    vmax_all = 0.0
+    nan_kpi = {
+        "samples": 0,
+        "v_median_kmh": float("nan"),
+        "v_p95_kmh": float("nan"),
+        "v_max_kmh": float("nan"),
+    }
+    for run_name, df in dfs.items():
+        try:
+            speed_col = _speed_col(df)
+            d = _prep(df, extra_cols=(speed_col,))
+        except Exception:
+            kpis[run_name] = dict(nan_kpi)
+            continue
+        valid = np.isfinite(d["laps"]) & np.isfinite(d["laptime"])
+        d = {k: v[valid] for k, v in d.items()}
+        d = exclude_lap0_and_last_lap(d)
+        spd = np.abs(np.asarray(d[speed_col], dtype=float)) * 3.6
+        spd = spd[np.isfinite(spd)]
+        speeds[run_name] = spd
+        if spd.size == 0:
+            kpis[run_name] = dict(nan_kpi)
+            continue
+        vmax_all = max(vmax_all, float(spd.max()))
+        kpis[run_name] = {
+            "samples": int(spd.size),
+            "v_median_kmh": float(np.median(spd)),
+            "v_p95_kmh": float(np.percentile(spd, 95)),
+            "v_max_kmh": float(spd.max()),
+        }
+
+    if vmax_all <= 0:
+        return fig, kpis
+
+    edges = np.arange(0.0, vmax_all + bin_width_kmh, bin_width_kmh)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    for i, (run_name, spd) in enumerate(speeds.items()):
+        if spd.size == 0:
+            continue
+        counts, _ = np.histogram(spd, bins=edges)
+        total = counts.sum()
+        if total == 0:
+            continue
+        pct = 100.0 * counts / total
+        color = _driver_color(run_name, i)
+        fig.add_trace(
+            go.Scatter(
+                x=centers,
+                y=pct,
+                name=_run_display_name(run_name),
+                mode="lines",
+                line=dict(color=color, width=2),
+                fill="tozeroy",
+                fillcolor=_hex_to_rgba(color, 0.18),
+                hovertemplate="%{x:.0f} km/h: %{y:.1f}%<extra>%{fullData.name}</extra>",
+            )
+        )
+    fig.update_layout(legend=dict(orientation="h"), margin_t=30)
+    fig.update_xaxes(range=[0, vmax_all * 1.02])
     return fig, kpis
 
 
@@ -3232,7 +2948,11 @@ def lap_comparison_track_fig(
                 )
             )
 
-    fig.update_layout(height=430, showlegend=True)
+    fig.update_layout(
+        height=455,
+        showlegend=True,
+        margin=dict(l=90, r=50, t=130, b=70),
+    )
     fig.update_yaxes(scaleanchor="x", scaleratio=1.0)
     return fig
 
@@ -4600,7 +4320,6 @@ def main() -> None:
     throttle_histogram_fig(dfs).show()
     full_throttle_time_fig(dfs).show()
     throttle_speed_fig(dfs).show()
-    braking_effort_fig(dfs).show()
     braking_aggressiveness_fig(dfs).show()
     brake_release_smoothness_fig(dfs).show()
     steering_smoothness_fig(dfs).show()

@@ -64,6 +64,7 @@ PER_MOTOR_POWER_CAP_W = 80_000.0 / 4.0
 _CELL_V_BAND = (2.0, 4.5)  # [V] single cell
 _PACK_V_BAND = (300.0, 650.0)  # [V] accumulator
 _TEMP_BAND_C = (-20.0, 150.0)  # [°C] any temperature channel
+WEAKEST_CELL_DISCHARGE_FLOOR_V = 3.75  # [V] single-cell discharge reference
 
 # Dark theme (mirrors utils.py for subplot figures)
 _BG = "#141417"
@@ -87,13 +88,19 @@ def _decimate(n: int, max_points: int = 4000) -> slice:
     return slice(None, None, max(1, n // max_points))
 
 
-def _dark_subplots(rows: int, titles: list[str], ylabels: list[str]) -> go.Figure:
+def _dark_subplots(
+    rows: int,
+    titles: list[str],
+    ylabels: list[str],
+    *,
+    vertical_spacing: float = 0.08,
+) -> go.Figure:
     """Create a make_subplots figure with dark motorsport styling."""
     fig = make_subplots(
         rows=rows,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.08,
+        vertical_spacing=vertical_spacing,
         subplot_titles=titles,
     )
     # Shared dark styling (bg, font family, legend, dark hover box, modebar);
@@ -964,6 +971,7 @@ def soc_per_lap_fig(
         rows=2,
         titles=["End-of-Lap SoC", "SoC Drop per Lap"],
         ylabels=["SoC [%]", "ΔSoC [%]"],
+        vertical_spacing=0.16,
     )
     fig.add_trace(
         go.Scatter(
@@ -986,7 +994,7 @@ def soc_per_lap_fig(
     if x_mode == "laps":
         fig.update_xaxes(tickvals=np.sort(lp.astype(int)), row=2, col=1)
     fig.update_layout(
-        height=560,
+        height=620,
         title_text="Battery SoC per Lap",
         title_font=dict(color=_TEXT, size=14),
     )
@@ -1104,10 +1112,21 @@ def hv_delivery_efficiency_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure,
         table["Run"] = run_all
     eff_cat = np.concatenate(eff_pool)
     loss_cat = np.concatenate(loss_pool)
+    runs: dict[str, dict] = {}
+    for run_name in dict.fromkeys(run_all):
+        m = [r == run_name for r in run_all]
+        eff_r = np.concatenate([p for p, keep in zip(eff_pool, m) if keep])
+        loss_r = np.concatenate([p for p, keep in zip(loss_pool, m) if keep])
+        runs[run_name] = {
+            "delivery_eff_median": float(np.nanmedian(eff_r)),
+            "mean_loss_kw": float(np.nanmean(loss_r)),
+            "samples": int(eff_r.size),
+        }
     kpis = {
         "delivery_eff_median": float(np.nanmedian(eff_cat)),
         "mean_loss_kw": float(np.nanmean(loss_cat)),
         "samples": int(eff_cat.size),
+        "runs": runs,
         "table": pl.DataFrame(table),
         "warnings": warnings,
     }
@@ -1126,7 +1145,6 @@ def weakest_cell_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     """
     warnings: list[str] = []
     runs: dict[str, dict[str, float]] = {}
-    floor_v = 2.5  # cell discharge floor reference [V]
     fig = make_dark_figure(
         title="Weakest Cell Voltage vs Current",
         xlabel="Battery current [A] (+ = discharge)",
@@ -1171,9 +1189,9 @@ def weakest_cell_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
             "warnings": warnings + ["No valid cell-voltage data."],
         }
     fig.add_hline(
-        y=floor_v,
+        y=WEAKEST_CELL_DISCHARGE_FLOOR_V,
         line=dict(color="#E74C3C", dash="dash", width=1.2),
-        annotation_text=f"discharge floor {floor_v:.1f} V",
+        annotation_text=f"discharge floor {WEAKEST_CELL_DISCHARGE_FLOOR_V:.2f} V",
         annotation_position="bottom right",
     )
     return fig, {"runs": runs, "warnings": warnings}

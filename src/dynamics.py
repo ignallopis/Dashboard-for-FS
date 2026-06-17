@@ -31,6 +31,8 @@ from utils import (
     unique_laps,
     phase_masks_for_map,
     per_lap_axis,
+    radius_corner_mask,
+    MU_TIRE,
     WHEEL_COLORS,
 )
 
@@ -76,7 +78,7 @@ CD_AERO = 1.803  # Vhcl.Coef_Drag
 A_AERO_M2 = 1.0  # Vhcl.A
 COP_X_FROM_FRONT = -0.7547  # Vhcl.CoP_x
 RHO_AIR_KGM3 = 1.225  # Standard air density
-MU_TIRE = 1.70  # Estimated FS slick peak friction coefficient
+# MU_TIRE imported from utils (single source for tyre μ across modules)
 G_MPS2 = 9.81
 G_MS2 = G_MPS2
 WHEEL_RADIUS_M = 0.2032  # Vhcl.Wheel_Radius
@@ -164,38 +166,18 @@ def _radius_corner_mask(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Corner mask using the Driver/Lap Analysis curvature logic.
 
-    The driver cornering analysis detects curves from radius
-    ``R = V^2 / |ay|`` with a default 60 m threshold. This local copy avoids
-    importing `src.cornering`, which already imports this module.
+    Thin wrapper around ``utils.radius_corner_mask`` — the single shared
+    implementation of the ``R = V²/|ay| < 60 m`` corner detector, so dynamics and
+    the grip-factors section flag exactly the same corners.
     """
-    ay_abs = np.abs(np.asarray(ay_mps2, dtype=float))
-    vx = np.asarray(vx_mps, dtype=float)
-    radius_m = np.divide(
-        vx**2,
-        np.maximum(ay_abs, 0.05),
-        out=np.full_like(vx, np.nan, dtype=float),
-        where=np.isfinite(vx) & np.isfinite(ay_abs),
+    return radius_corner_mask(
+        vx_mps,
+        ay_mps2,
+        dt_s,
+        radius_threshold_m=radius_threshold_m,
+        min_speed_mps=min_speed_mps,
+        min_duration_s=min_duration_s,
     )
-    inv_radius = np.divide(
-        1.0,
-        radius_m,
-        out=np.zeros_like(radius_m, dtype=float),
-        where=np.isfinite(radius_m) & (radius_m > 0.0),
-    )
-    win = max(1, int(round(0.30 / dt_s)))
-    inv_radius_sm = smooth_signal(inv_radius, win)
-    radius_sm_m = np.divide(
-        1.0,
-        inv_radius_sm,
-        out=np.full_like(inv_radius_sm, np.nan, dtype=float),
-        where=np.isfinite(inv_radius_sm) & (inv_radius_sm > 0.0),
-    )
-    raw = (
-        np.isfinite(radius_sm_m)
-        & (np.abs(vx) >= min_speed_mps)
-        & (radius_sm_m < radius_threshold_m)
-    )
-    return keep_min_duration_segments(raw, min_duration_s, dt_s), radius_sm_m
 
 
 # ── 2. Understeer angle evolution ─────────────────────────────────────────────
@@ -1718,6 +1700,112 @@ def axle_brake_slip_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     fig.update_layout(height=520, margin=dict(l=70, r=30, t=50, b=65))
     fig.update_xaxes(range=[0.0, 1.4])
     fig.update_yaxes(range=[-0.35, 0.08])
+    return fig, {"runs": runs, "warnings": warnings}
+
+
+# ── Wheel lock-up time per lap (relocated from rb.py, 2026-06-15) ──────────────
+# Lock-up is a tyre/vehicle braking outcome — RB has no slip feedback — so it lives
+# in Dynamics › Braking, next to the per-axle braking-slip view.
+_LOCKUP_SR_THRESHOLD = -0.30  # Est_SR below this during braking = wheel near lock-up
+_LOCKUP_MIN_DURATION_S = 0.05  # sustained at least this long to count
+_LOCKUP_BRAKE_DECEL_MIN = 1.0  # [m/s²] |decel| above which we treat it as braking
+_LOCKUP_WHEELS = ("FL", "FR", "RL", "RR")
+
+
+def _lockup_segment_count(mask: np.ndarray) -> int:
+    idx = np.flatnonzero(mask)
+    if idx.size == 0:
+        return 0
+    return int(1 + np.count_nonzero(np.diff(idx) > 1))
+
+
+def wheel_lockup_per_lap_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Wheel locking time per lap — braking lock-up (vehicle behaviour).
+
+    Per lap, the time each wheel spends with Est_SR below the −0.30 lock-up line while
+    braking (decel > 1 m/s²), summed across wheels. A tyre/vehicle outcome (the regen
+    controller has no slip feedback), shown alongside the per-axle braking-slip view.
+    """
+    fig = make_dark_figure(
+        title="Wheel locking time per lap",
+        xlabel="Lap",
+        ylabel="Lock time [s]",
+    )
+    multi = len(dfs) > 1
+    runs: dict[str, dict] = {}
+    warnings: list[str] = []
+    dt = 0.01  # 100 Hz
+
+    for name, df in dfs.items():
+        try:
+            d = ensure_complete_laps_df(df)
+            ax_col = "Filtering_VN_ax" if "Filtering_VN_ax" in d.columns else "VN_ax"
+            cols = ["laps", "laptime", ax_col, "Est_SRFL", "Est_SRFR", "Est_SRRL", "Est_SRRR"]
+            a = cols_to_numpy(d, cols)
+            a = exclude_lap0_and_last_lap(a)
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"{name}: wheel lock-up unavailable: {exc}")
+            continue
+
+        laps = a["laps"]
+        if laps.size == 0:
+            warnings.append(f"{name}: no samples for wheel lock-up.")
+            continue
+        brake = np.nan_to_num(a[ax_col], nan=0.0) < -_LOCKUP_BRAKE_DECEL_MIN
+
+        lock_masks: dict[str, np.ndarray] = {}
+        worst_min_sr = np.nan
+        events_total = 0
+        for w in _LOCKUP_WHEELS:
+            sr = a[f"Est_SR{w}"]
+            raw = brake & np.isfinite(sr) & (sr < _LOCKUP_SR_THRESHOLD)
+            lock = keep_min_duration_segments(raw, _LOCKUP_MIN_DURATION_S, dt)
+            lock_masks[w] = lock
+            events_total += _lockup_segment_count(lock)
+            if lock.any():
+                m = float(np.nanmin(sr[lock]))
+                worst_min_sr = m if not np.isfinite(worst_min_sr) else min(worst_min_sr, m)
+
+        uql = unique_laps(laps)
+        total_by_lap = np.zeros(len(uql), dtype=float)
+        time_by_wheel = {w: np.zeros(len(uql), dtype=float) for w in _LOCKUP_WHEELS}
+        for i, lp in enumerate(uql):
+            in_lap = laps == lp
+            for w in _LOCKUP_WHEELS:
+                t = float(np.sum(lock_masks[w] & in_lap) * dt)
+                time_by_wheel[w][i] = t
+                total_by_lap[i] += t
+
+        lap_ints = [int(x) for x in uql]
+        if multi:
+            fig.add_trace(
+                go.Bar(
+                    x=lap_ints,
+                    y=total_by_lap,
+                    name=name,
+                    marker_color=driver_color(name),
+                    opacity=0.85,
+                )
+            )
+        else:
+            for w in _LOCKUP_WHEELS:
+                fig.add_trace(
+                    go.Bar(
+                        x=lap_ints,
+                        y=time_by_wheel[w],
+                        name=w,
+                        marker_color=WHEEL_COLORS[w],
+                    )
+                )
+
+        runs[name] = {
+            "lockup_total_time_s": float(np.nansum(total_by_lap)),
+            "lockup_events_total": int(events_total),
+            "worst_min_sr": float(worst_min_sr) if np.isfinite(worst_min_sr) else float("nan"),
+            "laps": int(len(uql)),
+        }
+
+    fig.update_layout(barmode="group" if multi else "stack")
     return fig, {"runs": runs, "warnings": warnings}
 
 
