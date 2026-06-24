@@ -17,11 +17,18 @@ def render_track_map_component(
     *,
     height_px: int,
     key: str,
+    draw_enabled: bool = True,
 ) -> dict[str, Any]:
-    """Render the interactive track map component and return its latest event."""
+    """Render the interactive track map component and return its latest event.
+
+    ``draw_enabled=False`` hides the line-drawing tools (keeping lasso/click),
+    so a map can stay interactive for curve selection without offering gate
+    drawing.
+    """
     return _track_map_component(
         figure_json=figure_json,
         height_px=int(height_px),
+        draw_enabled=bool(draw_enabled),
         default={
             "event_id": 0,
             "selection_indices": [],

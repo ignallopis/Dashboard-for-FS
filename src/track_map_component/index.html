@@ -151,6 +151,7 @@
         const args = event.data.args || {}
         const fig = JSON.parse(args.figure_json)
         const heightPx = Number(args.height_px) || 390
+        const drawEnabled = args.draw_enabled !== false
         currentSelection = []
         currentLine = null
         fig.layout = fig.layout || {}
@@ -160,21 +161,20 @@
           line: { color: "#4DB3F2", width: 3 },
         }
 
+        const fullscreenButton = {
+          name: "fullscreen",
+          title: "Open full screen track",
+          icon: fullscreenIcon,
+          click: () => sendFullscreenValue(),
+        }
         const config = {
           displaylogo: false,
           scrollZoom: false,
           responsive: true,
           modeBarButtonsToRemove: ["select2d"],
-          modeBarButtonsToAdd: [
-            "drawline",
-            "eraseshape",
-            {
-              name: "fullscreen",
-              title: "Open full screen track",
-              icon: fullscreenIcon,
-              click: () => sendFullscreenValue(),
-            },
-          ],
+          modeBarButtonsToAdd: drawEnabled
+            ? ["drawline", "eraseshape", fullscreenButton]
+            : [fullscreenButton],
         }
 
         Plotly.purge(plotEl)

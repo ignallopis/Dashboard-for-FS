@@ -1669,7 +1669,11 @@ def fastest_lap_speed_map_fig(
     best_run: str | None = None
     best_laptime = float("inf")
     for run_name, df in dfs.items():
-        lap_id, laptime_s = _fastest_valid_lap(df)
+        try:
+            lap_id, laptime_s = _fastest_valid_lap(df)
+        except ValueError:
+            # No valid laps yet (manual mode before gate lines are drawn).
+            lap_id, laptime_s = -1, float("nan")
         entry = {
             "fastest_lap": lap_id,
             "laptime_s": laptime_s,
@@ -1698,16 +1702,38 @@ def fastest_lap_speed_map_fig(
     fig.update_yaxes(showgrid=False, zeroline=False, visible=False, scaleanchor="x")
 
     if best_run is None:
-        fig.add_annotation(
-            text="GPS / lap not available",
-            showarrow=False,
-            xref="x domain",
-            yref="y domain",
-            x=0.5,
-            y=0.5,
-            font=dict(color="#EBEBEB"),
+        # No valid lap yet (e.g. a manual/autocross file before its gate lines
+        # are drawn). Still plot the raw full-session GPS of whichever run has a
+        # track, so the circuit shape is visible and gate lines can be drawn on
+        # it to bootstrap lap detection.
+        raw_run = next(
+            (name for name in dfs if _full_session_gps(dfs.get(name))[0].size > 0),
+            None,
         )
-        fig.update_layout(title="Fastest-Lap Speed Map")
+        if raw_run is not None:
+            raw_lat, raw_lng = _full_session_gps(dfs.get(raw_run))
+            fig.add_trace(
+                go.Scattergl(
+                    x=raw_lng,
+                    y=raw_lat,
+                    mode="lines",
+                    line=dict(color="rgba(160,160,160,0.55)", width=2),
+                    showlegend=False,
+                    hoverinfo="skip",
+                )
+            )
+            fig.update_layout(title="Track GPS — no lap yet (draw a gate line to detect laps)")
+        else:
+            fig.add_annotation(
+                text="GPS / lap not available",
+                showarrow=False,
+                xref="x domain",
+                yref="y domain",
+                x=0.5,
+                y=0.5,
+                font=dict(color="#EBEBEB"),
+            )
+            fig.update_layout(title="Fastest-Lap Speed Map")
         return fig, kpis
 
     full_lat, full_lng = _full_session_gps(dfs.get(best_run))
@@ -3331,7 +3357,10 @@ def _full_session_gps(df: pl.DataFrame | None) -> tuple[np.ndarray, np.ndarray]:
         return np.empty(0, dtype=float), np.empty(0, dtype=float)
     lat = df["VN_latitude"].to_numpy().astype(float)
     lng = df["VN_longitude"].to_numpy().astype(float)
-    ok = np.isfinite(lat) & np.isfinite(lng)
+    # Drop null-island (0, 0) samples: the VectorNav logs exact zeros before it
+    # gets a GPS fix, and those points would otherwise stretch the map axes from
+    # the real track down to (0, 0), shrinking the circuit to an invisible dot.
+    ok = np.isfinite(lat) & np.isfinite(lng) & (lat != 0.0) & (lng != 0.0)
     return lat[ok], lng[ok]
 
 

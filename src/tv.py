@@ -16,8 +16,6 @@ import numpy as np
 import polars as pl
 import plotly.graph_objects as go
 
-from src import cornering
-
 from utils import (
     cols_to_numpy,
     driver_color,
@@ -26,7 +24,6 @@ from utils import (
     lap_dist_from_gps,
     make_dark_figure,
     robust_dt,
-    unique_laps,
 )
 
 
@@ -40,6 +37,7 @@ MAX_ROBUST_SLOPE_POINTS = 257
 
 G_MPS2 = 9.81  # [m/s²] gravity, for |Ay| in g
 RING_DEADBAND_NM = 30.0  # [Nm] min Mz_fb excursion to count a PI sign change (ignore noise)
+MZ_DELIVERY_MIN_NM = 50.0  # [Nm] min |desired Mz| to score delivery ratio (avoid ÷~0 near 0)
 
 
 def _vx_signal(columns: list[str]) -> str:
@@ -71,12 +69,27 @@ def _unique_required_cols(columns: list[str]) -> list[str]:
     return out
 
 
+def _tv_laps_df(df: pl.DataFrame) -> pl.DataFrame:
+    """Valid-lap samples for the sample-based TV figures, single-lap tolerant.
+
+    Multi-lap events (skidpad, endurance) use the standard complete-laps filter (drop lap
+    0 and the last lap). Single-lap events (autocross, acceleration) keep their one timed
+    lap so the section still renders — these figures scatter/bin over samples, not
+    lap-distance-aligned traces, so they don't need ≥2 laps.
+    """
+    if "laps" in df.columns and "laptime" in df.columns:
+        valid = df.filter((pl.col("laps") > 0) & pl.col("laptime").is_not_nan())
+        if not valid.is_empty() and valid["laps"].n_unique() < 2:
+            return valid
+    return ensure_complete_laps_df(df)
+
+
 def _prepare_tv_control_arrays(
     df: pl.DataFrame,
     signal_cols: list[str],
 ) -> dict[str, np.ndarray]:
-    """Prepare complete-lap arrays shared by the TV control figures."""
-    df = ensure_complete_laps_df(df)
+    """Prepare valid-lap arrays shared by the TV control figures."""
+    df = _tv_laps_df(df)
     ay_col = _ay_signal(df.columns)
     vx_col = _vx_signal(df.columns)
     cols = _unique_required_cols(
@@ -136,11 +149,6 @@ def _binned_percentile(
     return centers, values, counts
 
 
-def _beta_deg(vy: np.ndarray, vx: np.ndarray) -> np.ndarray:
-    """Side-slip angle [deg] from COG velocity estimates (estimator output)."""
-    return np.rad2deg(np.arctan2(vy, vx))
-
-
 def _annotate_empty(fig: go.Figure) -> None:
     """Centre 'no data' note on a figure that ended up with no run traces."""
     fig.add_annotation(
@@ -177,6 +185,7 @@ def tv_yaw_tracking_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
         "TV yaw-rate tracking  ·  real vs target",
         "TV target yaw rate [rad/s]",
         "Real yaw rate [rad/s]",
+        height=520,
     )
     runs: dict[str, dict] = {}
     warnings: list[str] = []
@@ -286,6 +295,7 @@ def tv_pi_loop_health_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict
         "TV PI loop health  ·  feedback vs error",
         "Yaw error [rad/s]",
         "Feedback moment Mz_fb [Nm]",
+        height=520,
     )
     runs: dict[str, dict] = {}
     warnings: list[str] = []
@@ -349,18 +359,103 @@ def tv_pi_loop_health_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict
     return fig, {"runs": runs, "warnings": warnings}
 
 
+def tv_feedforward_share_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """#4: how much of the yaw-moment command is anticipation (FF) vs correction (FB)?
+
+    FF share = |TV_feedForwardMz| / (|TV_feedForwardMz| + |TV_feedBackMz|), a magnitude
+    share in [0,1] (0.5 = FF and FB do equal work), binned by |Steering| over cornering
+    samples. A well-tuned TV does most of the work in feedforward (share high, flat); a
+    share that collapses as steering grows means the FF map runs out of authority at the
+    limit and the PI loop is left to correct. All runs overlaid by colour.
+    """
+    fig = make_dark_figure(
+        "TV feedforward share  ·  anticipation vs correction",
+        "|Steering| [rad]",
+        "FF share  |Mz_ff| / (|Mz_ff| + |Mz_fb|)",
+        height=520,
+    )
+    runs: dict[str, dict] = {}
+    warnings: list[str] = []
+    any_run = False
+    for run_name, df in dfs.items():
+        try:
+            arr = _prepare_tv_control_arrays(df, ["TV_feedForwardMz", "TV_feedBackMz"])
+        except Exception as exc:
+            warnings.append(f"{run_name}: {exc}")
+            continue
+        ff = arr["TV_feedForwardMz"]
+        fb = arr["TV_feedBackMz"]
+        denom = np.abs(ff) + np.abs(fb)
+        share = np.divide(
+            np.abs(ff), denom, out=np.full_like(ff, np.nan, dtype=float), where=denom > 1.0
+        )
+        steer = np.abs(arr["Steering"])
+        cm = arr["corner_mask"] & np.isfinite(share) & np.isfinite(steer)
+        if not cm.any():
+            warnings.append(f"{run_name}: no valid TV corner samples for feedforward share.")
+            continue
+        any_run = True
+        x = steer[cm]
+        y = share[cm]
+        color = driver_color(run_name)
+        stride = max(1, int(np.ceil(x.size / 6000)))
+        fig.add_trace(
+            go.Scattergl(
+                x=x[::stride],
+                y=y[::stride],
+                mode="markers",
+                marker=dict(color=color, size=3, opacity=0.08),
+                name=f"{run_name} samples",
+                legendgroup=run_name,
+                showlegend=False,
+                hovertemplate=f"{run_name}<br>|steer|=%{{x:.3f}} rad<br>FF share=%{{y:.2f}}<extra></extra>",
+            )
+        )
+        centers, p50, _ = _binned_percentile(x, y, bin_width=0.05, x_min=0.0, x_max=0.5, pct=50.0)
+        valid = np.isfinite(p50)
+        fig.add_trace(
+            go.Scatter(
+                x=centers[valid],
+                y=p50[valid],
+                mode="lines+markers",
+                line=dict(color=color, width=2.8),
+                legendgroup=run_name,
+                name=f"{run_name} median",
+            )
+        )
+        runs[run_name] = {
+            "median_ff_share": float(np.nanmedian(y)),
+            "fb_led_pct": float(100.0 * np.nanmean(y < 0.5)),
+            "corner_samples": int(cm.sum()),
+        }
+
+    if any_run:
+        fig.add_hline(
+            y=0.5,
+            line=dict(color="#9AA0A6", dash="dash", width=1.5),
+            annotation_text="FF = FB",
+            annotation_position="bottom left",
+        )
+        fig.update_yaxes(range=[0.0, 1.0])
+    else:
+        _annotate_empty(fig)
+    return fig, {"runs": runs, "warnings": warnings}
+
+
 def tv_authority_utilisation_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
-    """A4: how close to its moment limit does the TV run (does it run out of authority)?
+    """#2: how much yaw-moment authority does the TV use, and does it deliver it?
 
     Utilisation = |TV_desiredMz| / |TV_limitMz| (1.0 = saturated) binned vs |Ay|. The p95
     curve (solid) shows the worst-case demand, the median (dotted) the typical demand;
-    mz_tracking_rmse is how far the QP-delivered moment (TV_actualMz, a Bz·T reconstruction)
-    falls from the request. All runs overlaid by colour.
+    delivery_ratio_p50 = median |TV_actualMz| / |TV_desiredMz| (a Bz·T reconstruction of the
+    moment the wheels actually made) tells whether the allocator delivers the commanded
+    moment (≈1 = faithful). All runs overlaid by colour.
     """
     fig = make_dark_figure(
         "TV moment authority  ·  utilisation vs lateral g",
         "|Ay| [g]",
         "Moment utilisation |Mz| / |Mz limit|",
+        height=520,
     )
     runs: dict[str, dict] = {}
     warnings: list[str] = []
@@ -406,7 +501,7 @@ def tv_authority_utilisation_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figur
                 mode="lines+markers",
                 line=dict(color=color, width=2.6),
                 legendgroup=run_name,
-                name=f"{run_name} p95",
+                name=f"{run_name} p95 (worst-case)",
             )
         )
         fig.add_trace(
@@ -416,15 +511,17 @@ def tv_authority_utilisation_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figur
                 mode="lines",
                 line=dict(color=color, width=1.6, dash="dot"),
                 legendgroup=run_name,
-                showlegend=False,
-                name=f"{run_name} median",
+                name=f"{run_name} median (typical)",
             )
+        )
+        des_cm = desired[cm]
+        big = des_cm > MZ_DELIVERY_MIN_NM
+        delivery_p50 = (
+            float(np.nanmedian(np.abs(actual[cm][big]) / des_cm[big])) if big.any() else np.nan
         )
         runs[run_name] = {
             "util_p95": float(np.nanpercentile(util, 95.0)),
-            "mz_tracking_rmse": float(
-                np.sqrt(np.nanmean((actual[cm] - arr["TV_desiredMz"][cm]) ** 2))
-            ),
+            "delivery_ratio_p50": delivery_p50,
             "corner_samples": int(cm.sum()),
         }
 
@@ -435,6 +532,103 @@ def tv_authority_utilisation_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figur
             annotation_text="moment limit",
             annotation_position="top left",
         )
+    else:
+        _annotate_empty(fig)
+    return fig, {"runs": runs, "warnings": warnings}
+
+
+def tv_fx_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """#1: how much of the longitudinal-force envelope does the TV demand, vs lateral g?
+
+    Fx envelope-use = |TV_desiredFx| / |TV_limitFx| (1.0 = the wheels can give no more
+    drive/brake force), over the whole moving lap (not corner-only — Fx peaks on straights
+    and in braking zones), binned vs |Ay|. The |·| folds traction and braking together and
+    sidesteps the hydraulic-brake force the motors can't deliver. Read against #2: as |Ay|
+    grows the car trades longitudinal force (this curve falls) for yaw moment (#2 rises) —
+    the QP's α weighting at work. All runs overlaid by colour.
+    """
+    fig = make_dark_figure(
+        "TV longitudinal-force use  ·  envelope vs lateral g",
+        "|Ay| [g]",
+        "Fx envelope-use  |Fx| / |Fx limit|",
+        height=520,
+    )
+    runs: dict[str, dict] = {}
+    warnings: list[str] = []
+    any_run = False
+    for run_name, df in dfs.items():
+        try:
+            arr = _prepare_tv_control_arrays(df, ["TV_desiredFx", "TV_limitFx"])
+        except Exception as exc:
+            warnings.append(f"{run_name}: {exc}")
+            continue
+        limit = np.abs(arr["TV_limitFx"])
+        use = np.divide(
+            np.abs(arr["TV_desiredFx"]),
+            limit,
+            out=np.full_like(limit, np.nan, dtype=float),
+            where=limit > 1.0,
+        )
+        ay_g = np.abs(arr["ay"]) / G_MPS2
+        moving = (np.abs(arr["vx"]) >= MIN_SPEED) & np.isfinite(use) & np.isfinite(ay_g)
+        if not moving.any():
+            warnings.append(f"{run_name}: no valid moving samples for Fx envelope.")
+            continue
+        any_run = True
+        x = ay_g[moving]
+        y = use[moving]
+        color = driver_color(run_name)
+        stride = max(1, int(np.ceil(x.size / 6000)))
+        fig.add_trace(
+            go.Scattergl(
+                x=x[::stride],
+                y=y[::stride],
+                mode="markers",
+                marker=dict(color=color, size=3, opacity=0.08),
+                name=f"{run_name} samples",
+                legendgroup=run_name,
+                showlegend=False,
+                hovertemplate=f"{run_name}<br>|Ay|=%{{x:.2f}} g<br>Fx use=%{{y:.2f}}<extra></extra>",
+            )
+        )
+        centers, p50, _ = _binned_percentile(x, y, bin_width=0.2, x_min=0.0, x_max=2.0, pct=50.0)
+        _, p95, _ = _binned_percentile(x, y, bin_width=0.2, x_min=0.0, x_max=2.0, pct=95.0)
+        valid = np.isfinite(p95)
+        fig.add_trace(
+            go.Scatter(
+                x=centers[valid],
+                y=p95[valid],
+                mode="lines+markers",
+                line=dict(color=color, width=2.6),
+                legendgroup=run_name,
+                name=f"{run_name} p95 (worst-case)",
+            )
+        )
+        valid50 = np.isfinite(p50)
+        fig.add_trace(
+            go.Scatter(
+                x=centers[valid50],
+                y=p50[valid50],
+                mode="lines",
+                line=dict(color=color, width=1.6, dash="dot"),
+                legendgroup=run_name,
+                name=f"{run_name} median (typical)",
+            )
+        )
+        runs[run_name] = {
+            "fx_use_p95": float(np.nanpercentile(y, 95.0)),
+            "time_at_limit_pct": float(100.0 * np.nanmean(y >= 0.95)),
+            "moving_samples": int(moving.sum()),
+        }
+
+    if any_run:
+        fig.add_hline(
+            y=1.0,
+            line=dict(color="#E5564E", dash="dash", width=2.0),
+            annotation_text="force limit",
+            annotation_position="top left",
+        )
+        fig.update_yaxes(range=[0.0, 1.05])
     else:
         _annotate_empty(fig)
     return fig, {"runs": runs, "warnings": warnings}
@@ -464,270 +658,3 @@ def _robust_slope(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
     slope = float(np.nanmedian(slopes))
     intercept = float(np.nanmedian(y_valid - slope * x_valid))
     return slope, intercept
-
-
-YAW_BALANCE_MIN_EXPECTED_RADPS = 0.15
-
-
-def _turn_mask_from_reference(
-    df: pl.DataFrame,
-    reference_turns: list[cornering.TurnDef],
-) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]:
-    """Project Lap Analysis reference turns onto every valid lap."""
-    d = cornering.compute_radius_curvature(df)
-    laps = d["laps"]
-    mask = np.zeros(len(laps), dtype=bool)
-    turn_id = np.full(len(laps), np.nan, dtype=float)
-    lap_ids = unique_laps(laps)
-    if lap_ids.size == 0:
-        return d, mask, turn_id
-    valid_laps = lap_ids[(lap_ids > 0) & (lap_ids != np.nanmax(lap_ids))]
-    for lap in valid_laps:
-        lap_mask = laps == lap
-        if not lap_mask.any():
-            continue
-        for turn in reference_turns:
-            tm = (
-                lap_mask
-                & (d["s_lap_m"] >= float(turn.s_entry_m))
-                & (d["s_lap_m"] <= float(turn.s_exit_m))
-            )
-            mask |= tm
-            turn_id[tm] = float(turn.turn_id)
-    return d, mask, turn_id
-
-
-def _reference_turns(
-    df: pl.DataFrame,
-    reference_turns: list[cornering.TurnDef] | None,
-    reference_label: str,
-) -> tuple[list[cornering.TurnDef], str]:
-    """Resolve the geometry-lap reference turns (fastest valid lap) if not provided."""
-    if reference_turns is not None:
-        return reference_turns, reference_label
-    d_ref = cornering.compute_radius_curvature(df)
-    lap_ids = unique_laps(d_ref["laps"])
-    valid_laps = (
-        lap_ids[(lap_ids > 0) & (lap_ids != np.nanmax(lap_ids))] if lap_ids.size else np.array([])
-    )
-    if valid_laps.size == 0:
-        return [], reference_label
-    best_lap = min(
-        valid_laps,
-        key=lambda lap: float(np.nanmax(d_ref["laptime"][d_ref["laps"] == lap])),
-    )
-    turns = cornering.detect_turns_on_lap(d_ref, "", int(best_lap))
-    return turns, reference_label or f"lap {int(best_lap)}"
-
-
-def _balance_pct(yaw: np.ndarray, path_yaw: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """US/OS balance [%] = 100·(yaw/path_yaw − 1), clipped to a sane gain range."""
-    gain = np.divide(yaw, path_yaw, out=np.full_like(yaw, np.nan, dtype=float), where=mask)
-    gain = np.where((gain >= -1.0) & (gain <= 3.0), gain, np.nan)
-    return (gain - 1.0) * 100.0
-
-
-def _intended_balance_arrays(
-    df: pl.DataFrame,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-    """Per-run intended-balance arrays: (intended%, |Ay| g, turn_id, eval mask) or None."""
-    df = ensure_complete_laps_df(df)
-    required = ["TimeStamp", "laps", "laptime", "VN_gz", "TV_desiredYawRate"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise KeyError(f"Missing TV balance columns: {missing}")
-
-    reference_turns, _ = _reference_turns(df, None, "")
-    radius, corner_mask, turn_id = _turn_mask_from_reference(df, reference_turns)
-    if len(radius["time_s"]) != len(df):
-        raise ValueError("Radius-based corner arrays do not match TV telemetry length.")
-
-    yaw_real = df["VN_gz"].to_numpy().astype(float)
-    yaw_intended = df["TV_desiredYawRate"].to_numpy().astype(float)
-    vx = radius["vx_mps"]
-    path_yaw = vx * radius["signed_curvature_smooth_inv_m"]
-    ay_g = np.abs(radius["ay_abs_smooth_mps2"]) / G_MPS2
-
-    base = (
-        corner_mask
-        & np.isfinite(yaw_real)
-        & np.isfinite(path_yaw)
-        & (np.abs(path_yaw) >= YAW_BALANCE_MIN_EXPECTED_RADPS)
-        & np.isfinite(vx)
-        & (np.abs(vx) >= MIN_SPEED)
-    )
-    # Sign-align the path reference to the car's actual rotation sense (the measured yaw
-    # reliably shares the corner's sign), then apply to the intended target.
-    if base.any():
-        alignment = float(np.nanmedian(yaw_real[base] * path_yaw[base]))
-        if np.isfinite(alignment) and alignment < 0.0:
-            path_yaw = -path_yaw
-
-    eval_mask = base & np.isfinite(yaw_intended)
-    intended = _balance_pct(yaw_intended, path_yaw, eval_mask)
-    m = eval_mask & np.isfinite(intended) & np.isfinite(ay_g)
-    if not m.any():
-        return None
-    return intended, ay_g, turn_id, m
-
-
-def tv_intended_balance_figs_kpis(dfs: dict[str, pl.DataFrame]) -> tuple[list[go.Figure], dict]:
-    """B1: the US/OS balance the TV is tuned to *intend* across the cornering envelope.
-
-    Intended balance [%] = 100·(TV_desiredYawRate / path_yaw − 1), where path_yaw =
-    vx·curvature is the neutral geometric reference. >0 means the TV asks for more rotation
-    than the path demands (oversteer-side bias); <0 means it pulls the car toward understeer.
-    Shown vs |Ay| (how the bias scales with corner load) and per numbered corner, all runs
-    overlaid by colour.
-
-    Honest scope: this is the TV's *intended* effect on balance. Whether the car realises
-    it cannot be proven without a TV-off baseline; tracking of that intent is A1.
-    """
-    fig_env = make_dark_figure(
-        "TV intended rotation bias  ·  vs lateral g",
-        "|Ay| [g]",
-        "Intended balance [%]   (>0 oversteer-side · <0 understeer-side)",
-    )
-    fig_corner = make_dark_figure(
-        "TV intended bias per corner",
-        "Corner",
-        "Intended balance [%]",
-    )
-    runs: dict[str, dict] = {}
-    warnings: list[str] = []
-    per_run_turns: dict[str, dict[int, float]] = {}
-    for run_name, df in dfs.items():
-        try:
-            res = _intended_balance_arrays(df)
-        except Exception as exc:
-            warnings.append(f"{run_name}: {exc}")
-            continue
-        if res is None:
-            warnings.append(f"{run_name}: no valid TV corner samples for intended balance.")
-            continue
-        intended, ay_g, turn_id, m = res
-        color = driver_color(run_name)
-        centers, p_int, _ = _binned_percentile(
-            ay_g[m], intended[m], bin_width=0.1, x_min=0.0, x_max=1.7, pct=50.0
-        )
-        valid = np.isfinite(p_int)
-        fig_env.add_trace(
-            go.Scatter(
-                x=centers[valid],
-                y=p_int[valid],
-                mode="lines+markers",
-                line=dict(color=color, width=2.8),
-                legendgroup=run_name,
-                name=run_name,
-                hovertemplate=f"{run_name}<br>|Ay|=%{{x:.2f}} g<br>intended=%{{y:.1f}}%<extra></extra>",
-            )
-        )
-        tdict: dict[int, float] = {}
-        for tid in sorted({int(t) for t in turn_id[m & np.isfinite(turn_id)]}):
-            tm = m & (turn_id == float(tid))
-            if int(tm.sum()) >= 10:
-                tdict[tid] = float(np.nanmedian(intended[tm]))
-        per_run_turns[run_name] = tdict
-        median_int = float(np.nanmedian(intended[m]))
-        curve = p_int[valid]
-        peak_intended = float(curve[int(np.nanargmax(np.abs(curve)))]) if curve.size else np.nan
-        runs[run_name] = {
-            "median_intended_balance": median_int,
-            "peak_intended_balance": peak_intended,
-            "balance_sign": "OS" if median_int > 0 else "US",
-            "corner_samples": int(m.sum()),
-        }
-
-    if runs:
-        fig_env.add_hline(
-            y=0.0,
-            line=dict(color="#9AA0A6", dash="dash", width=1.5),
-            annotation_text="neutral (path)",
-            annotation_position="bottom left",
-        )
-        all_tids = sorted({t for d in per_run_turns.values() for t in d})
-        labels = [f"T{t}" for t in all_tids]
-        for run_name, tdict in per_run_turns.items():
-            fig_corner.add_trace(
-                go.Bar(
-                    x=labels,
-                    y=[tdict.get(t) for t in all_tids],
-                    marker_color=driver_color(run_name),
-                    name=run_name,
-                    hovertemplate=f"{run_name}<br>%{{x}}<br>intended=%{{y:.1f}}%<extra></extra>",
-                )
-            )
-        fig_corner.update_layout(barmode="group")
-        fig_corner.add_hline(y=0.0, line=dict(color="#9AA0A6", dash="dash", width=1.5))
-    else:
-        _annotate_empty(fig_env)
-        _annotate_empty(fig_corner)
-    return [fig_env, fig_corner], {"runs": runs, "warnings": warnings}
-
-
-def tv_sideslip_stability_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
-    """B2: how planted the car stays — side-slip angle β across the cornering envelope.
-
-    β = atan2(Est_vyCOG, Est_vxCOG) [deg] (an estimator output, not measured). Its p95 vs
-    |Ay| shows how much the rear steps out as lateral load builds; a steep rise toward high
-    g means the car is getting loose (stability margin shrinking). All runs overlaid.
-    """
-    fig = make_dark_figure(
-        "TV side-slip stability  ·  |β| vs lateral g",
-        "|Ay| [g]",
-        "|β| side-slip angle [deg]",
-    )
-    runs: dict[str, dict] = {}
-    warnings: list[str] = []
-    any_run = False
-    for run_name, df in dfs.items():
-        try:
-            arr = _prepare_tv_control_arrays(df, ["Est_vyCOG", "Est_vxCOG"])
-        except Exception as exc:
-            warnings.append(f"{run_name}: {exc}")
-            continue
-        beta = np.abs(_beta_deg(arr["Est_vyCOG"], arr["Est_vxCOG"]))
-        ay_g = np.abs(arr["ay"]) / G_MPS2
-        cm = arr["corner_mask"] & np.isfinite(beta) & np.isfinite(ay_g)
-        if not cm.any():
-            warnings.append(f"{run_name}: no valid TV corner samples for side-slip.")
-            continue
-        any_run = True
-        x = ay_g[cm]
-        y = beta[cm]
-        color = driver_color(run_name)
-        stride = max(1, int(np.ceil(x.size / 6000)))
-        fig.add_trace(
-            go.Scattergl(
-                x=x[::stride],
-                y=y[::stride],
-                mode="markers",
-                marker=dict(color=color, size=3, opacity=0.08),
-                name=f"{run_name} samples",
-                legendgroup=run_name,
-                showlegend=False,
-                hovertemplate=f"{run_name}<br>|Ay|=%{{x:.2f}} g<br>|β|=%{{y:.2f}}°<extra></extra>",
-            )
-        )
-        centers, p95, _ = _binned_percentile(x, y, bin_width=0.1, x_min=0.0, x_max=1.7, pct=95.0)
-        valid = np.isfinite(p95)
-        fig.add_trace(
-            go.Scatter(
-                x=centers[valid],
-                y=p95[valid],
-                mode="lines+markers",
-                line=dict(color=color, width=2.8),
-                legendgroup=run_name,
-                name=f"{run_name} p95 |β|",
-            )
-        )
-        peak_bins = np.where(valid)[0]
-        runs[run_name] = {
-            "beta_p95_deg": float(np.nanpercentile(y, 95.0)),
-            "beta_peak_g": float(p95[peak_bins[-1]]) if peak_bins.size else np.nan,
-            "corner_samples": int(cm.sum()),
-        }
-
-    if not any_run:
-        _annotate_empty(fig)
-    return fig, {"runs": runs, "warnings": warnings}

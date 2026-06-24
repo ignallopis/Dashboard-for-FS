@@ -23,6 +23,7 @@ from utils import (
     cols_to_numpy,
     driver_color,
     ensure_complete_laps_df,
+    ensure_detected_laps_df,
     lap_dist_from_gps,
     keep_min_duration_segments,
     exclude_lap0_and_last_lap,
@@ -1123,7 +1124,7 @@ def decel_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
         centers, p95_g, counts = _binned_percentile(
             vx_b,
             decel_g,
-            bin_width=5.0,
+            bin_width=1.0,
             x_min=0.0,
             x_max=40.0,
             percentile=95.0,
@@ -1136,7 +1137,7 @@ def decel_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
                 x=vx_b[::stride],
                 y=decel_g[::stride],
                 mode="markers",
-                marker=dict(color=color, size=3, opacity=0.10),
+                marker=dict(color=color, size=3, opacity=0.30),
                 name=f"{run_name} samples",
                 legendgroup=run_name,
                 showlegend=False,
@@ -1199,16 +1200,8 @@ def decel_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     fig.add_hline(
         y=reference_g,
         line=dict(color="#73D973", width=2.4, dash="dash"),
-        annotation_text="CAT17x design target 1.79 g",
+        annotation_text="Vehicle max deceleration 1.79 g",
         annotation_position="top right",
-    )
-    fig.add_hrect(
-        y0=reference_g,
-        y1=max(2.05, reference_g * 1.08),
-        fillcolor="rgba(115,217,115,0.08)",
-        line_width=0,
-        annotation_text="design target zone",
-        annotation_position="top left",
     )
     fig.update_layout(
         height=560,
@@ -1229,144 +1222,24 @@ def decel_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     return fig, {"runs": runs, "warnings": warnings, "reference_decel_g": reference_g}
 
 
-def brake_balance_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
-    """Real front/rear brake balance from total tyre longitudinal force.
+def brake_blending_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Hydraulic line pressure vs brake-pedal demand — where regen hands off to hydraulics.
 
-    Front share of total braking force ``Est_FX`` (regen + hydraulic, validated
-    against the IMU) vs the ideal load-transfer brake-bias curve. Reads as: above
-    the ideal line = front-biased; below = rear over-braked (lock-up-prone).
+    The car brakes on regen alone until the pedal passes a blend threshold, then the
+    hydraulic circuit engages. Median front/rear line pressure (BSEFront/BSERear, bar)
+    binned by pedal % makes the regen-only deadzone and the blend onset readable at a glance.
     """
-    required = [
-        "Filtering_VN_ax",
-        "VN_vx",
-        "Est_FXFL",
-        "Est_FXFR",
-        "Est_FXRL",
-        "Est_FXRR",
-    ]
-    title = "Real Brake Balance  ·  front share of braking force"
-    xlabel = "Deceleration |ax| [g]"
-    ylabel = "Front share of braking force  [-]"
+    required = ["Brake", "BSEFront", "BSERear"]
+    title = "Brake Blending  ·  Hydraulic Pressure vs Pedal"
+    xlabel = "Brake pedal demand [%]"
+    ylabel = "Hydraulic line pressure [bar]"
     if not dfs:
         return _empty_xy_fig(title, xlabel, ylabel, "No runs selected"), {
             "runs": {},
             "warnings": ["No runs selected."],
         }
-    multi = len(dfs) > 1
-    fig = make_dark_figure(title, xlabel, ylabel)
-    warnings: list[str] = []
-    runs: dict[str, dict[str, float]] = {}
-    ideal_drawn = False
-    for run_name, df_in in dfs.items():
-        df = ensure_complete_laps_df(df_in)
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            warnings.append(f"{run_name}: missing brake-balance columns: {missing}")
-            continue
-        arr = cols_to_numpy(df, required)
-        valid = _base_validity(*(arr[c] for c in required))
-        arr = {k: v[valid] for k, v in arr.items()}
-        ax = arr["Filtering_VN_ax"]
-        vx = np.abs(arr["VN_vx"])
-        decel_g = -ax / G_MPS2
-        ff = np.clip(-(arr["Est_FXFL"] + arr["Est_FXFR"]), 0.0, None)
-        fr = np.clip(-(arr["Est_FXRL"] + arr["Est_FXRR"]), 0.0, None)
-        tot = ff + fr
-        m = (ax < -2.0) & (vx > 3.0) & (decel_g > 0.3) & (tot > 0.0)
-        if not m.any():
-            warnings.append(f"{run_name}: no braking samples for brake balance.")
-            continue
-        decel_m = decel_g[m]
-        vx_m = vx[m]
-        front_share = ff[m] / tot[m]
-        centers, med, _ = _binned_percentile(
-            decel_m, front_share, bin_width=0.1, x_min=0.2, x_max=1.4, percentile=50.0
-        )
-        _, p10, _ = _binned_percentile(
-            decel_m, front_share, bin_width=0.1, x_min=0.2, x_max=1.4, percentile=10.0
-        )
-        _, p90, _ = _binned_percentile(
-            decel_m, front_share, bin_width=0.1, x_min=0.2, x_max=1.4, percentile=90.0
-        )
-        v = np.isfinite(med)
-        color = driver_color(run_name) if multi else _AXLE_FRONT_COLOR
-        if not multi and v.any():
-            band_v = v & np.isfinite(p10) & np.isfinite(p90)
-            fig.add_trace(
-                go.Scatter(
-                    x=np.concatenate([centers[band_v], centers[band_v][::-1]]),
-                    y=np.concatenate([p90[band_v], p10[band_v][::-1]]),
-                    fill="toself",
-                    fillcolor="rgba(79,195,247,0.15)",
-                    line=dict(width=0),
-                    hoverinfo="skip",
-                    showlegend=False,
-                    name=f"{run_name} P10-P90",
-                )
-            )
-        fig.add_trace(
-            go.Scatter(
-                x=centers[v],
-                y=med[v],
-                mode="lines+markers",
-                line=dict(color=color, width=2.6),
-                marker=dict(color=color, size=6),
-                name=f"{run_name} measured" if multi else "Measured front share",
-                legendgroup=run_name,
-            )
-        )
-        if not ideal_drawn:
-            ax_grid = np.linspace(0.2, 1.4, 50)
-            _ff_i, _fr_i, ideal_front = _ideal_brake_forces(
-                ax_grid * G_MPS2, float(np.nanmedian(vx_m))
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=ax_grid,
-                    y=ideal_front,
-                    mode="lines",
-                    line=dict(color="#73D973", width=2.2, dash="dash"),
-                    name="Ideal (load-transfer)",
-                )
-            )
-            ideal_drawn = True
-        _f, _r, ideal_sample = _ideal_brake_forces(decel_m * G_MPS2, vx_m)
-        bias_error = front_share - ideal_sample
-        runs[run_name] = {
-            "front_bias_median": float(np.nanmedian(front_share)),
-            "bias_error_vs_ideal": float(np.nanmedian(bias_error)),
-            "pct_rear_overbraked": float(np.nanmean(front_share < ideal_sample) * 100.0),
-            "peak_decel_g": float(np.nanpercentile(decel_m, 95.0)),
-            "samples": int(m.sum()),
-        }
-    fig.update_layout(height=520, margin=dict(l=70, r=30, t=50, b=65))
-    fig.update_xaxes(range=[0.2, 1.4])
-    fig.update_yaxes(range=[0.3, 1.0])
-    return fig, {"runs": runs, "warnings": warnings}
 
-
-def brake_load_transfer_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
-    """Longitudinal load transfer under braking: measured front Fz share vs the
-    rigid point-mass prediction. The gap (measured below rigid) is the anti-dive /
-    suspension-compliance signature.
-    """
-    required = [
-        "Filtering_VN_ax",
-        "VN_vx",
-        "Est_FZFL",
-        "Est_FZFR",
-        "Est_FZRL",
-        "Est_FZRR",
-    ]
-    title = "Longitudinal Load Transfer  ·  front Fz share vs rigid theory"
-    xlabel = "Deceleration |ax| [g]"
-    ylabel = "Front vertical-load share  [-]"
-    if not dfs:
-        return _empty_xy_fig(title, xlabel, ylabel, "No runs selected"), {
-            "runs": {},
-            "warnings": ["No runs selected."],
-        }
-    multi = len(dfs) > 1
+    onset_bar = 1.0  # line pressure that marks clear hydraulic engagement
     fig = make_dark_figure(title, xlabel, ylabel)
     warnings: list[str] = []
     runs: dict[str, dict[str, float]] = {}
@@ -1374,85 +1247,81 @@ def brake_load_transfer_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, di
         df = ensure_complete_laps_df(df_in)
         missing = [c for c in required if c not in df.columns]
         if missing:
-            warnings.append(f"{run_name}: missing load-transfer columns: {missing}")
+            warnings.append(f"{run_name}: missing brake-blending columns: {missing}")
             continue
         arr = cols_to_numpy(df, required)
-        valid = _base_validity(*(arr[c] for c in required))
-        arr = {k: v[valid] for k, v in arr.items()}
-        ax = arr["Filtering_VN_ax"]
-        vx = np.abs(arr["VN_vx"])
-        decel_g = -ax / G_MPS2
-        fz_front = arr["Est_FZFL"] + arr["Est_FZFR"]
-        fz_rear = arr["Est_FZRL"] + arr["Est_FZRR"]
-        fz_tot = fz_front + fz_rear
-        m = (ax < -2.0) & (vx > 3.0) & (fz_tot > 1.0)
+        pedal = arr["Brake"]
+        front = arr["BSEFront"]
+        rear = arr["BSERear"]
+        m = (pedal > 0.0) & np.isfinite(pedal) & np.isfinite(front) & np.isfinite(rear)
         if not m.any():
-            warnings.append(f"{run_name}: no braking samples for load transfer.")
+            warnings.append(f"{run_name}: no brake-pedal samples for blending curve.")
             continue
-        decel_m = decel_g[m]
-        share = fz_front[m] / fz_tot[m]
-        centers, med, _ = _binned_percentile(
-            decel_m, share, bin_width=0.1, x_min=0.2, x_max=1.4, percentile=50.0
+        pedal_b, front_b, rear_b = pedal[m], front[m], rear[m]
+        centers, med_front, _ = _binned_percentile(
+            pedal_b, front_b, bin_width=5.0, x_min=0.0, x_max=80.0, percentile=50.0
         )
-        _, p10, _ = _binned_percentile(
-            decel_m, share, bin_width=0.1, x_min=0.2, x_max=1.4, percentile=10.0
+        _, med_rear, _ = _binned_percentile(
+            pedal_b, rear_b, bin_width=5.0, x_min=0.0, x_max=80.0, percentile=50.0
         )
-        _, p90, _ = _binned_percentile(
-            decel_m, share, bin_width=0.1, x_min=0.2, x_max=1.4, percentile=90.0
-        )
-        v = np.isfinite(med)
-        color = driver_color(run_name) if multi else _AXLE_FRONT_COLOR
-        if not multi and v.any():
-            band_v = v & np.isfinite(p10) & np.isfinite(p90)
-            fig.add_trace(
-                go.Scatter(
-                    x=np.concatenate([centers[band_v], centers[band_v][::-1]]),
-                    y=np.concatenate([p90[band_v], p10[band_v][::-1]]),
-                    fill="toself",
-                    fillcolor="rgba(79,195,247,0.15)",
-                    line=dict(width=0),
-                    hoverinfo="skip",
-                    showlegend=False,
-                    name=f"{run_name} P10-P90",
-                )
-            )
+        color = driver_color(run_name)
+        vf = np.isfinite(med_front)
+        vr = np.isfinite(med_rear)
+        # Blend onset = first pedal bin whose median front pressure crosses onset_bar.
+        crossed = vf & (med_front >= onset_bar)
+        threshold_pct = float(centers[np.argmax(crossed)]) if crossed.any() else np.nan
         fig.add_trace(
             go.Scatter(
-                x=centers[v],
-                y=med[v],
+                x=centers[vf],
+                y=med_front[vf],
                 mode="lines+markers",
-                line=dict(color=color, width=2.6),
-                marker=dict(color=color, size=6),
-                name=f"{run_name} measured" if multi else "Measured front Fz share",
+                line=dict(color=color, width=3.0),
+                marker=dict(color=color, size=7, line=dict(color="#EBEBEB", width=0.8)),
+                name=f"{run_name} front",
                 legendgroup=run_name,
+                hovertemplate=(
+                    f"{run_name} front<br>Pedal=%{{x:.0f}}%<br>Median P=%{{y:.1f}} bar<extra></extra>"
+                ),
             )
         )
-        rigid_sample = 0.5 + decel_m * COG_Z_M / WHEELBASE_M
-        static_mask = decel_m < 0.35
-        peak_idx = int(np.nanargmax(centers[v])) if v.any() else -1
+        fig.add_trace(
+            go.Scatter(
+                x=centers[vr],
+                y=med_rear[vr],
+                mode="lines+markers",
+                line=dict(color=color, width=2.2, dash="dash"),
+                marker=dict(color=color, size=6, symbol="diamond"),
+                name=f"{run_name} rear",
+                legendgroup=run_name,
+                hovertemplate=(
+                    f"{run_name} rear<br>Pedal=%{{x:.0f}}%<br>Median P=%{{y:.1f}} bar<extra></extra>"
+                ),
+            )
+        )
+        if np.isfinite(threshold_pct):
+            fig.add_vline(x=threshold_pct, line=dict(color=color, width=1.6, dash="dot"))
         runs[run_name] = {
-            "fz_front_static": float(np.nanmedian(share[static_mask]))
-            if static_mask.any()
-            else float(np.nanmedian(share)),
-            "fz_front_at_peak": float(med[v][peak_idx]) if peak_idx >= 0 else float("nan"),
-            "transfer_deficit_pp": float(np.nanmedian(share - rigid_sample) * 100.0),
+            "blend_threshold_pct": threshold_pct,
+            "front_peak_pressure_bar": float(np.nanpercentile(front_b, 95.0)),
+            "rear_peak_pressure_bar": float(np.nanpercentile(rear_b, 95.0)),
             "samples": int(m.sum()),
         }
-    ax_grid = np.linspace(0.2, 1.4, 50)
-    rigid_line = 0.5 + ax_grid * COG_Z_M / WHEELBASE_M
-    fig.add_trace(
-        go.Scatter(
-            x=ax_grid,
-            y=rigid_line,
-            mode="lines",
-            line=dict(color="#73D973", width=2.2, dash="dash"),
-            name="Rigid-body (no anti-dive)",
-        )
+    fig.update_layout(
+        height=520,
+        margin=dict(l=70, r=35, t=55, b=65),
+        hovermode="closest",
+        legend=dict(
+            bgcolor="rgba(20,20,23,0.85)",
+            bordercolor="rgba(128,128,128,0.3)",
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1.0,
+        ),
     )
-    fig.update_layout(height=520, margin=dict(l=70, r=30, t=50, b=65))
-    fig.update_xaxes(range=[0.2, 1.4])
-    fig.update_yaxes(range=[0.45, 0.78])
-    return fig, {"runs": runs, "warnings": warnings}
+    fig.update_xaxes(range=[0.0, 80.0])
+    return fig, {"runs": runs, "warnings": warnings, "onset_bar": onset_bar}
 
 
 def axle_brake_utilisation_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
@@ -1563,6 +1432,9 @@ def axle_brake_utilisation_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure,
             "util_rear_median": float(np.nanmedian(util_r)),
             "util_front_p95": peak_f,
             "util_rear_p95": peak_r,
+            # Signed front-minus-rear headroom gap at the P95 limit: + = front runs
+            # closer to its grip limit (shift bias rearward); - = rear over-braked.
+            "util_gap_p95": peak_f - peak_r,
             "limiting_axle": "front" if peak_f >= peak_r else "rear",
             "samples": int(m.sum()),
         }
@@ -1722,19 +1594,27 @@ def _lockup_segment_count(mask: np.ndarray) -> int:
 def wheel_lockup_per_lap_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     """Wheel locking time per lap — braking lock-up (vehicle behaviour).
 
-    Per lap, the time each wheel spends with Est_SR below the −0.30 lock-up line while
-    braking (decel > 1 m/s²), summed across wheels. A tyre/vehicle outcome (the regen
-    controller has no slip feedback), shown alongside the per-axle braking-slip view.
+    Top-down car view: one panel per corner (FL/FR top, RL/RR bottom, shared y-axis),
+    each the per-lap time that wheel spends with Est_SR below the −0.30 lock-up line while
+    braking (decel > 1 m/s²). Reads at a glance which corner suffers and how it evolves.
     """
-    fig = make_dark_figure(
-        title="Wheel locking time per lap",
-        xlabel="Lap",
-        ylabel="Lock time [s]",
-    )
+    from plotly.subplots import make_subplots
+
     multi = len(dfs) > 1
     runs: dict[str, dict] = {}
     warnings: list[str] = []
     dt = 0.01  # 100 Hz
+
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        shared_yaxes=True,
+        subplot_titles=("FL", "FR", "RL", "RR"),
+        horizontal_spacing=0.07,
+        vertical_spacing=0.14,
+    )
+    grid_pos = {"FL": (1, 1), "FR": (1, 2), "RL": (2, 1), "RR": (2, 2)}
+    legend_shown: set[str] = set()
 
     for name, df in dfs.items():
         try:
@@ -1777,36 +1657,716 @@ def wheel_lockup_per_lap_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, d
                 total_by_lap[i] += t
 
         lap_ints = [int(x) for x in uql]
-        if multi:
+        for w in _LOCKUP_WHEELS:
+            r, c = grid_pos[w]
+            # single run: colour by corner; multi run: colour by run, grouped.
+            color = driver_color(name) if multi else WHEEL_COLORS[w]
+            trace_name = name if multi else w
+            show = (name not in legend_shown) if multi else False
             fig.add_trace(
                 go.Bar(
                     x=lap_ints,
-                    y=total_by_lap,
-                    name=name,
-                    marker_color=driver_color(name),
-                    opacity=0.85,
-                )
+                    y=time_by_wheel[w],
+                    name=trace_name,
+                    marker_color=color,
+                    legendgroup=trace_name,
+                    showlegend=show,
+                    hovertemplate=f"{w} · {name}<br>Lap %{{x}}<br>%{{y:.2f}} s<extra></extra>",
+                ),
+                row=r,
+                col=c,
             )
-        else:
-            for w in _LOCKUP_WHEELS:
-                fig.add_trace(
-                    go.Bar(
-                        x=lap_ints,
-                        y=time_by_wheel[w],
-                        name=w,
-                        marker_color=WHEEL_COLORS[w],
-                    )
-                )
+            if multi:
+                legend_shown.add(name)
 
+        # Total lock-up time per wheel across all laps → which corner suffers most.
+        time_per_wheel = {w: float(np.nansum(time_by_wheel[w])) for w in _LOCKUP_WHEELS}
+        worst_wheel = max(time_per_wheel, key=time_per_wheel.get)
         runs[name] = {
             "lockup_total_time_s": float(np.nansum(total_by_lap)),
             "lockup_events_total": int(events_total),
             "worst_min_sr": float(worst_min_sr) if np.isfinite(worst_min_sr) else float("nan"),
+            "worst_wheel": worst_wheel,
+            "worst_wheel_time_s": time_per_wheel[worst_wheel],
+            "time_per_wheel": time_per_wheel,
             "laps": int(len(uql)),
         }
 
-    fig.update_layout(barmode="group" if multi else "stack")
+    fig.update_layout(
+        title=dict(
+            text="Wheel locking time per lap  ·  top-down car view",
+            font=dict(size=14, color="#EBEBEB"),
+        ),
+        paper_bgcolor="#141417",
+        plot_bgcolor="#141417",
+        font=dict(color="#EBEBEB", size=11),
+        barmode="group",
+        bargap=0.15,
+        height=560,
+        margin=dict(l=70, r=30, t=60, b=55),
+        showlegend=multi,
+        legend=dict(
+            bgcolor="rgba(20,20,23,0.85)",
+            bordercolor="rgba(128,128,128,0.3)",
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1.0,
+        ),
+    )
+    fig.update_xaxes(title_text="Lap", dtick=1, gridcolor="rgba(255,255,255,0.08)")
+    fig.update_yaxes(gridcolor="rgba(255,255,255,0.08)")
+    fig.update_yaxes(title_text="Lock time [s]", col=1)
     return fig, {"runs": runs, "warnings": warnings}
+
+
+def wheel_lockup_track_map_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
+    """Wheel lock-up zones over the circuit — spatial view of one run.
+
+    Draws the GPS track outline (grey) and overlays, directly on the line, the
+    points where each wheel crosses the −0.30 lock-up line while braking, coloured
+    by corner (FL/FR/RL/RR). Front and rear lock at different points of a braking
+    zone, so the colours separate naturally along the track. Unlike the per-lap
+    bar view it needs no complete-lap pairs, so it still reads with a single
+    flying lap — answering *where* each wheel locks.
+    """
+    fig = make_dark_figure(title="Wheel lock-up zones  ·  track map", xlabel="", ylabel="")
+    fig.update_layout(height=560, margin=dict(l=10, r=10, t=60, b=10))
+
+    def _msg(text: str) -> tuple[go.Figure, dict]:
+        fig.add_annotation(
+            text=text,
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            font=dict(color="#EBEBEB", size=12),
+        )
+        return fig, {"time_per_wheel": {}, "warnings": [text]}
+
+    needed = ("laps", "VN_latitude", "VN_longitude", *(f"Est_SR{w}" for w in _LOCKUP_WHEELS))
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        return _msg(f"Track map unavailable: missing columns {missing}")
+
+    try:
+        d = ensure_detected_laps_df(df)
+    except Exception as exc:  # noqa: BLE001
+        return _msg(f"Track map unavailable: {exc}")
+
+    ax_col = "Filtering_VN_ax" if "Filtering_VN_ax" in d.columns else "VN_ax"
+    cols = cols_to_numpy(d, ["laps", "VN_latitude", "VN_longitude", ax_col, *needed[3:]])
+    lat = cols["VN_latitude"]
+    lng = cols["VN_longitude"]
+    laps = cols["laps"]
+    dt = 0.01
+
+    gps_ok = np.isfinite(lat) & np.isfinite(lng)
+    # Flying laps only (laps > 0) keeps the out-lap out, but unlike the bar view
+    # we never drop the last lap, so a single flying lap survives.
+    on_track = gps_ok & (laps > 0)
+    if not on_track.any():
+        on_track = gps_ok  # no detected laps > 0 → fall back to every GPS sample
+    if not on_track.any():
+        return _msg("Track map unavailable: no valid GPS samples")
+
+    brake = np.nan_to_num(cols[ax_col], nan=0.0) < -_LOCKUP_BRAKE_DECEL_MIN
+
+    # Background: the circuit outline (every on-track GPS sample, faint).
+    fig.add_trace(
+        go.Scattergl(
+            x=lng[on_track],
+            y=lat[on_track],
+            mode="markers",
+            marker=dict(size=3, color="rgba(170,170,170,0.30)"),
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+
+    lock_by_wheel: dict[str, np.ndarray] = {}
+    for w in _LOCKUP_WHEELS:
+        sr = cols[f"Est_SR{w}"]
+        raw = on_track & brake & np.isfinite(sr) & (sr < _LOCKUP_SR_THRESHOLD)
+        lock_by_wheel[w] = keep_min_duration_segments(raw, _LOCKUP_MIN_DURATION_S, dt)
+
+    time_per_wheel = {w: float(np.sum(lock_by_wheel[w]) * dt) for w in _LOCKUP_WHEELS}
+    events_per_wheel = {w: _lockup_segment_count(lock_by_wheel[w]) for w in _LOCKUP_WHEELS}
+
+    worst_min_sr = np.nan
+    for w in _LOCKUP_WHEELS:
+        lock = lock_by_wheel[w]
+        if lock.any():
+            m = float(np.nanmin(cols[f"Est_SR{w}"][lock]))
+            worst_min_sr = m if not np.isfinite(worst_min_sr) else min(worst_min_sr, m)
+        # Markers sit exactly on the track line — no offset.
+        fig.add_trace(
+            go.Scattergl(
+                x=lng[lock],
+                y=lat[lock],
+                mode="markers",
+                marker=dict(
+                    size=6,
+                    color=WHEEL_COLORS[w],
+                    opacity=0.9,
+                    line=dict(width=0),
+                ),
+                name=f"{w} · {time_per_wheel[w]:.1f} s",
+                legendgroup=w,
+                hovertemplate=f"{w} lock-up<extra></extra>",
+                showlegend=True,
+            )
+        )
+
+    n_laps = int(np.count_nonzero(unique_laps(laps[on_track]) > 0)) or int(
+        unique_laps(laps[on_track]).size
+    )
+    worst_wheel = max(time_per_wheel, key=time_per_wheel.get) if time_per_wheel else None
+
+    fig.update_layout(
+        showlegend=True,
+        legend=dict(
+            bgcolor="rgba(20,20,23,0.85)",
+            bordercolor="rgba(128,128,128,0.3)",
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="center",
+            x=0.5,
+        ),
+    )
+    fig.update_xaxes(showgrid=False, zeroline=False, showticklabels=False, showline=False)
+    fig.update_yaxes(
+        showgrid=False,
+        zeroline=False,
+        showticklabels=False,
+        showline=False,
+        scaleanchor="x",
+        scaleratio=1.0,
+    )
+    return fig, {
+        "time_per_wheel": time_per_wheel,
+        "events_per_wheel": events_per_wheel,
+        "lockup_total_time_s": float(sum(time_per_wheel.values())),
+        "worst_wheel": worst_wheel,
+        "worst_wheel_time_s": time_per_wheel.get(worst_wheel, float("nan"))
+        if worst_wheel
+        else float("nan"),
+        "worst_min_sr": float(worst_min_sr) if np.isfinite(worst_min_sr) else float("nan"),
+        "laps": n_laps,
+        "warnings": [],
+    }
+
+
+# ── Ideal braking curve vs measured regen (Controls › RB) ─────────────────────
+_BRAKE_DIST_COLS = [
+    "TimeStamp",
+    "laps",
+    "laptime",
+    "Filtering_VN_ax",
+    "VN_vx",
+    "FL_actualTorque",
+    "FR_actualTorque",
+    "RL_actualTorque",
+    "RR_actualTorque",
+]
+_BRAKE_DIST_OPTIONAL_COLS = ["BSEFront", "BSERear"]
+
+
+def _regen_force_from_motor_torque(torque_nm: np.ndarray) -> np.ndarray:
+    """Positive braking force [N] from negative motor torque [N·m]."""
+    regen_torque_nm = -np.minimum(0.0, torque_nm) * GEAR_RATIO
+    return regen_torque_nm / WHEEL_RADIUS_M
+
+
+def _brake_pressure_demand_force(pressure_bar: np.ndarray, piston_count: int) -> np.ndarray:
+    """Hydraulic brake demand force [N] from pressure [bar], if sensors exist."""
+    piston_area_m2 = np.pi * (BRAKE_PISTON_DIAM_M * 0.5) ** 2
+    pad_radius_m = 0.5 * (BRAKE_PAD_RE_M + BRAKE_PAD_RI_M)
+    pressure_pa = np.maximum(0.0, pressure_bar) * 1e5
+    return (
+        pressure_pa * piston_count * piston_area_m2 * BRAKE_PAD_MU * pad_radius_m / WHEEL_RADIUS_M
+    )
+
+
+def _rms_distance_to_ideal_curve(
+    ff_n: np.ndarray,
+    fr_n: np.ndarray,
+    vx_mps: np.ndarray,
+    ax_grid_mps2: np.ndarray,
+) -> np.ndarray:
+    """Per-sample Euclidean distance [N] to the ideal curve at sample speed."""
+    out = np.full_like(ff_n, np.nan, dtype=float)
+    chunk_size = 4000
+    for start in range(0, len(ff_n), chunk_size):
+        end = min(start + chunk_size, len(ff_n))
+        for i in range(start, end):
+            f_curve, r_curve, _front_frac = _ideal_brake_forces(ax_grid_mps2, vx_mps[i])
+            dist = np.hypot(f_curve - ff_n[i], r_curve - fr_n[i])
+            out[i] = float(np.nanmin(dist)) if np.any(np.isfinite(dist)) else np.nan
+    return out
+
+
+def _ideal_rear_at_front_force(
+    ff_n: np.ndarray,
+    vx_mps: np.ndarray,
+    ax_grid_mps2: np.ndarray,
+) -> np.ndarray:
+    """Ideal rear force [N] interpolated at measured front force and speed."""
+    out = np.full_like(ff_n, np.nan, dtype=float)
+    for i, (front_force_n, vx) in enumerate(zip(ff_n, vx_mps)):
+        f_curve, r_curve, _front_frac = _ideal_brake_forces(ax_grid_mps2, vx)
+        order = np.argsort(f_curve)
+        out[i] = np.interp(front_force_n, f_curve[order], r_curve[order])
+    return out
+
+
+def _empty_brake_distribution_fig(message: str) -> go.Figure:
+    fig = make_dark_figure(
+        title="Ideal braking curve vs measured regen",
+        xlabel="Front braking force [kN]",
+        ylabel="Rear braking force [kN]",
+    )
+    fig.add_annotation(
+        xref="paper",
+        yref="paper",
+        x=0.5,
+        y=0.5,
+        showarrow=False,
+        text=message,
+        font=dict(color="#EBEBEB", size=12),
+    )
+    return fig
+
+
+def ideal_braking_curve_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Compare ideal front/rear braking distribution with measured regen force.
+
+    Returns a force-plane figure plus KPIs per run.
+    """
+    if not dfs:
+        return _empty_brake_distribution_fig("No runs selected"), {
+            "runs": {},
+            "warnings": ["No runs selected."],
+        }
+
+    import plotly.colors as pc
+
+    ax_grid = np.linspace(0.0, MU_TIRE * G_MPS2, 200)
+    run_payloads: list[dict[str, object]] = []
+    kpi_runs: dict[str, dict[str, float]] = {}
+    warnings: list[str] = []
+    pooled_speed: list[np.ndarray] = []
+    required = list(_BRAKE_DIST_COLS)
+    ideal_curve_limits: list[tuple[float, float]] = []
+
+    for run_name, df_in in dfs.items():
+        df = ensure_complete_laps_df(df_in)
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            warnings.append(f"{run_name}: missing brake distribution columns: {missing}")
+            continue
+
+        cols = required + [c for c in _BRAKE_DIST_OPTIONAL_COLS if c in df.columns]
+        arr = cols_to_numpy(df, cols)
+        dist_m = lap_dist_from_gps(df)
+        valid = _base_validity(*(arr[c] for c in required)) & np.isfinite(dist_m)
+        if not valid.any():
+            warnings.append(f"{run_name}: no finite brake distribution samples.")
+            continue
+
+        arr = {k: v[valid] for k, v in arr.items()}
+        dist_m = dist_m[valid]
+        vx_mps = np.abs(arr["VN_vx"])
+        ax_abs_mps2 = np.abs(arr["Filtering_VN_ax"])
+        f_reg_fl = _regen_force_from_motor_torque(arr["FL_actualTorque"])
+        f_reg_fr = _regen_force_from_motor_torque(arr["FR_actualTorque"])
+        f_reg_rl = _regen_force_from_motor_torque(arr["RL_actualTorque"])
+        f_reg_rr = _regen_force_from_motor_torque(arr["RR_actualTorque"])
+        f_reg_front_n = f_reg_fl + f_reg_fr
+        f_reg_rear_n = f_reg_rl + f_reg_rr
+        total_regen_n = f_reg_front_n + f_reg_rear_n
+
+        brake_mask = (
+            (arr["Filtering_VN_ax"] < -1.0)
+            & (total_regen_n > 50.0)
+            & np.isfinite(vx_mps)
+            & np.isfinite(dist_m)
+        )
+        if not brake_mask.any():
+            warnings.append(f"{run_name}: no regen braking samples meet the filter.")
+            continue
+
+        ff_n = f_reg_front_n[brake_mask]
+        fr_n = f_reg_rear_n[brake_mask]
+        vx_b = vx_mps[brake_mask]
+        ax_b = ax_abs_mps2[brake_mask]
+        dist_b = dist_m[brake_mask]
+        total_b = ff_n + fr_n
+        front_bias = np.divide(
+            ff_n,
+            total_b,
+            out=np.full_like(ff_n, np.nan, dtype=float),
+            where=total_b > 0.0,
+        )
+
+        equivalent_ax = np.clip(total_b / MASS_KG, 0.0, MU_TIRE * G_MPS2)
+        _ideal_ff, _ideal_fr, ideal_front_bias = _ideal_brake_forces(equivalent_ax, vx_b)
+        bias_error = front_bias - ideal_front_bias
+        dist_to_ideal_n = _rms_distance_to_ideal_curve(ff_n, fr_n, vx_b, ax_grid)
+        ideal_rear_n = _ideal_rear_at_front_force(ff_n, vx_b, ax_grid)
+        rear_overbiased = fr_n > ideal_rear_n
+        peak_combined_brake_g = np.nanmax(total_b) / (MASS_KG * G_MPS2)
+
+        hyd_payload = None
+        if "BSEFront" in arr and "BSERear" in arr:
+            bse_f = arr["BSEFront"][brake_mask]
+            bse_r = arr["BSERear"][brake_mask]
+            bse_active = np.nanstd(bse_f) > 0.05 or np.nanstd(bse_r) > 0.05
+            if bse_active:
+                hyd_payload = {
+                    "front_kN": _brake_pressure_demand_force(bse_f, BRAKE_PISTONS_F) / 1000.0,
+                    "rear_kN": _brake_pressure_demand_force(bse_r, BRAKE_PISTONS_R) / 1000.0,
+                }
+
+        speed_kmh = vx_b * 3.6
+        pooled_speed.append(speed_kmh)
+        run_payloads.append(
+            {
+                "run_name": run_name,
+                "front_kN": ff_n / 1000.0,
+                "rear_kN": fr_n / 1000.0,
+                "speed_kmh": speed_kmh,
+                "hyd": hyd_payload,
+            }
+        )
+        kpi_runs[run_name] = {
+            "front_bias_mean": float(np.nanmean(front_bias)),
+            "front_bias_std": float(np.nanstd(front_bias)),
+            "rms_dist_to_ideal_N": float(np.sqrt(np.nanmean(dist_to_ideal_n**2))),
+            "pct_time_rear_overbiased": float(np.nanmean(rear_overbiased) * 100.0),
+            "peak_combined_brake_g": float(peak_combined_brake_g),
+            "samples": int(brake_mask.sum()),
+        }
+
+    if not run_payloads:
+        return _empty_brake_distribution_fig("No valid regen braking samples"), {
+            "runs": kpi_runs,
+            "warnings": warnings or ["No valid regen braking samples."],
+        }
+
+    fig = make_dark_figure(
+        xlabel="Front braking force [kN]",
+        ylabel="Rear braking force [kN]",
+    )
+
+    # Speed colour scale shared by points and ideal curves: read each point against the
+    # ideal curve of its own colour (= its own speed). Mirrors ideal_brake_distribution_fig.
+    all_speed = np.concatenate(pooled_speed)
+    cmin = float(np.nanpercentile(all_speed, 2.0))
+    cmax = float(np.nanpercentile(all_speed, 98.0))
+    if not (cmax > cmin):
+        cmin, cmax = float(np.nanmin(all_speed)), float(np.nanmax(all_speed)) + 1.0
+
+    def _speed_color(speed_kmh: float) -> str:
+        t = float(np.clip((speed_kmh - cmin) / (cmax - cmin), 0.0, 1.0))
+        return pc.sample_colorscale(_SPEED_COLORSCALE, [t])[0]
+
+    # v=0 (no-aero) reference curve — neutral, no points sit on it.
+    f0, r0, _ = _ideal_brake_forces(ax_grid, 0.0)
+    ideal_curve_limits.append((float(np.nanmax(f0 / 1000.0)), float(np.nanmax(r0 / 1000.0))))
+    fig.add_trace(
+        go.Scatter(
+            x=f0 / 1000.0,
+            y=r0 / 1000.0,
+            mode="lines",
+            line=dict(color="rgba(235,235,235,0.5)", width=1.8, dash="dash"),
+            name="Ideal 0 km/h (no aero)",
+            hovertemplate="Ff=%{x:.2f} kN<br>Fr=%{y:.2f} kN<extra></extra>",
+        )
+    )
+    # Representative-speed ideal curves, colour-matched to the point speed scale.
+    for speed_kmh in _IDEAL_BRAKE_CURVE_SPEEDS_KMH:
+        f_curve, r_curve, _front_frac = _ideal_brake_forces(ax_grid, speed_kmh / 3.6)
+        ideal_curve_limits.append(
+            (float(np.nanmax(f_curve / 1000.0)), float(np.nanmax(r_curve / 1000.0)))
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=f_curve / 1000.0,
+                y=r_curve / 1000.0,
+                mode="lines",
+                line=dict(color=_speed_color(speed_kmh), width=2.4),
+                name=f"Ideal {speed_kmh:.0f} km/h",
+                hovertemplate="Ff=%{x:.2f} kN<br>Fr=%{y:.2f} kN<extra></extra>",
+            )
+        )
+
+    force_limit_kN = MU_TIRE * MASS_KG * G_MPS2 / 1000.0
+    fig.add_trace(
+        go.Scatter(
+            x=[0.0, force_limit_kN],
+            y=[force_limit_kN, 0.0],
+            mode="lines",
+            line=dict(color="rgba(235,235,235,0.55)", width=1.5, dash="dot"),
+            name=f"μ envelope v=0 ({MU_TIRE:.2f})",
+            hoverinfo="skip",
+        )
+    )
+    for idx, payload in enumerate(run_payloads):
+        run_name = str(payload["run_name"])
+        show_colorbar = idx == 0
+        fig.add_trace(
+            go.Scattergl(
+                x=payload["front_kN"],
+                y=payload["rear_kN"],
+                mode="markers",
+                marker=dict(
+                    color=payload["speed_kmh"],
+                    colorscale=_SPEED_COLORSCALE,
+                    cmin=cmin,
+                    cmax=cmax,
+                    colorbar=dict(title="speed<br>[km/h]", x=1.02) if show_colorbar else None,
+                    showscale=show_colorbar,
+                    size=4,
+                    opacity=0.45,
+                ),
+                name=f"{run_name} regen",
+                customdata=payload["speed_kmh"],
+                hovertemplate=(
+                    f"{run_name}<br>Ff=%{{x:.2f}} kN<br>Fr=%{{y:.2f}} kN"
+                    "<br>speed=%{customdata:.0f} km/h<extra></extra>"
+                ),
+            )
+        )
+        hyd = payload.get("hyd")
+        if isinstance(hyd, dict):
+            fig.add_trace(
+                go.Scattergl(
+                    x=hyd["front_kN"],
+                    y=hyd["rear_kN"],
+                    mode="markers",
+                    marker=dict(
+                        color="rgba(235,235,235,0.0)",
+                        line=dict(color=driver_color(run_name), width=1.2),
+                        size=6,
+                        symbol="circle-open",
+                        opacity=0.55,
+                    ),
+                    name=f"{run_name} BSE demand",
+                    hovertemplate=(
+                        f"{run_name} BSE demand<br>Ff=%{{x:.2f}} kN"
+                        "<br>Fr=%{y:.2f} kN<extra></extra>"
+                    ),
+                )
+            )
+
+    visible_front_kN = [float(np.nanpercentile(p["front_kN"], 99.7)) for p in run_payloads]
+    visible_rear_kN = [float(np.nanpercentile(p["rear_kN"], 99.7)) for p in run_payloads]
+    for p in run_payloads:
+        hyd = p.get("hyd")
+        if isinstance(hyd, dict):
+            visible_front_kN.append(float(np.nanpercentile(hyd["front_kN"], 99.7)))
+            visible_rear_kN.append(float(np.nanpercentile(hyd["rear_kN"], 99.7)))
+    for front_lim_kN, rear_lim_kN in ideal_curve_limits:
+        visible_front_kN.append(front_lim_kN)
+        visible_rear_kN.append(rear_lim_kN)
+    axis_max = max(visible_front_kN + visible_rear_kN) * 1.12
+    fig.update_layout(
+        paper_bgcolor="#141417",
+        plot_bgcolor="#141417",
+        font=dict(color="#EBEBEB", size=11),
+        height=860,
+        margin=dict(l=80, r=120, t=35, b=75),
+        legend=dict(
+            bgcolor="rgba(20,20,23,0.85)",
+            bordercolor="rgba(128,128,128,0.3)",
+            orientation="h",
+            yanchor="bottom",
+            y=1.01,
+            xanchor="right",
+            x=1.0,
+        ),
+        hovermode="closest",
+    )
+    fig.update_xaxes(title_text="Front braking force [kN]", range=[0.0, 5.0])
+    fig.update_yaxes(
+        title_text="Rear braking force [kN]", range=[0.0, 2.0], scaleanchor="x", scaleratio=1
+    )
+
+    return fig, {
+        "runs": kpi_runs,
+        "warnings": warnings,
+        "front_balance_reference": BRAKE_FRONT_BALANCE,
+        "mu_tire": MU_TIRE,
+    }
+
+
+# ── Ideal brake distribution: total Fx front vs rear vs load ideal (Dynamics › Braking) ──
+_IDEAL_BRAKE_DIST_COLS = [
+    "Filtering_VN_ax",
+    "VN_vx",
+    "Brake",
+    "Est_FXFL",
+    "Est_FXFR",
+    "Est_FXRL",
+    "Est_FXRR",
+]
+# Representative braking speeds for the ideal curves (data spans ~28-100 km/h).
+_IDEAL_BRAKE_CURVE_SPEEDS_KMH = (35.0, 55.0, 90.0)
+_SPEED_COLORSCALE = "Viridis"
+
+
+def ideal_brake_distribution_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Total front vs rear braking force vs the load-proportional ideal split.
+
+    Plots measured |Est_FX| per axle [kN] in the force plane, coloured by speed, against
+    the ideal load-proportional brake distribution at representative speeds. Points above
+    the ideal curve = rear over-braked (locks first); below = front over-braked. Est_FX is
+    the controller's total tyre-force estimate (regen + hydraulic) with a single mu per axle.
+    """
+    import plotly.colors as pc
+
+    title = "Ideal Brake Distribution  ·  Total Fx Front vs Rear"
+    xlabel = "Front braking force [kN]"
+    ylabel = "Rear braking force [kN]"
+    if not dfs:
+        return _empty_xy_fig(title, xlabel, ylabel, "No runs selected"), {
+            "runs": {},
+            "warnings": ["No runs selected."],
+        }
+
+    ax_grid = np.linspace(0.0, MU_TIRE * G_MPS2, 200)
+    fig = make_dark_figure(title, xlabel, ylabel)
+    warnings: list[str] = []
+    runs: dict[str, dict[str, float]] = {}
+    payloads: list[dict[str, object]] = []
+    pooled_speed: list[np.ndarray] = []
+    symbols = ["circle", "diamond", "square", "triangle-up", "cross"]
+    multi = len(dfs) > 1
+
+    for run_name, df_in in dfs.items():
+        df = ensure_complete_laps_df(df_in)
+        missing = [c for c in _IDEAL_BRAKE_DIST_COLS if c not in df.columns]
+        if missing:
+            warnings.append(f"{run_name}: missing brake-distribution columns: {missing}")
+            continue
+        arr = cols_to_numpy(df, _IDEAL_BRAKE_DIST_COLS)
+        valid = _base_validity(*(arr[c] for c in _IDEAL_BRAKE_DIST_COLS))
+        arr = {k: v[valid] for k, v in arr.items()}
+        ax = arr["Filtering_VN_ax"]
+        vx = np.abs(arr["VN_vx"])
+        fx_front = np.abs(arr["Est_FXFL"] + arr["Est_FXFR"])
+        fx_rear = np.abs(arr["Est_FXRL"] + arr["Est_FXRR"])
+        m = (ax < -2.0) & (arr["Brake"] > 5.0) & (vx > 3.0) & (fx_front > 0.0) & (fx_rear > 0.0)
+        if not m.any():
+            warnings.append(f"{run_name}: no braking samples for brake distribution.")
+            continue
+        ff_n = fx_front[m]
+        fr_n = fx_rear[m]
+        vx_m = vx[m]
+        speed_kmh = vx_m * 3.6
+        total_n = ff_n + fr_n
+        front_bias = np.divide(ff_n, total_n, out=np.full_like(ff_n, np.nan), where=total_n > 0.0)
+        # Ideal front bias at the decel each sample's total force implies (Est_FX is the
+        # total tyre force, so total/m is the achieved decel) and the sample's speed.
+        equivalent_ax = np.clip(total_n / MASS_KG, 0.0, MU_TIRE * G_MPS2)
+        _idf, _idr, ideal_front_bias = _ideal_brake_forces(equivalent_ax, vx_m)
+        dist_to_ideal_n = _rms_distance_to_ideal_curve(ff_n, fr_n, vx_m, ax_grid)
+        pooled_speed.append(speed_kmh)
+        payloads.append(
+            {
+                "run_name": run_name,
+                "front_kN": ff_n / 1000.0,
+                "rear_kN": fr_n / 1000.0,
+                "speed_kmh": speed_kmh,
+            }
+        )
+        runs[run_name] = {
+            "front_bias_mean": float(np.nanmean(front_bias)),
+            "front_bias_ideal_mean": float(np.nanmean(ideal_front_bias)),
+            "bias_error_mean": float(np.nanmean(front_bias - ideal_front_bias)),
+            "rms_dist_to_ideal_N": float(np.sqrt(np.nanmean(dist_to_ideal_n**2))),
+            "peak_combined_brake_g": float(np.nanpercentile(equivalent_ax, 95.0) / G_MPS2),
+            "samples": int(m.sum()),
+        }
+
+    if not payloads:
+        return _empty_xy_fig(title, xlabel, ylabel, "No valid braking samples"), {
+            "runs": runs,
+            "warnings": warnings or ["No valid braking samples."],
+        }
+
+    all_speed = np.concatenate(pooled_speed)
+    cmin = float(np.nanpercentile(all_speed, 2.0))
+    cmax = float(np.nanpercentile(all_speed, 98.0))
+    if not (cmax > cmin):
+        cmin, cmax = float(np.nanmin(all_speed)), float(np.nanmax(all_speed)) + 1.0
+
+    def _speed_color(speed_kmh: float) -> str:
+        t = float(np.clip((speed_kmh - cmin) / (cmax - cmin), 0.0, 1.0))
+        return pc.sample_colorscale(_SPEED_COLORSCALE, [t])[0]
+
+    # Ideal load-proportional curves at representative braking speeds, coloured to match the
+    # point speed scale — read each point against the ideal curve of its own speed.
+    curve_limits: list[tuple[float, float]] = []
+    for speed_kmh in _IDEAL_BRAKE_CURVE_SPEEDS_KMH:
+        f_curve, r_curve, _ = _ideal_brake_forces(ax_grid, speed_kmh / 3.6)
+        curve_limits.append(
+            (float(np.nanmax(f_curve / 1000.0)), float(np.nanmax(r_curve / 1000.0)))
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=f_curve / 1000.0,
+                y=r_curve / 1000.0,
+                mode="lines",
+                line=dict(color=_speed_color(speed_kmh), width=2.6),
+                name=f"Ideal {speed_kmh:.0f} km/h",
+                hovertemplate="Ff=%{x:.2f} kN<br>Fr=%{y:.2f} kN<extra></extra>",
+            )
+        )
+
+    for idx, payload in enumerate(payloads):
+        run_name = str(payload["run_name"])
+        show_colorbar = idx == 0
+        fig.add_trace(
+            go.Scattergl(
+                x=payload["front_kN"],
+                y=payload["rear_kN"],
+                mode="markers",
+                marker=dict(
+                    color=payload["speed_kmh"],
+                    colorscale=_SPEED_COLORSCALE,
+                    cmin=cmin,
+                    cmax=cmax,
+                    size=4,
+                    opacity=0.5,
+                    symbol=symbols[idx % len(symbols)],
+                    colorbar=dict(title="Speed<br>[km/h]") if show_colorbar else None,
+                    showscale=show_colorbar,
+                ),
+                name=run_name if multi else "Measured braking",
+                customdata=payload["speed_kmh"],
+                hovertemplate=(
+                    f"{run_name}<br>Ff=%{{x:.2f}} kN<br>Fr=%{{y:.2f}} kN"
+                    "<br>v=%{customdata:.0f} km/h<extra></extra>"
+                ),
+            )
+        )
+
+    visible_front = [float(np.nanpercentile(p["front_kN"], 99.5)) for p in payloads]
+    visible_rear = [float(np.nanpercentile(p["rear_kN"], 99.5)) for p in payloads]
+    for fl, rl in curve_limits:
+        visible_front.append(fl)
+        visible_rear.append(rl)
+    x_max = max(visible_front) * 1.12
+    y_max = max(visible_rear) * 1.12
+    fig.update_layout(height=620, margin=dict(l=80, r=120, t=50, b=70), hovermode="closest")
+    fig.update_xaxes(range=[0.0, x_max])
+    fig.update_yaxes(range=[0.0, y_max])
+    return fig, {"runs": runs, "warnings": warnings, "mu_tire": MU_TIRE}
 
 
 def _ideal_traction_forces(
@@ -1921,6 +2481,7 @@ def ideal_traction_curve_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, d
                 "front_kN": ff_net / 1000.0,
                 "rear_kN": fr_net / 1000.0,
                 "ax": ax_m,
+                "speed_kmh": vx_m * 3.6,
                 "mean_vx": mean_vx,
             }
         )
@@ -1947,19 +2508,39 @@ def ideal_traction_curve_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, d
                 name=f"Ideal {payload['run_name']} ({mean_vx:.0f} m/s)",
             )
         )
-    for payload in payloads:
+    pooled_speed = (
+        np.concatenate([np.asarray(p["speed_kmh"]) for p in payloads])
+        if payloads
+        else np.array([0.0, 1.0])
+    )
+    cmin = float(np.nanpercentile(pooled_speed, 2.0))
+    cmax = float(np.nanpercentile(pooled_speed, 98.0))
+    if not (cmax > cmin):
+        cmin, cmax = float(np.nanmin(pooled_speed)), float(np.nanmax(pooled_speed)) + 1.0
+    for idx, payload in enumerate(payloads):
         run_name = str(payload["run_name"])
+        show_colorbar = idx == 0
+        customdata = np.column_stack([payload["ax"], payload["speed_kmh"]])
         fig.add_trace(
             go.Scattergl(
                 x=payload["front_kN"],
                 y=payload["rear_kN"],
                 mode="markers",
-                marker=dict(color=driver_color(run_name), size=4, opacity=0.46),
+                marker=dict(
+                    color=payload["speed_kmh"],
+                    colorscale=_SPEED_COLORSCALE,
+                    cmin=cmin,
+                    cmax=cmax,
+                    size=4,
+                    opacity=0.5,
+                    colorbar=dict(title="Speed<br>[km/h]") if show_colorbar else None,
+                    showscale=show_colorbar,
+                ),
                 name=f"{run_name} drive",
-                customdata=payload["ax"],
+                customdata=customdata,
                 hovertemplate=(
                     f"{run_name}<br>Ff=%{{x:.2f}} kN<br>Fr=%{{y:.2f}} kN"
-                    "<br>ax=%{customdata:.2f} m/s²<extra></extra>"
+                    "<br>ax=%{customdata[0]:.2f} m/s²<br>v=%{customdata[1]:.0f} km/h<extra></extra>"
                 ),
             )
         )
@@ -2099,112 +2680,140 @@ def accel_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     }
 
 
-def tractive_effort_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
-    """Total drive force vs speed with grip / torque / power bounds.
+_TRACTION_OPTIMAL_SR = 0.20  # team's optimal slip ratio under acceleration (TC setpoint)
+_TRACTION_STRAIGHT_AY_G = 0.5  # |ay| ceiling for "near-straight" so ax reflects pure drive grip
+_TRACTION_G_BIN = 0.1  # longitudinal-grip bin width [g]
+_TRACTION_G_MAX = 1.4  # grip axis ceiling [g]
 
-    The canonical tractive-effort diagram: measured drive force (sum of Est_FX
-    over the four wheels) against the three limiting envelopes — tyre grip,
-    motor-torque ceiling and the 80 kW power hyperbola. Est_FX are controller
-    estimates, not measured forces.
+
+def traction_slip_curve_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Per-axle drive slip ratio (Est_SR) vs longitudinal grip — vehicle behaviour.
+
+    How much each axle kinematically slips as accelerative grip builds; the on-throttle
+    mirror of the braking-slip figure. Restricted to near-straight, on-throttle samples
+    so the grip axis (measured ax) reflects pure drive grip — not cornering or
+    torque/power limiting. The +0.20 reference is the team's optimal drive SR (TC
+    setpoint). SR-vs-target control quality lives in Controls > TC, not here.
     """
     required = [
         "Filtering_VN_ax",
+        "Filtering_VN_ay",
         "VN_vx",
         "Throttle",
-        "Est_FXFL",
-        "Est_FXFR",
-        "Est_FXRL",
-        "Est_FXRR",
+        "Est_SRFL",
+        "Est_SRFR",
+        "Est_SRRL",
+        "Est_SRRR",
     ]
+    title = "Traction Slip Curve  ·  Est_SR vs longitudinal grip"
+    xlabel = "Longitudinal grip  ax [g]"
+    ylabel = "Drive slip ratio  [-]"
     if not dfs:
-        return _empty_xy_fig(
-            "Tractive Effort  ·  Drive Force vs Speed",
-            "Vehicle speed [m/s]",
-            "Drive force [kN]",
-            "No runs selected",
-        ), {"runs": {}, "warnings": ["No runs selected."]}
-    fig = make_dark_figure(
-        "Tractive Effort  ·  Drive Force vs Speed",
-        "Vehicle speed [m/s]",
-        "Drive force [kN]",
-    )
+        return _empty_xy_fig(title, xlabel, ylabel, "No runs selected"), {
+            "runs": {},
+            "warnings": ["No runs selected."],
+        }
+    multi = len(dfs) > 1
+    fig = make_dark_figure(title, xlabel, ylabel)
     warnings: list[str] = []
     runs: dict[str, dict[str, float]] = {}
-    f_max_seen = 1.0
     for run_name, df_in in dfs.items():
         df = ensure_complete_laps_df(df_in)
         missing = [c for c in required if c not in df.columns]
         if missing:
-            warnings.append(f"{run_name}: missing tractive-effort columns: {missing}")
+            warnings.append(f"{run_name}: missing traction-slip columns: {missing}")
             continue
         arr = cols_to_numpy(df, required)
         valid = _base_validity(*(arr[c] for c in required))
         arr = {k: v[valid] for k, v in arr.items()}
-        vx = np.abs(arr["VN_vx"])
         ax = arr["Filtering_VN_ax"]
-        total_n = arr["Est_FXFL"] + arr["Est_FXFR"] + arr["Est_FXRL"] + arr["Est_FXRR"]
-        m = (ax > 1.0) & (arr["Throttle"] > 5.0) & (total_n > 0.0) & np.isfinite(vx)
+        ax_g = ax / G_MPS2
+        ay_g = np.abs(arr["Filtering_VN_ay"]) / G_MPS2
+        vx = np.abs(arr["VN_vx"])
+        sr_front = 0.5 * (arr["Est_SRFL"] + arr["Est_SRFR"])
+        sr_rear = 0.5 * (arr["Est_SRRL"] + arr["Est_SRRR"])
+        m = (ax > 1.0) & (arr["Throttle"] > 5.0) & (vx > 3.0) & (ay_g < _TRACTION_STRAIGHT_AY_G)
         if not m.any():
-            warnings.append(f"{run_name}: no drive samples for tractive effort.")
+            warnings.append(f"{run_name}: no near-straight drive samples for traction slip.")
             continue
-        vx_m = vx[m]
-        f_kn = total_n[m] / 1000.0
-        f_max_seen = max(f_max_seen, float(np.nanpercentile(f_kn, 99.0)))
-        fx_tire_n, fx_torque_n, fx_power_n, _fx_max_n = _accel_envelope_curves(vx_m)
-        binding = np.argmin(np.vstack([fx_tire_n, fx_torque_n, fx_power_n]), axis=0)
-        stride = max(1, int(np.ceil(vx_m.size / 8000)))
-        color = driver_color(run_name)
-        fig.add_trace(
-            go.Scattergl(
-                x=vx_m[::stride],
-                y=f_kn[::stride],
-                mode="markers",
-                marker=dict(color=color, size=3, opacity=0.45),
-                name=run_name,
-                hovertemplate="vx=%{x:.1f} m/s<br>F=%{y:.2f} kN<extra></extra>",
-            )
+        grip_m, srf, srr = ax_g[m], sr_front[m], sr_rear[m]
+        centers_f, med_f, _ = _binned_percentile(
+            grip_m,
+            srf,
+            bin_width=_TRACTION_G_BIN,
+            x_min=0.0,
+            x_max=_TRACTION_G_MAX,
+            percentile=50.0,
         )
+        centers_r, med_r, _ = _binned_percentile(
+            grip_m,
+            srr,
+            bin_width=_TRACTION_G_BIN,
+            x_min=0.0,
+            x_max=_TRACTION_G_MAX,
+            percentile=50.0,
+        )
+        vf, vr = np.isfinite(med_f), np.isfinite(med_r)
+        if multi:
+            base = driver_color(run_name)
+            fig.add_trace(
+                go.Scatter(
+                    x=centers_f[vf],
+                    y=med_f[vf],
+                    mode="lines",
+                    line=dict(color=base, width=2.2),
+                    name=f"{run_name} front",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=centers_r[vr],
+                    y=med_r[vr],
+                    mode="lines",
+                    line=dict(color=base, width=2.2, dash="dot"),
+                    name=f"{run_name} rear",
+                )
+            )
+        else:
+            fig.add_trace(
+                go.Scatter(
+                    x=centers_f[vf],
+                    y=med_f[vf],
+                    mode="lines",
+                    line=dict(color=_AXLE_FRONT_COLOR, width=2.4),
+                    name="Front axle",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=centers_r[vr],
+                    y=med_r[vr],
+                    mode="lines",
+                    line=dict(color=_AXLE_REAR_COLOR, width=2.4),
+                    name="Rear axle",
+                )
+            )
+        sr_front_p95 = float(np.nanpercentile(srf, 95.0))
+        sr_rear_p95 = float(np.nanpercentile(srr, 95.0))
         runs[run_name] = {
-            "peak_drive_kN": float(np.nanpercentile(f_kn, 95.0)),
-            "pct_torque_limited": float(np.mean(binding == 1) * 100.0),
-            "pct_grip_limited": float(np.mean(binding == 0) * 100.0),
-            "pct_power_limited": float(np.mean(binding == 2) * 100.0),
+            "sr_front_median": float(np.nanmedian(srf)),
+            "sr_rear_median": float(np.nanmedian(srr)),
+            "sr_front_p95": sr_front_p95,
+            "sr_rear_p95": sr_rear_p95,
+            "axle_more_slip": "front" if sr_front_p95 >= sr_rear_p95 else "rear",
             "samples": int(m.sum()),
         }
-    v_grid = np.linspace(1.0, 40.0, 400)
-    fx_tire_n, fx_torque_n, fx_power_n, _ = _accel_envelope_curves(v_grid)
-    fig.add_trace(
-        go.Scatter(
-            x=v_grid,
-            y=fx_tire_n / 1000.0,
-            mode="lines",
-            line=dict(color="#73D973", width=1.8, dash="dash"),
-            name=f"Grip limit μ={MU_TIRE:.2f}",
-        )
+    fig.add_hline(
+        y=_TRACTION_OPTIMAL_SR,
+        line=dict(color="#73D973", width=1.4, dash="dot"),
+        annotation_text=f"optimal SR +{_TRACTION_OPTIMAL_SR:.2f}",
+        annotation_position="top left",
     )
-    fig.add_trace(
-        go.Scatter(
-            x=v_grid,
-            y=fx_torque_n / 1000.0,
-            mode="lines",
-            line=dict(color="#5BC8F5", width=1.8, dash="dash"),
-            name=f"Torque limit ({N_MOTORS}x{T_MOTOR_MAX_NM:.0f} Nm)",
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=v_grid,
-            y=fx_power_n / 1000.0,
-            mode="lines",
-            line=dict(color="#F2D44D", width=1.8, dash="dash"),
-            name=f"Power limit {MAX_POWER_W / 1000:.0f} kW",
-        )
-    )
-    y_max = max(f_max_seen * 1.1, float(np.nanmax(fx_torque_n) / 1000.0) * 1.1)
+    fig.add_hline(y=0.0, line=dict(color="rgba(235,235,235,0.35)", width=1.0))
     fig.update_layout(height=520, margin=dict(l=70, r=30, t=50, b=65))
-    fig.update_xaxes(range=[0.0, 40.0])
-    fig.update_yaxes(range=[0.0, y_max])
-    return fig, {"runs": runs, "warnings": warnings, "mu_tire": MU_TIRE}
+    fig.update_xaxes(range=[0.0, _TRACTION_G_MAX])
+    fig.update_yaxes(range=[-0.08, 0.35])
+    return fig, {"runs": runs, "warnings": warnings, "optimal_sr": _TRACTION_OPTIMAL_SR}
 
 
 def axle_traction_utilisation_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
@@ -2504,7 +3113,7 @@ def lateral_grip_envelope_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, 
             centers, p95, _ = _binned_percentile(
                 vx[sm],
                 np.abs(ay_g[sm]),
-                bin_width=2.0,
+                bin_width=1.0,
                 x_min=0.0,
                 x_max=40.0,
                 percentile=95.0,
@@ -2594,11 +3203,7 @@ def cornering_balance_phase_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure
             continue
         laps = d["laps"]
         lap_ids = unique_laps(laps)
-        valid_laps = (
-            lap_ids[(lap_ids > 0) & (lap_ids != np.nanmax(lap_ids))]
-            if lap_ids.size
-            else np.array([])
-        )
+        valid_laps = lap_ids[lap_ids > 0]
         if valid_laps.size == 0:
             warnings.append(f"{run_name}: no valid laps for corner phases.")
             continue
@@ -3186,19 +3791,37 @@ def steering_vs_ay_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
     ay_c = ay[cm]
     steer_c = np.rad2deg(steer[cm])
     vx_c = vx[cm]
+    speed_kmh = np.abs(vx_c) * 3.6
 
     fig = make_dark_figure(
         title="Steering vs Lateral Acceleration  ·  US/OS handling curve",
         xlabel="Lateral acceleration ay [m/s²]",
         ylabel="Steering [deg]",
     )
+    cmin = float(np.nanpercentile(speed_kmh, 2.0))
+    cmax = float(np.nanpercentile(speed_kmh, 98.0))
+    if not (cmax > cmin):
+        cmin, cmax = float(np.nanmin(speed_kmh)), float(np.nanmax(speed_kmh)) + 1.0
     fig.add_trace(
         go.Scattergl(
             x=ay_c,
             y=steer_c,
             mode="markers",
-            marker=dict(color="#4DB3F2", size=3, opacity=0.45),
+            marker=dict(
+                color=speed_kmh,
+                colorscale=_SPEED_COLORSCALE,
+                cmin=cmin,
+                cmax=cmax,
+                size=2.7,
+                opacity=0.64,
+                colorbar=dict(title="Speed<br>[km/h]"),
+                showscale=True,
+            ),
             name="Samples",
+            customdata=speed_kmh,
+            hovertemplate=(
+                "ay=%{x:.2f} m/s²<br>δ=%{y:.2f}°<br>v=%{customdata:.0f} km/h<extra></extra>"
+            ),
         )
     )
 
@@ -3213,7 +3836,7 @@ def steering_vs_ay_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
                 y=ideal_deg,
                 mode="lines",
                 line=dict(color="#73D973", dash="dash", width=2.0),
-                name=f"Ideal δ = L·ay/vx² (vx={vx_ref:.1f} m/s)",
+                name=f"Ideal δ (vx={vx_ref:.1f} m/s)",
             )
         )
 
@@ -3229,13 +3852,25 @@ def steering_vs_ay_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
                 y=slope * xfit + intercept,
                 mode="lines",
                 line=dict(color="#F28C40", width=2.2),
-                name=f"Linear fit  ·  {slope:+.3f} deg/(m/s²)",
+                name=f"Linear fit ({slope:+.3f} deg/(m/s²))",
             )
         )
         grad_deg_per_g = float(slope) * 9.81
 
     fig.add_hline(y=0.0, line=dict(color="rgba(200,200,200,0.4)", dash="dot", width=1))
     fig.add_vline(x=0.0, line=dict(color="rgba(200,200,200,0.4)", dash="dot", width=1))
+    fig.update_layout(
+        margin=dict(l=95, r=45, t=75, b=85),
+        legend=dict(
+            orientation="v",
+            yanchor="top",
+            y=0.98,
+            xanchor="left",
+            x=0.01,
+            font=dict(size=14),
+            bgcolor="rgba(20,20,23,0.78)",
+        ),
+    )
 
     kpis = {
         "samples": int(ay_c.size),

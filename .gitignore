@@ -17,3 +17,14 @@ AGENTS.md
 .playwright-mcp/
 docs/
 ggv/
+tests/
+screenshots/
+
+# Local tooling / environment
+.venv/
+.ruff_cache/
+.vscode/
+*.log
+.env
+*.env
+secrets.toml

@@ -428,10 +428,25 @@ def gg_scatter_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     fig.update_layout(
         height=_OVERVIEW_FIG_HEIGHT,
         margin=dict(l=58, r=22, t=48, b=52),
+        title=dict(y=0.98, yanchor="top"),
+        legend=dict(
+            orientation="h",
+            x=0.5,
+            xanchor="center",
+            y=0.89,
+            yanchor="top",
+            font=dict(size=11),
+        ),
         hovermode="closest",
     )
     fig.update_xaxes(range=[-lim, lim], dtick=1.0)
-    fig.update_yaxes(range=[-lim, lim], dtick=1.0, scaleanchor="x", scaleratio=1)
+    fig.update_yaxes(
+        range=[-lim, lim],
+        domain=[0.0, 0.78],
+        dtick=1.0,
+        scaleanchor="x",
+        scaleratio=1,
+    )
     return fig, {"runs": runs, "warnings": warnings}
 
 
@@ -715,9 +730,10 @@ def grip_factor_radar_fig(
     fig = make_dark_figure(title="Grip by phase · radar")
     fig.update_layout(
         height=_OVERVIEW_FIG_HEIGHT,
-        margin=dict(l=50, r=50, t=64, b=40),
+        margin=dict(l=50, r=50, t=76, b=40),
         polar=dict(
             bgcolor="#141417",
+            domain=dict(y=[0.0, 0.84]),
             angularaxis=dict(
                 color="#E5E5E5",
                 gridcolor="rgba(128,128,128,0.25)",
@@ -729,11 +745,13 @@ def grip_factor_radar_fig(
                 color="#E5E5E5",
                 gridcolor="rgba(128,128,128,0.25)",
                 linecolor="rgba(128,128,128,0.4)",
+                angle=90,
                 tickformat=".2f",
             ),
         ),
         showlegend=True,
     )
+    fig.update_layout(legend=dict(y=0.96, yanchor="top"))
 
     theta = list(GRIP_CATEGORIES) + [GRIP_CATEGORIES[0]]
     for run_name, table in tables_by_run.items():

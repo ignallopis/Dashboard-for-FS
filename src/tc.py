@@ -1,16 +1,17 @@
 """tc.py
 ------
-Traction Control (TC) control-behaviour figures (redesign 2026-06-16).
+Traction Control (TC) figures — one per controller reference (redesign 2026-06-21).
 
-Spine — engage → fight/aim → hold — event-based on the TC-armed segments
-(``TCenable == 1``) so it works on acceleration logs (laps 0→1) and circuit logs
-alike, never the complete-laps filter (which needs ≥2 laps and erases an accel run):
-  1. ``tc_engagement_fig``        — did TC arm at the right moment, and for how long?
-  2. ``tc_slip_distribution_fig`` — what it fights: per-wheel slip vs +0.20 / +0.33.
-  3. ``tc_fidelity_fig`` (toggled) — does it hold its reference?
-                                     old car = velocity cap, new car = torque cut.
+Event-based on the TC-armed segments (``TCenable == 1``) so it works on acceleration
+logs (laps 0→1) and circuit logs alike, never the complete-laps filter (which needs ≥2
+laps and erases an accel run). One figure per stage of the TC pipeline:
+  1. ``tc_optimal_slip_ratio_fig`` — setpoint: achieved slip vs the +0.20 optimum and the
+                                     controller's own target (backed out from the cap).
+  2. ``tc_reference_velocity_fig`` — does the wheel hold the TC velocity reference?
+  3. ``tc_reference_torque_fig``   — actuation effort (torque cut); placeholder until a
+                                     torque-mode (new-car) log carries a live cut.
 
-Spec: docs/superpowers/specs/2026-06-16-tc-control-section-redesign-design.md
+Spec: docs/superpowers/specs/2026-06-21-controls-tc-three-references-redesign-design.md
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from utils import (
     make_dark_figure,
 )
 
-CSV_PATH = "data/run8_2025-08-09.csv"
+CSV_PATH = "data/Acceleration_FSS.csv"
 WHEELS = ("FL", "FR", "RL", "RR")
 
 # ── TC parameters ─────────────────────────────────────────────────────────────
@@ -39,16 +40,14 @@ def _vx_signal(columns: list[str]) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Event-based TC control section (redesign 2026-06-16)
+# One figure per TC controller reference (redesign 2026-06-21).
 #
-# Spec: docs/superpowers/specs/2026-06-16-tc-control-section-redesign-design.md
-# Spine: engage → fight/aim → hold. Works on acceleration logs (laps 0→1) AND
-# circuit logs because the analysis window is the TC-armed segments (TCenable==1),
-# NOT the complete-laps filter (which needs ≥2 laps and erases an accel run).
+# Spec: docs/superpowers/specs/2026-06-21-controls-tc-three-references-redesign-design.md
+# The analysis window is the TC-armed segments (TCenable==1), NOT the complete-laps
+# filter (which needs ≥2 laps and erases an accel run), so it works on FSS accel logs.
 # ══════════════════════════════════════════════════════════════════════════════
 
 TC_VX_GUARD = 2.0  # [m/s] below this, slip ratio is unreliable (standing start)
-SR_CAP_IMPLIED = 0.33  # old-car velocity-cap implied slip setpoint (vs SR_TARGET 0.20)
 SR_DISPLAY_CLIP = 1.0  # clip Est_SR for display/aggregation (it carries ±inf artifacts)
 
 
@@ -125,22 +124,22 @@ def _worst_sr(d: dict[str, np.ndarray], sl: slice | np.ndarray) -> np.ndarray:
     return out
 
 
-def tc_slip_distribution_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
-    """Fig 2 — Slip distribution: where is traction lost while TC is armed?
+def tc_optimal_slip_ratio_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Fig 1 — Optimal slip ratio: where the tyre operated, vs the +0.20 optimum.
 
-    A box per wheel of the slip ratio (Est_SR) inside TC-armed segments — median, IQR and
-    spread — against the +0.20 team optimum and the +0.33 old-car velocity-cap target.
-    Fronts towering over rears = a front-limited launch (load goes rearward, unloading the
-    front tyres); a box pushing past +0.33 means the wheels escape the cap.
+    Per-wheel distribution of the slip ratio reached while TC is armed (Est_SR, guarded to
+    vx>2 m/s and clipped — the standing-start estimate explodes), against the +0.20 grip
+    optimum. An operating-point read — *where slip landed* — NOT a control-quality one.
     """
     fig = make_dark_figure(
-        "TC slip distribution  ·  what it fights, where",
+        "TC optimal slip ratio  ·  where the tyre operates vs +0.20",
         "Wheel",
         "Slip ratio [-]",
+        height=520,
     )
     runs: dict[str, dict] = {}
     warnings: list[str] = []
-    any_run = False
+    samples: dict[str, list[np.ndarray]] = {w: [] for w in WHEELS}
     for run_name, df in dfs.items():
         try:
             d = _tc_event_arrays(df)
@@ -151,45 +150,48 @@ def tc_slip_distribution_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, d
         if not armed.any():
             warnings.append(f"{run_name}: no TC-armed samples.")
             continue
-        color = driver_color(run_name)
         p95: dict[str, float] = {}
+        over: dict[str, float] = {}
         nper: dict[str, int] = {}
-        plotted = False
         for w in WHEELS:
-            s = d[f"sr_{w}"][armed]
-            s = s[np.isfinite(s)]
+            sr = d[f"sr_{w}"]
+            s = sr[armed & np.isfinite(sr)]
             nper[w] = int(s.size)
             if s.size < 5:
-                p95[w] = np.nan
+                p95[w] = over[w] = np.nan
                 continue
             p95[w] = float(np.nanpercentile(s, 95))
-            fig.add_trace(
-                go.Box(
-                    y=s,
-                    x=[w] * s.size,
-                    name=run_name,
-                    legendgroup=run_name,
-                    showlegend=not plotted,
-                    marker_color=color,
-                    line=dict(color=color),
-                    boxpoints=False,
-                    whiskerwidth=0.5,
-                )
-            )
-            plotted = True
-        if not plotted:
+            over[w] = 100.0 * float(np.mean(s > SR_TARGET))
+            samples[w].append(s)
+        if all(not np.isfinite(p95[w]) for w in WHEELS):
             warnings.append(f"{run_name}: too few armed slip samples.")
             continue
-        any_run = True
         p95arr = [p95[w] for w in WHEELS]
+        over_arr = [over[w] for w in WHEELS]
         runs[run_name] = {
             "front_p95_sr": round(float(np.nanmax(p95arr[:2])), 3),
             "rear_p95_sr": round(float(np.nanmax(p95arr[2:])), 3),
             "worst_wheel": WHEELS[int(np.nanargmax(p95arr))],
+            "pct_time_over_target": round(float(np.nanmax(over_arr)), 1),
             "armed_samples": int(sum(nper.values())),
         }
 
-    if any_run:
+    if any(samples[w] for w in WHEELS):
+        for w in WHEELS:
+            if not samples[w]:
+                continue
+            s = np.concatenate(samples[w])
+            fig.add_trace(
+                go.Box(
+                    y=s,
+                    name=w,
+                    marker_color=WHEEL_COLORS[w],
+                    line_color=WHEEL_COLORS[w],
+                    boxpoints=False,
+                    whiskerwidth=0.4,
+                    hovertemplate=f"{w}<br>SR=%{{y:.2f}}<extra></extra>",
+                )
+            )
         fig.add_hline(
             y=SR_TARGET,
             line=dict(color="rgba(255,255,255,0.6)", dash="dash", width=1.3),
@@ -197,104 +199,26 @@ def tc_slip_distribution_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, d
             annotation_position="top left",
             annotation_font_color="#EBEBEB",
         )
-        fig.add_hline(
-            y=SR_CAP_IMPLIED,
-            line=dict(color="rgba(242,140,64,0.75)", dash="dot", width=1.3),
-            annotation_text="old-car cap +0.33",
-            annotation_position="bottom left",
-            annotation_font_color="#F28C40",
-        )
-        fig.update_layout(boxmode="group")
-        fig.update_xaxes(categoryorder="array", categoryarray=list(WHEELS))
         fig.update_yaxes(range=[-0.15, 0.8])
+        fig.update_xaxes(categoryorder="array", categoryarray=list(WHEELS))
     else:
         _annotate_empty_tc(fig)
     return fig, {"runs": runs, "warnings": warnings}
 
 
-def tc_overslip_severity_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
-    """Fig 3 — Overslip severity: how much armed time each wheel spends past +0.20.
+def tc_reference_velocity_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Fig 2 — Reference velocity: does the wheel hold the TC velocity reference?
 
-    Per wheel, the share of TC-armed time the slip ratio exceeds the +0.20 optimum (bar)
-    vs the +0.33 old-car escape line (hover) — an operating-point *persistence* gauge of
-    where traction is lost, NOT a controller response time (the cut channel is unrecorded
-    on these logs). Taller = the wheel rides in overslip more of the time it is armed.
+    Per-wheel actual motor speed vs the TC velocity reference (TC_*_MaxAngVel) inside armed
+    segments, both in motor rad/s; on the y=x line the wheel sits exactly at its reference,
+    above it the wheel escaped the cap. Leads on the escape rate — the share of armed time
+    each axle ran past its reference.
     """
     fig = make_dark_figure(
-        "TC overslip severity  ·  share of armed time past +0.20",
-        "Wheel",
-        "Armed time over target [%]",
-    )
-    runs: dict[str, dict] = {}
-    warnings: list[str] = []
-    any_run = False
-    for run_name, df in dfs.items():
-        try:
-            d = _tc_event_arrays(df)
-        except Exception as exc:
-            warnings.append(f"{run_name}: {exc}")
-            continue
-        armed = d["armed"]
-        if not armed.any():
-            warnings.append(f"{run_name}: no TC-armed samples.")
-            continue
-        color = driver_color(run_name)
-        over: dict[str, float] = {}
-        severe: dict[str, float] = {}
-        peak: dict[str, float] = {}
-        nper: dict[str, int] = {}
-        for w in WHEELS:
-            s = d[f"sr_{w}"][armed]
-            s = s[np.isfinite(s)]
-            nper[w] = int(s.size)
-            if s.size < 5:
-                over[w] = severe[w] = peak[w] = np.nan
-                continue
-            over[w] = 100.0 * float(np.mean(s > SR_TARGET))
-            severe[w] = 100.0 * float(np.mean(s > SR_CAP_IMPLIED))
-            peak[w] = float(np.nanpercentile(s, 95))
-        if all(not np.isfinite(over[w]) for w in WHEELS):
-            warnings.append(f"{run_name}: too few armed slip samples.")
-            continue
-        any_run = True
-        fig.add_trace(
-            go.Bar(
-                x=list(WHEELS),
-                y=[over[w] for w in WHEELS],
-                name=run_name,
-                marker_color=color,
-                customdata=[[severe[w], peak[w]] for w in WHEELS],
-                hovertemplate=(
-                    "%{x}<br>over +0.20=%{y:.1f}%<br>over +0.33=%{customdata[0]:.1f}%"
-                    "<br>p95 peak SR=%{customdata[1]:.2f}"
-                    f"<extra>{run_name}</extra>"
-                ),
-            )
-        )
-        over_vals = [over[w] for w in WHEELS]
-        peak_vals = [peak[w] for w in WHEELS if np.isfinite(peak[w])]
-        worst = WHEELS[int(np.nanargmax(over_vals))]
-        runs[run_name] = {
-            "worst_wheel": worst,
-            "pct_time_over_target": round(float(np.nanmax(over_vals)), 1),
-            "p95_peak_sr": round(float(np.nanmax(peak_vals)), 3) if peak_vals else float("nan"),
-            "armed_samples": int(sum(nper.values())),
-        }
-    if any_run:
-        fig.update_layout(barmode="group")
-        fig.update_xaxes(categoryorder="array", categoryarray=list(WHEELS))
-        fig.update_yaxes(rangemode="tozero")
-    else:
-        _annotate_empty_tc(fig)
-    return fig, {"runs": runs, "warnings": warnings}
-
-
-def _fidelity_velocity_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
-    """OLD car: actual wheel speed vs the TC velocity cap (its own reference)."""
-    fig = make_dark_figure(
-        "TC control fidelity  ·  wheel speed vs velocity cap (old car)",
-        "TC velocity cap [rad/s]",
+        "TC reference velocity  ·  wheel speed vs the TC velocity reference",
+        "TC velocity reference [rad/s]",
         "Actual wheel speed [rad/s]",
+        height=520,
     )
     runs: dict[str, dict] = {}
     warnings: list[str] = []
@@ -314,10 +238,12 @@ def _fidelity_velocity_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dic
             continue
         over: dict[str, float] = {}
         p95r: dict[str, float] = {}
+        nper: dict[str, int] = {}
         for w in WHEELS:
             cap = d[f"cap_{w}"][armed]
             wv = d[f"wv_{w}"][armed]
             m = np.isfinite(cap) & np.isfinite(wv) & (cap > 1.0)
+            nper[w] = int(m.sum())
             if m.sum() < 5:
                 continue
             x = cap[m]
@@ -333,7 +259,7 @@ def _fidelity_velocity_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dic
                     name=w,
                     legendgroup=w,
                     showlegend=w not in shown,
-                    hovertemplate=f"{run_name} {w}<br>cap=%{{x:.0f}}<br>actual=%{{y:.0f}} rad/s<extra></extra>",
+                    hovertemplate=f"{run_name} {w}<br>ref=%{{x:.0f}}<br>actual=%{{y:.0f}} rad/s<extra></extra>",
                 )
             )
             shown.add(w)
@@ -344,10 +270,11 @@ def _fidelity_velocity_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dic
             hi_all.append(float(max(x.max(), y.max())))
         if over:
             runs[run_name] = {
-                "front_over_cap_pct": round(max(over.get("FL", 0.0), over.get("FR", 0.0)), 1),
-                "rear_over_cap_pct": round(max(over.get("RL", 0.0), over.get("RR", 0.0)), 1),
+                "front_escape_pct": round(max(over.get("FL", 0.0), over.get("FR", 0.0)), 1),
+                "rear_escape_pct": round(max(over.get("RL", 0.0), over.get("RR", 0.0)), 1),
                 "front_p95_ratio": round(max(p95r.get("FL", 0.0), p95r.get("FR", 0.0)), 2),
                 "rear_p95_ratio": round(max(p95r.get("RL", 0.0), p95r.get("RR", 0.0)), 2),
+                "armed_samples": int(sum(nper.values())),
             }
     if any_pts and lo_all:
         lo = min(lo_all)
@@ -358,7 +285,7 @@ def _fidelity_velocity_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dic
                 y=[lo, hi],
                 mode="lines",
                 line=dict(color="#73D973", dash="dash", width=2.0),
-                name="holds the cap (y=x)",
+                name="holds the reference (y=x)",
             )
         )
     else:
@@ -366,12 +293,19 @@ def _fidelity_velocity_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dic
     return fig, {"runs": runs, "warnings": warnings}
 
 
-def _fidelity_torque_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
-    """NEW car: torque cut vs slip-over-target (PI response). Dark until new-car data."""
+def tc_reference_torque_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """Fig 3 — Reference torque: how hard TC cuts torque to hold the reference.
+
+    Total TC torque cut (TC_*_MaxTrq, ≤0, summed over the four wheels) against the worst
+    wheel's slip over the +0.20 target, inside armed segments — the actuation effort vs the
+    error driving it. Empty on velocity-mode logs (old car), where the cut is done inside
+    the inverter and TC_*_MaxTrq is not recorded; lights up on torque-mode (new-car) logs.
+    """
     fig = make_dark_figure(
-        "TC control fidelity  ·  torque cut vs slip error (new car)",
-        "Worst-wheel slip over target [-]",
+        "TC reference torque  ·  torque cut vs slip over target",
+        "Worst-wheel slip over +0.20 [-]",
         "TC torque cut applied [Nm]",
+        height=520,
     )
     runs: dict[str, dict] = {}
     warnings: list[str] = []
@@ -411,34 +345,24 @@ def _fidelity_torque_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]
         fig.add_hline(y=0.0, line=dict(color="#9AA0A6", dash="dash", width=1.2))
     else:
         _annotate_empty_tc(
-            fig, "No torque-cut data in this log (old-car velocity TC, or TC never cut)"
+            fig,
+            "No torque cut recorded — TC ran in velocity mode (old car); "
+            "this figure lights up on new-car torque-mode logs.",
         )
     return fig, {"runs": runs, "warnings": warnings}
 
 
-def tc_fidelity_fig(dfs: dict[str, pl.DataFrame], mode: str = "velocity") -> tuple[go.Figure, dict]:
-    """Fig 4 — Control fidelity (toggled): how tightly does TC hold its reference?
-
-    mode='velocity' (old car): actual wheel speed vs the TC velocity cap, y=x = perfect
-    hold; points above = the wheel escaped the cap.
-    mode='torque' (new car): torque cut vs slip-over-target (PI response); shows an
-    explicit empty-state until new-car logs carry a live cut.
-    """
-    if mode == "torque":
-        return _fidelity_torque_fig(dfs)
-    return _fidelity_velocity_fig(dfs)
-
-
 def main() -> None:
-    """Standalone smoke test of the TC control figures on CSV_PATH."""
+    """Standalone smoke test of the TC reference figures on CSV_PATH."""
     df = pl.read_csv(CSV_PATH, infer_schema_length=2000)
     dfs = {CSV_PATH: df}
-    mode = tc_mode_for_df(df)
-    print(f"TC actuation detected: {mode}")
-    _, kpis = tc_slip_distribution_fig(dfs)
-    print("slip_distribution", kpis["runs"], kpis["warnings"])
-    _, kpis = tc_fidelity_fig(dfs, mode=mode)
-    print("fidelity", kpis["runs"], kpis["warnings"])
+    print(f"TC actuation detected: {tc_mode_for_df(df)}")
+    _, kpis = tc_optimal_slip_ratio_fig(dfs)
+    print("optimal_slip_ratio", kpis["runs"], kpis["warnings"])
+    _, kpis = tc_reference_velocity_fig(dfs)
+    print("reference_velocity", kpis["runs"], kpis["warnings"])
+    _, kpis = tc_reference_torque_fig(dfs)
+    print("reference_torque", kpis["runs"], kpis["warnings"])
 
 
 if __name__ == "__main__":

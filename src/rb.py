@@ -387,6 +387,222 @@ def rb_saturation_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     return fig, {"runs": runs, "warnings": warnings}
 
 
+# ── RB regen-as-delivered figures (Controls redesign 2026-06-20) ───────────────
+# RB's own published channels (RB_*_Trq, RB_Enable) read zero on the available logs
+# (logging artifact). The CAT17x brakes with regen only, so these figures read regen
+# as actually delivered from LIVE channels (battery Current/Vbat, deceleration).
+G_MPS2 = 9.81
+REGEN_CURRENT_CAP_A = 80.0  # battery max regen current [A] (cat17x_parameters.md)
+CAPTURE_MIN_KE_J = 2000.0  # ignore low-energy coast events
+CAPTURE_MIN_EVENT_SAMPLES = 10
+REGEN_MAP_MIN_DECEL_G = 0.05  # below this it is coasting, not braking
+
+
+def _braking_events(brake: np.ndarray, thr: float = BRAKE_THRESHOLD) -> list[tuple[int, int]]:
+    """Contiguous [start, end] index spans where brake >= thr."""
+    events: list[tuple[int, int]] = []
+    idx = np.flatnonzero(np.isfinite(brake) & (brake >= thr))
+    if idx.size == 0:
+        return events
+    start = prev = int(idx[0])
+    for i in idx[1:]:
+        i = int(i)
+        if i != prev + 1:
+            events.append((start, prev))
+            start = i
+        prev = i
+    events.append((start, prev))
+    return events
+
+
+def rb_capture_ratio_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """R2 — Regen capture ratio: electrical energy recovered ÷ kinetic energy shed.
+
+    Per braking event, of the kinetic energy the car shed (½·m·Δv²) what fraction came back
+    to the battery (∫ −Vbat·Current dt while regenerating). The rest goes to the front
+    friction brakes (67 % front by design) and drag, so the ratio is always < 1 — it reads
+    recovery *efficiency*, not absolute Wh (that is Powertrain's energy-per-lap). Battery-bus
+    electrical energy, not motor-shaft.
+    """
+    fig = make_dark_figure(
+        "RB capture ratio  ·  recovered ÷ braking energy",
+        "Braking energy shed [kJ]",
+        "Capture ratio [-]",
+        height=520,
+    )
+    runs: dict[str, dict] = {}
+    warnings: list[str] = []
+    any_pts = False
+    for run_name, df in dfs.items():
+        need = ["Brake", RB_CURRENT_COL, "Vbat", _vx_signal(df.columns)]
+        missing = [c for c in need if c not in df.columns]
+        if missing:
+            warnings.append(f"{run_name}: missing {missing[:3]}…")
+            continue
+        try:
+            d = ensure_complete_laps_df(df)
+        except ValueError as exc:
+            warnings.append(f"{run_name}: {exc}")
+            continue
+        brake = d["Brake"].to_numpy().astype(float)
+        cur = d[RB_CURRENT_COL].to_numpy().astype(float)
+        vb = d["Vbat"].to_numpy().astype(float)
+        vx = d[_vx_signal(d.columns)].to_numpy().astype(float)
+        dt = robust_dt(d["TimeStamp"].to_numpy().astype(float))
+        ke_kj: list[float] = []
+        ratios: list[float] = []
+        tot_re = tot_ke = 0.0
+        for s, e in _braking_events(brake):
+            if e - s < CAPTURE_MIN_EVENT_SAMPLES:
+                continue
+            v0, v1 = vx[s], vx[e]
+            if not (np.isfinite(v0) and np.isfinite(v1)):
+                continue
+            ke = 0.5 * VEHICLE_MASS_KG * (v0 * v0 - v1 * v1)
+            if ke <= CAPTURE_MIN_KE_J:
+                continue
+            p_regen = np.clip(-(vb[s : e + 1] * cur[s : e + 1]), 0.0, None)
+            re = float(np.nansum(p_regen) * dt)
+            ke_kj.append(ke / 1000.0)
+            ratios.append(re / ke)
+            tot_re += re
+            tot_ke += ke
+        if len(ratios) < 3:
+            warnings.append(f"{run_name}: too few braking events with energy.")
+            continue
+        any_pts = True
+        color = driver_color(run_name)
+        fig.add_trace(
+            go.Scattergl(
+                x=ke_kj,
+                y=ratios,
+                mode="markers",
+                marker=dict(color=color, size=6, opacity=0.55),
+                name=run_name,
+                hovertemplate=f"{run_name}<br>KE=%{{x:.1f}} kJ<br>capture=%{{y:.2f}}<extra></extra>",
+            )
+        )
+        med = float(np.median(ratios))
+        fig.add_hline(y=med, line=dict(color=color, dash="dash", width=1.2), opacity=0.7)
+        runs[run_name] = {
+            "capture_ratio_median": round(med, 3),
+            "capture_ratio_overall": round(tot_re / tot_ke, 3) if tot_ke > 0 else float("nan"),
+            "events": len(ratios),
+            "samples": len(ratios),
+        }
+    if any_pts:
+        fig.update_yaxes(range=[0.0, 1.0])
+    else:
+        fig.add_annotation(
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            text="No braking-energy events in this log",
+            font=dict(color="#EBEBEB", size=12),
+        )
+    return fig, {"runs": runs, "warnings": warnings}
+
+
+def rb_regen_brake_map_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+    """R3 — Regen vs brake-demand: delivered pack regen current vs deceleration, and the cap.
+
+    During braking, how hard regen pulls (battery current) against how hard the car
+    decelerates, coloured by speed (regen current ≈ T·ω/V, so speed explains the spread).
+    The flat 80 A line is the battery regen-current cap — points sitting below it are recovery
+    headroom, points reaching it are battery-limited.
+    """
+    fig = make_dark_figure(
+        "RB regen vs brake-demand  ·  pack current vs deceleration",
+        "Deceleration [g]",
+        "Regen current [A]",
+        height=520,
+    )
+    runs: dict[str, dict] = {}
+    warnings: list[str] = []
+    any_pts = False
+    for run_name, df in dfs.items():
+        ax_col = _ax_signal(df.columns)
+        vx_col = _vx_signal(df.columns)
+        need = ["Brake", RB_CURRENT_COL, ax_col, vx_col]
+        missing = [c for c in need if c not in df.columns]
+        if missing:
+            warnings.append(f"{run_name}: missing {missing[:3]}…")
+            continue
+        try:
+            d = ensure_complete_laps_df(df)
+        except ValueError as exc:
+            warnings.append(f"{run_name}: {exc}")
+            continue
+        brake = d["Brake"].to_numpy().astype(float)
+        cur = d[RB_CURRENT_COL].to_numpy().astype(float)
+        ax = d[ax_col].to_numpy().astype(float)
+        vx = d[vx_col].to_numpy().astype(float)
+        decel_g = np.clip(-ax, 0.0, None) / G_MPS2
+        regen_a = np.clip(-cur, 0.0, None)
+        m = (
+            (brake >= BRAKE_THRESHOLD)
+            & np.isfinite(decel_g)
+            & np.isfinite(regen_a)
+            & np.isfinite(vx)
+            & (decel_g > REGEN_MAP_MIN_DECEL_G)
+        )
+        if m.sum() < 20:
+            warnings.append(f"{run_name}: too few braking samples.")
+            continue
+        any_pts = True
+        stride = max(1, int(np.ceil(int(m.sum()) / 5000)))
+        xg = decel_g[m][::stride]
+        ya = regen_a[m][::stride]
+        vc = vx[m][::stride]
+        fig.add_trace(
+            go.Scattergl(
+                x=xg,
+                y=ya,
+                mode="markers",
+                marker=dict(
+                    color=vc,
+                    colorscale="Viridis",
+                    size=4,
+                    opacity=0.45,
+                    colorbar=dict(title="Speed [m/s]"),
+                    showscale=True,
+                ),
+                name=run_name,
+                hovertemplate=f"{run_name}<br>decel=%{{x:.2f}} g<br>regen=%{{y:.0f}} A<extra></extra>",
+            )
+        )
+        p95 = float(np.nanpercentile(regen_a[m], 95))
+        runs[run_name] = {
+            "p95_regen_current_a": round(p95, 1),
+            "current_authority_pct": round(100.0 * p95 / REGEN_CURRENT_CAP_A, 0),
+            "pct_at_cap": round(100.0 * float(np.mean(regen_a[m] >= REGEN_CURRENT_CAP_A)), 1),
+            "samples": int(m.sum()),
+        }
+    if any_pts:
+        fig.add_hline(
+            y=REGEN_CURRENT_CAP_A,
+            line=dict(color="#F2C744", dash="dash", width=2.0),
+            annotation_text="battery cap 80 A",
+            annotation_position="top left",
+            annotation_font_color="#F2C744",
+        )
+        fig.update_yaxes(rangemode="tozero")
+        fig.update_xaxes(rangemode="tozero")
+    else:
+        fig.add_annotation(
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            text="No braking samples in this log",
+            font=dict(color="#EBEBEB", size=12),
+        )
+    return fig, {"runs": runs, "warnings": warnings}
+
+
 def _load(columns: list[str]) -> dict[str, np.ndarray]:
     df = pl.read_csv(CSV_PATH, columns=columns)
     return cols_to_numpy(df, columns)

@@ -27,7 +27,7 @@ from utils import cols_to_numpy, read_telemetry_csv
 
 # ── Default detection parameters ──────────────────────────────────────────────
 _EARTH_RADIUS_M = 6_378_137.0
-_LAPCOUNT_ALGO_VERSION = 4
+_LAPCOUNT_ALGO_VERSION = 5
 _LAPCOUNT_VERSION_COL = "lapcount_version"
 _LAPCOUNT_MIN_VEL_COL = "lapcount_min_vel_mps"
 _LAPCOUNT_GATE_HALF_WIDTH_COL = "lapcount_gate_half_width_m"
@@ -37,9 +37,15 @@ _LAPCOUNT_GATE_LON0_COL = "lapcount_gate_lon0_deg"
 _LAPCOUNT_GATE_LAT0_COL = "lapcount_gate_lat0_deg"
 _LAPCOUNT_GATE_LON1_COL = "lapcount_gate_lon1_deg"
 _LAPCOUNT_GATE_LAT1_COL = "lapcount_gate_lat1_deg"
+# Second gate line, only used by autocross (start line lives in the gate cols
+# above, finish line in these). NaN for every other mode.
+_LAPCOUNT_GATE2_LON0_COL = "lapcount_gate2_lon0_deg"
+_LAPCOUNT_GATE2_LAT0_COL = "lapcount_gate2_lat0_deg"
+_LAPCOUNT_GATE2_LON1_COL = "lapcount_gate2_lon1_deg"
+_LAPCOUNT_GATE2_LAT1_COL = "lapcount_gate2_lat1_deg"
 _LAPCOUNT_MODE_COL = "lapcount_mode"
 
-LapCountMode = Literal["circuit", "acceleration", "skidpad"]
+LapCountMode = Literal["circuit", "acceleration", "skidpad", "autocross"]
 
 AUTO_PARAMS: dict[str, Any] = {
     "sample_hz": 100,  # fallback sample rate if dt cannot be computed
@@ -66,6 +72,14 @@ SKIDPAD_PARAMS: dict[str, Any] = {
     "dist_max": 3.0,  # [m]   ROS finish-line distance tolerance
     "min_lap_time": 1.0,  # [s]   real skidpad laps are ~4-7 s; allow some slack
     "max_lap_time": 15.0,  # [s]   anything longer is a transition between attempts
+}
+
+AUTOCROSS_PARAMS: dict[str, Any] = {
+    **AUTO_PARAMS,
+    "min_vel": 3.0,  # [m/s] motion threshold before the start line can be armed
+    "rearm_distance": 10.0,  # [m]  move this far from a line before it can re-trigger
+    "min_lap_time": 8.0,  # [s]  reject a finish crossing too close to the start
+    "max_lap_time": 200.0,  # [s] a single autocross lap is well under this
 }
 
 # Progressive fallbacks tried when the default params yield no laps.
@@ -134,12 +148,14 @@ def _normalise_lapcount_mode(mode: str | None) -> LapCountMode:
     key = mode.strip().lower().replace("-", "_").replace(" ", "_")
     aliases: dict[str, LapCountMode] = {
         "auto": "circuit",
-        "autox": "circuit",
-        "auto_x": "circuit",
         "circuit": "circuit",
         "endurance": "circuit",
         "trackdrive": "circuit",
         "track_drive": "circuit",
+        "autocross": "autocross",
+        "auto_cross": "autocross",
+        "autox": "autocross",
+        "auto_x": "autocross",
         "accel": "acceleration",
         "acceleration": "acceleration",
         "skidpad": "skidpad",
@@ -341,7 +357,7 @@ def lap_detection_gate_from_df(
                         float(lat1),
                         float(lon1),
                     )
-                return {
+                gate = {
                     "finish_lat": finish_lat,
                     "finish_lon": finish_lon,
                     "gate_lat": np.array([float(lat0), float(lat1)], dtype=float),
@@ -357,6 +373,15 @@ def lap_detection_gate_from_df(
                     "lapcount_version": int(version),
                     "lapcount_mode": mode_s,
                 }
+                # Autocross stores a second (finish) line; expose it for overlays.
+                g2_lon0 = _first_finite_value(df, _LAPCOUNT_GATE2_LON0_COL)
+                g2_lat0 = _first_finite_value(df, _LAPCOUNT_GATE2_LAT0_COL)
+                g2_lon1 = _first_finite_value(df, _LAPCOUNT_GATE2_LON1_COL)
+                g2_lat1 = _first_finite_value(df, _LAPCOUNT_GATE2_LAT1_COL)
+                if None not in (g2_lon0, g2_lat0, g2_lon1, g2_lat1):
+                    gate["gate2_lat"] = np.array([float(g2_lat0), float(g2_lat1)], dtype=float)
+                    gate["gate2_lon"] = np.array([float(g2_lon0), float(g2_lon1)], dtype=float)
+                return gate
 
     prep = _prepare_detection_inputs(df)
     if (
@@ -824,6 +849,93 @@ def detect_laps_from_manual_gate(
     )
 
 
+def _first_segment_crossing(
+    xg: np.ndarray,
+    yg: np.ndarray,
+    finish_x: float,
+    finish_y: float,
+    t_hat: np.ndarray,
+    half_width_m: float,
+    rearm_distance_m: float,
+    start_k: int,
+) -> int | None:
+    """First index > start_k where the path crosses a finite line segment.
+
+    Direction-agnostic: a crossing is any sign change of the signed distance to
+    the gate line (either way) while the foot of the crossing falls within the
+    line's half-width window. The car must first move ``rearm_distance_m`` away
+    from the line so a vehicle sitting on the line at ``start_k`` does not
+    trigger immediately.
+    """
+    n_hat = np.array([-t_hat[1], t_hat[0]], dtype=float)
+    signed_dist = (xg - finish_x) * n_hat[0] + (yg - finish_y) * n_hat[1]
+    along_dist = (xg - finish_x) * t_hat[0] + (yg - finish_y) * t_hat[1]
+
+    armed = False
+    for k in range(max(1, int(start_k) + 1), len(xg)):
+        dist_to_gate = float(np.hypot(xg[k] - finish_x, yg[k] - finish_y))
+        if not armed:
+            if dist_to_gate > rearm_distance_m:
+                armed = True
+            continue
+        crossed = signed_dist[k - 1] * signed_dist[k] < 0.0
+        in_gate = abs(float(along_dist[k])) <= float(half_width_m)
+        if crossed and in_gate:
+            return k
+    return None
+
+
+def detect_autocross_lap(
+    xg: np.ndarray,
+    yg: np.ndarray,
+    speed: np.ndarray,
+    t: np.ndarray,
+    start_geom: tuple[float, float, np.ndarray, float],
+    finish_geom: tuple[float, float, np.ndarray, float],
+    params: dict,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
+    """Detect a single autocross lap between a start line and a finish line.
+
+    The car crosses the start line once and the finish line once, at different
+    places. Timing runs from the first start-line crossing (after motion begins)
+    to the first finish-line crossing after that.
+
+    Returns ``(crossing_idx, crossing_times, lap_durations, start_idx,
+    finish_idx)`` with one completed lap. Raises ``ValueError`` when either line
+    is not crossed.
+    """
+    moving = np.where(speed > params["min_vel"])[0]
+    motion_start = int(moving[0]) if len(moving) > 0 else 0
+
+    sx, sy, s_that, s_half = start_geom
+    fx, fy, f_that, f_half = finish_geom
+    rearm = float(params["rearm_distance"])
+
+    start_idx = _first_segment_crossing(xg, yg, sx, sy, s_that, s_half, rearm, motion_start)
+    if start_idx is None:
+        raise ValueError("Autocross start line was never crossed.")
+
+    finish_idx = _first_segment_crossing(xg, yg, fx, fy, f_that, f_half, rearm, start_idx)
+    if finish_idx is None:
+        raise ValueError("Autocross finish line was never crossed after the start line.")
+
+    duration_s = float(t[finish_idx] - t[start_idx])
+    valid_time = params["min_lap_time"] <= duration_s <= params["max_lap_time"]
+    if not valid_time or not np.isfinite(duration_s):
+        raise ValueError(
+            f"Autocross lap duration {duration_s:.1f}s is outside the valid range "
+            f"[{params['min_lap_time']:.0f}, {params['max_lap_time']:.0f}] s."
+        )
+
+    return (
+        np.array([start_idx, finish_idx], dtype=int),
+        np.array([float(t[start_idx]), float(t[finish_idx])], dtype=float),
+        np.array([duration_s], dtype=float),
+        int(start_idx),
+        int(finish_idx),
+    )
+
+
 def detect_skidpad_laps_from_gate(
     xg: np.ndarray,
     yg: np.ndarray,
@@ -1123,6 +1235,7 @@ def detect_and_write_laps(
     params: dict | None = None,
     gate_line_lonlat: tuple[tuple[float, float], tuple[float, float]] | None = None,
     mode: str | None = None,
+    finish_gate_line_lonlat: tuple[tuple[float, float], tuple[float, float]] | None = None,
 ) -> int:
     """Auto-detect laps and overwrite the CSV with ``laps`` / ``laptime`` columns.
 
@@ -1143,6 +1256,10 @@ def detect_and_write_laps(
     gate_lat0 = np.nan
     gate_lon1 = np.nan
     gate_lat1 = np.nan
+    gate2_lon0 = np.nan
+    gate2_lat0 = np.nan
+    gate2_lon1 = np.nan
+    gate2_lat1 = np.nan
     detected_laps = 0
 
     if lap_mode == "acceleration":
@@ -1221,6 +1338,52 @@ def detect_and_write_laps(
         gate_lat1 = float(chosen_gate[1][1])
         used_params = {**used_params, "min_vel": np.nan}
         detected_laps = int(np.sum(np.isfinite(lap_durations)))
+    elif lap_mode == "autocross":
+        if gate_line_lonlat is None or finish_gate_line_lonlat is None:
+            raise ValueError(
+                "Autocross lap detection needs both a start line and a finish "
+                "line. Draw both on a track map in the dashboard."
+            )
+        autocross_params = {**AUTOCROSS_PARAMS, **(params or {})}
+        start_geom = _manual_gate_geometry(prep, gate_line_lonlat)
+        finish_geom = _manual_gate_geometry(prep, finish_gate_line_lonlat)
+        (
+            crossing_idx_valid,
+            _crossing_times,
+            lap_durations,
+            start_idx_valid,
+            finish_idx_valid,
+        ) = detect_autocross_lap(
+            prep["xg"],
+            prep["yg"],
+            prep["speed_gps"],
+            prep["t"],
+            start_geom,
+            finish_geom,
+            autocross_params,
+        )
+        duration_s = float(lap_durations[0]) if len(lap_durations) > 0 else np.nan
+        laps_valid, laptime_valid = build_acceleration_samples(
+            start_idx_valid,
+            finish_idx_valid,
+            duration_s,
+            len(prep["valid_idx"]),
+        )
+        used_params = {
+            **autocross_params,
+            "gate_half_width": float(start_geom[3]),
+            "min_vel": np.nan,
+        }
+        gate_time_s = float(prep["t"][start_idx_valid])
+        gate_lon0 = float(gate_line_lonlat[0][0])
+        gate_lat0 = float(gate_line_lonlat[0][1])
+        gate_lon1 = float(gate_line_lonlat[1][0])
+        gate_lat1 = float(gate_line_lonlat[1][1])
+        gate2_lon0 = float(finish_gate_line_lonlat[0][0])
+        gate2_lat0 = float(finish_gate_line_lonlat[0][1])
+        gate2_lon1 = float(finish_gate_line_lonlat[1][0])
+        gate2_lat1 = float(finish_gate_line_lonlat[1][1])
+        detected_laps = int(len(lap_durations))
     elif gate_line_lonlat is None:
         result = _run_detection_attempts(
             prep["xg"],
@@ -1298,6 +1461,10 @@ def detect_and_write_laps(
             pl.Series(_LAPCOUNT_GATE_LAT0_COL, np.full(int(prep["N"]), gate_lat0)),
             pl.Series(_LAPCOUNT_GATE_LON1_COL, np.full(int(prep["N"]), gate_lon1)),
             pl.Series(_LAPCOUNT_GATE_LAT1_COL, np.full(int(prep["N"]), gate_lat1)),
+            pl.Series(_LAPCOUNT_GATE2_LON0_COL, np.full(int(prep["N"]), gate2_lon0)),
+            pl.Series(_LAPCOUNT_GATE2_LAT0_COL, np.full(int(prep["N"]), gate2_lat0)),
+            pl.Series(_LAPCOUNT_GATE2_LON1_COL, np.full(int(prep["N"]), gate2_lon1)),
+            pl.Series(_LAPCOUNT_GATE2_LAT1_COL, np.full(int(prep["N"]), gate2_lat1)),
             pl.Series(_LAPCOUNT_MODE_COL, np.full(int(prep["N"]), lap_mode)),
         ]
     )

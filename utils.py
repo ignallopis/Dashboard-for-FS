@@ -37,8 +37,8 @@ PLOT_FONT_SIZE = 22
 PLOT_HOVER_FONT_SIZE = 20
 PLOT_AXIS_TITLE_STANDOFF = 24
 
-# Per-wheel colours: FL=blue, FR=orange, RL=green, RR=purple
-WHEEL_COLORS = {"FL": "#4DB3F2", "FR": "#F28C40", "RL": "#73D973", "RR": "#D973D9"}
+# Per-wheel colours (Windows-logo mapping): FL=orange, FR=green, RL=blue, RR=yellow
+WHEEL_COLORS = {"FL": "#F28C40", "FR": "#73D973", "RL": "#4DB3F2", "RR": "#F2C84D"}
 WHEEL_SYMBOLS = {"FL": "circle", "FR": "square", "RL": "triangle-up", "RR": "diamond"}
 
 # ── Vehicle / phase-detection constants (single source for every module) ──────
@@ -54,9 +54,9 @@ BRAKE_DECEL_MIN_MPS2 = 1.0  # [m/s²] |long. decel| with brake applied = braking
 
 # ── Driver / run identity colours ──────────────────────────────────────────────
 # Single source of truth for "which colour is this driver/run". Used by every
-# module so a given driver keeps the same colour across all tabs. Colours are
-# assigned by name (not by load order), with explicit A/B aliases for renamed
-# comparison CSVs so Driver_A/FSG_A stay blue and Driver_B/FSG_B stay orange.
+# module so a given driver keeps the same colour across all tabs. Colours follow
+# the current dashboard comparison order so run 1 stays blue and run 2 orange
+# even when the underlying CSV filenames change.
 DRIVER_PALETTE: tuple[str, ...] = (
     "#4DB3F2",  # blue
     "#F28C40",  # orange
@@ -99,12 +99,7 @@ def _run_slot_color(key: str) -> str | None:
 
 
 def set_run_colors(names: Iterable[object]) -> None:
-    """Seed stable, collision-free colours for the currently loaded runs.
-
-    Each driver keeps a colour derived from its name (deterministic across
-    sessions); when two loaded drivers hash to the same slot, the later one is
-    nudged to the next free slot so on-screen runs are always distinguishable.
-    """
+    """Seed run colours from the current dashboard comparison order."""
     keys: list[str] = []
     for name in names:
         key = driver_key(name)
@@ -112,22 +107,9 @@ def set_run_colors(names: Iterable[object]) -> None:
             continue
         keys.append(key)
 
-    used: set[str] = set()
     mapping: dict[str, str] = {}
-    for key in keys:
-        fixed_color = _run_slot_color(key)
-        if fixed_color is not None and fixed_color not in used:
-            color = fixed_color
-        else:
-            idx = _palette_index(key)
-            start = idx
-            while DRIVER_PALETTE[idx] in used:
-                idx = (idx + 1) % len(DRIVER_PALETTE)
-                if idx == start:
-                    break
-            color = DRIVER_PALETTE[idx]
-        used.add(color)
-        mapping[key] = color
+    for idx, key in enumerate(keys):
+        mapping[key] = DRIVER_PALETTE[idx % len(DRIVER_PALETTE)]
 
     _RUN_COLOR_REGISTRY.clear()
     _RUN_COLOR_REGISTRY.update(mapping)
@@ -255,9 +237,18 @@ def apply_dark_layout(
     return fig
 
 
-def make_dark_figure(title: str = "", xlabel: str = "", ylabel: str = "") -> go.Figure:
-    """Return a Plotly Figure with dark motorsport styling."""
-    return apply_dark_layout(go.Figure(), title=title, xlabel=xlabel, ylabel=ylabel)
+def make_dark_figure(
+    title: str = "", xlabel: str = "", ylabel: str = "", height: int | None = None
+) -> go.Figure:
+    """Return a Plotly Figure with dark motorsport styling.
+
+    Pass *height* (px) to fix the rendered height; single-panel charts that omit
+    it fall back to Streamlit's ~450 px default.
+    """
+    fig = apply_dark_layout(go.Figure(), title=title, xlabel=xlabel, ylabel=ylabel)
+    if height is not None:
+        fig.update_layout(height=height)
+    return fig
 
 
 def add_lap_scatter(
