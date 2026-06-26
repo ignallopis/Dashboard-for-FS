@@ -18,7 +18,6 @@ AGENTS.md
 docs/
 ggv/
 tests/
-screenshots/
 
 # Local tooling / environment
 .venv/
