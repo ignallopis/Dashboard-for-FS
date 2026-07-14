@@ -47,7 +47,11 @@ WHEEL_SYMBOLS = {"FL": "circle", "FR": "square", "RL": "triangle-up", "RR": "dia
 # to Parameters.m / the dashboard's existing detectors (see docs/context).
 MU_TIRE = 1.70  # [-]   estimated FS slick peak friction coefficient (Vhcl tyre μ)
 MIN_SPEED_MPS = 3.0  # [m/s] below this the car is ~stationary; exclude from dynamics
-CORNER_RADIUS_M = 60.0  # [m]   path radius below which a sample counts as cornering
+CORNER_RADIUS_M = 50.0  # [m]   path radius below which a sample counts as cornering
+# ^ single source of truth for "what counts as a corner" by path radius. Every
+#   radius-based section (Lap Analysis default, Dynamics corner phases + balance,
+#   grip factors) must reference this, never a local literal — see
+#   tests/test_cornering_curvature_split.py::CornerRadiusCoherenceTest.
 CORNER_MIN_DURATION_S = 0.20  # [s] minimum cornering event length
 BRAKE_PRESS_MIN = 5.0  # brake-system pressure above this = genuinely braking
 BRAKE_DECEL_MIN_MPS2 = 1.0  # [m/s²] |long. decel| with brake applied = braking phase
@@ -146,6 +150,78 @@ _FILTERING_ACCEL_FALLBACKS = (
     ("Filtering_VN_ax", "VN_ax"),
     ("Filtering_VN_ay", "VN_ay"),
 )
+
+# ── CAT18x → legacy (CAT17x) column aliases ───────────────────────────────────
+# The CAT18x logger renames most channels to snake_case (and splits a few). The
+# whole dashboard reads the legacy CAT17x names, so we rename the CAT18x columns
+# back to those names once, at load time — every module/figure keeps working
+# unchanged (this also covers the f-string column families, e.g. f"Est_SR{w}").
+#
+# Meanings were verified against the CAT18x `Variables_CSV` doc and the LLC
+# controller source (workspace/src/ctrl/llc). Enable flags in particular: the
+# CAT18x log carries three per system (`*_enable`, `*_enable_control`,
+# `*_enable_mode`). The controllers publish `enable_control = <loop-active>`
+# (TractionControl: true while `command>0.1 && vx>v_start`; RegenerativeControl:
+# true while braking) — that is the event window the old `TCenable`/`RB_Enable`
+# marked and the dashboard analyses in, so the legacy names map to
+# `tc_enable_control` / `rb_enable_control`, NOT the (~always-on) mode toggles.
+_CAT18X_WHEEL_LEGACY = {"FL": "frontLeft", "FR": "frontRight", "RL": "rearLeft", "RR": "rearRight"}
+
+
+def _cat18x_wheel_aliases() -> dict[str, str]:
+    """Per-wheel CAT18x → legacy renames (built for FL/FR/RL/RR)."""
+    fams: dict[str, str] = {}
+    for w in ("FL", "FR", "RL", "RR"):
+        lo = w.lower()
+        fams[f"est_sr{lo}"] = f"Est_SR{w}"  # slip ratio
+        fams[f"est_sa{lo}"] = f"Est_SA{w}"  # slip angle
+        fams[f"est_vx{lo}"] = f"Est_VX{w}"  # wheel-frame vx
+        fams[f"est_vy{lo}"] = f"Est_VY{w}"  # wheel-frame vy
+        fams[f"tv_{lo}_torque"] = f"TV_{w}_Trq"
+        fams[f"tc_{lo}_torque"] = f"TC_{w}_MaxTrq"  # torque-mode TC cut
+        fams[f"tc_{lo}_max_ang_vel"] = f"TC_{w}_MaxAngVel"  # velocity-mode TC cap
+        fams[f"rb_{lo}_torque"] = f"RB_{w}_Trq"
+        fams[f"pc_{lo}_torque"] = f"PC_{w}_Trq"
+        fams[f"{w}_temp_motor"] = f"{w}_motorTemperature"
+        fams[f"{w}_temp_inverter"] = f"{w}_inverterTemperature"
+        fams[f"master_{lo}_torque"] = f"Master_{_CAT18X_WHEEL_LEGACY[w]}Trq"
+    return fams
+
+
+_CAT18X_SCALAR_ALIASES = {
+    # Kinematic estimates (COG velocities handled with a liveness guard below).
+    "est_vx_cog": "Est_vxCOG",
+    "est_vy_cog": "Est_vyCOG",
+    # Torque Vectoring
+    "tv_desired_yaw_rate": "TV_desiredYawRate",
+    "tv_error_yaw_rate": "TV_errorYawRate",
+    "tv_feed_forward_mz": "TV_feedForwardMz",
+    "tv_feed_back_mz": "TV_feedBackMz",
+    "tv_desired_mz": "TV_desiredMz",
+    "tv_actualmz": "TV_actualMz",
+    "tv_error_mz": "TV_errorMz",
+    "tv_desired_fx": "TV_desiredFx",
+    "tv_actualfx": "TV_actualFx",
+    "tv_error_fx": "TV_errorFx",
+    "tv_limit_mz": "TV_limitMz",
+    "tv_limit_fx": "TV_limitFx",
+    # Traction / Regen control enable windows (loop-active flag — see note above).
+    "tc_enable_control": "TCenable",
+    "rb_enable_control": "RB_Enable",
+    "rb_enable_intensity_limiter": "RB_enableIntensityLimiter",
+    "rb_desired_current": "RB_intensityTarget",  # reference regen current [A]
+    # Command / mode parameters
+    "llc_command": "LLC_Command",
+    "param_desired_maximum_velocity": "Param_desiredMaximumVelocity",
+    "param_desired_maximum_torque": "Param_desiredMaximumTorque",
+    "param_desired_maximum_regen_torque": "Param_desiredMaximumRegenTorque",
+    # Brake hydraulic line pressure [bar]
+    "hydraulic_front": "BSEFront",
+    "hydraulic_rear": "BSERear",
+    # Genuine filtered inertial channels (better than the raw-VN backfill)
+    "filt_ax": "Filtering_VN_ax",
+    "filt_ay": "Filtering_VN_ay",
+}
 _SUSPENSION_LOOKUP_PATH = (
     Path(__file__).resolve().parent / "data" / "Suspension_Data_CAT17x_Lookup_Table.csv"
 )
@@ -342,13 +418,66 @@ def read_telemetry_csv(
     columns: list[str] | tuple[str, ...] | None = None,
     n_rows: int | None = None,
 ) -> pl.DataFrame:
-    """Read a telemetry CSV with robust type inference for mixed numeric columns."""
+    """Read a telemetry CSV with robust type inference for mixed numeric columns.
+
+    Some CAT18x channels look integer for the first thousands of rows and only
+    turn float later (e.g. a flag logged ``0`` then ``0.0``), which breaks a
+    bounded schema inference. Retry inferring over the whole file when that
+    happens so any log loads regardless of where the first float appears.
+    """
     kwargs: dict[str, object] = {"infer_schema_length": 10_000}
     if columns is not None:
         kwargs["columns"] = list(columns)
     if n_rows is not None:
         kwargs["n_rows"] = n_rows
-    return pl.read_csv(path, **kwargs)
+    try:
+        return pl.read_csv(path, **kwargs)
+    except pl.exceptions.ComputeError:
+        kwargs["infer_schema_length"] = None  # scan the full file
+        return pl.read_csv(path, **kwargs)
+
+
+def apply_cat18x_aliases(df: pl.DataFrame) -> pl.DataFrame:
+    """Rename CAT18x snake_case columns back to the legacy CAT17x names.
+
+    Applied once at load time so the whole dashboard keeps reading the legacy
+    names. A rename only fires when the CAT18x source column is present AND the
+    legacy target is absent (never clobbers a real column). The COG velocity
+    estimates are aliased only when they carry signal — on logs where they are
+    recorded flat-zero the code then falls back to the live ``VN_v*``.
+    """
+    cols = set(df.columns)
+    mapping = {**_cat18x_wheel_aliases(), **_CAT18X_SCALAR_ALIASES}
+
+    # Liveness guard: don't shadow the live VN velocities with a dead observer.
+    for c in ("est_vx_cog", "est_vy_cog"):
+        if c in cols:
+            arr = df[c].to_numpy().astype(float)
+            if not (np.isfinite(arr).any() and float(np.nanmax(np.abs(arr))) > 1e-9):
+                mapping.pop(c, None)
+
+    rename = {src: dst for src, dst in mapping.items() if src in cols and dst not in cols}
+    return df.rename(rename) if rename else df
+
+
+def ensure_pedal_percent_df(df: pl.DataFrame) -> pl.DataFrame:
+    """Scale `Throttle`/`Brake` to the 0–100 the dashboard expects.
+
+    CAT18x logs these pedals normalised to 0–1, while every threshold in the code
+    is on a 0–100 scale (`Brake > 5`, `Throttle >= 80`, …), so on a raw CAT18x log
+    no throttle/brake event would ever fire. When a pedal channel looks normalised
+    (finite max ≤ 1.5) it is multiplied by 100; a real 0–100 log always exceeds
+    that, so this is a no-op there.
+    """
+    exprs: list[pl.Expr] = []
+    for col in ("Throttle", "Brake"):
+        if col not in df.columns:
+            continue
+        arr = df[col].to_numpy().astype(float)
+        finite = arr[np.isfinite(arr)]
+        if finite.size and float(np.max(finite)) <= 1.5:
+            exprs.append((pl.col(col) * 100.0).alias(col))
+    return df.with_columns(exprs) if exprs else df
 
 
 def ensure_filtering_accel_columns_df(df: pl.DataFrame) -> pl.DataFrame:
@@ -398,11 +527,11 @@ def radius_corner_mask(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Corner mask from path curvature ``R = V²/|ay|`` (Lap-Analysis logic).
 
-    The driver / lap analysis detects corners from the path radius with a default
-    60 m threshold: smoothed inverse-radius, a minimum speed and a minimum event
-    length. This is the single shared implementation so every section (dynamics,
-    grip factors, …) flags the **same** corners. Returns ``(corner_mask,
-    smoothed_radius_m)``.
+    The driver / lap analysis detects corners from the path radius with the
+    shared ``CORNER_RADIUS_M`` threshold (50 m): smoothed inverse-radius, a
+    minimum speed and a minimum event length. This is the single shared
+    implementation so every section (dynamics, grip factors, …) flags the
+    **same** corners. Returns ``(corner_mask, smoothed_radius_m)``.
     """
     ay_abs = np.abs(np.asarray(ay_mps2, dtype=float))
     vx = np.asarray(vx_mps, dtype=float)
@@ -1302,7 +1431,9 @@ def load_data(path: str, complete_laps_only: bool = True) -> pl.DataFrame:
     When *complete_laps_only* is True, lap 0 and the last lap are excluded.
     When False, the full CSV is returned and the dashboard can choose laps later.
     """
-    df = apply_logic_start_time(read_telemetry_csv(path), path)
+    df = apply_cat18x_aliases(read_telemetry_csv(path))
+    df = ensure_pedal_percent_df(df)
+    df = apply_logic_start_time(df, path)
     df = apply_special_lap_logic(df, path)
     df = ensure_detected_laps_df(df)
     df = ensure_filtering_accel_columns_df(df)

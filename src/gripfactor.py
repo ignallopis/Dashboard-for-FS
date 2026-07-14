@@ -14,8 +14,8 @@ are too low to isolate a clean downforce effect:
 The phase gating reuses the **same detectors as the rest of the dashboard** so
 the grip categories agree with the Braking / Cornering sections:
 
-  • Corner   : path radius ``R = vx²/|ay| < 60 m`` (``utils.radius_corner_mask``,
-               the Lap-Analysis curvature logic).
+  • Corner   : path radius ``R = vx²/|ay| < CORNER_RADIUS_M`` (50 m,
+               ``utils.radius_corner_mask``, the Lap-Analysis curvature logic).
   • Braking  : ``Filtering_VN_ax < −1 m/s²`` AND ``Brake > 5`` (brake pressure).
   • Traction : corner AND ``Filtering_VN_ax > 0`` — corner exit. The lateral
                condition (it must be a corner) excludes straight-line
@@ -102,7 +102,7 @@ def _phase_masks(d: dict[str, np.ndarray], dt: float) -> dict[str, np.ndarray]:
     Operates on the **full, time-ordered** arrays in ``d`` (the corner detector
     smooths over time, so it must not run on a pre-filtered subset). Masks:
 
-      • Corner   = ``utils.radius_corner_mask`` (R < 60 m), the Lap-Analysis logic.
+      • Corner   = ``utils.radius_corner_mask`` (R < 50 m), the Lap-Analysis logic.
       • Braking  = ``ax < −1 m/s²`` AND ``Brake > 5``.
       • Traction = corner AND ``ax > 0`` (corner exit).
       • Overall  = braking ∪ corner (the grip-limited samples).

@@ -397,36 +397,83 @@ def energy_per_lap_fig(
 # ── Power per wheel ──────────────────────────────────────────────────────────
 
 
+def _wheel_power(df: pl.DataFrame) -> tuple[dict[str, np.ndarray], str] | None:
+    """Per-wheel power [W] plus a source label.
+
+    Prefers the electrical `{w}_actualPower`. On CAT18x logs that omit it, falls
+    back to **mechanical** power = `{w}_actualTorque × {w}_actualVelocity`
+    (Nm·rad/s = W). Returns ``None`` when neither source is available.
+    """
+    cols = set(df.columns)
+    if all(f"{w}_actualPower" in cols for w in WHEELS):
+        arr = cols_to_numpy(df, [f"{w}_actualPower" for w in WHEELS])
+        return {w: arr[f"{w}_actualPower"] for w in WHEELS}, "Electrical"
+    mech = [f"{w}_actualTorque" for w in WHEELS] + [f"{w}_actualVelocity" for w in WHEELS]
+    if all(c in cols for c in mech):
+        arr = cols_to_numpy(df, mech)
+        return {
+            w: arr[f"{w}_actualTorque"] * arr[f"{w}_actualVelocity"] for w in WHEELS
+        }, "Mechanical"
+    return None
+
+
+def _inverter_input_power(df: pl.DataFrame) -> tuple[np.ndarray, str] | None:
+    """Total inverter electrical **input** power [W] (Σ over wheels) + source label.
+
+    Prefers Σ `{w}_actualPower`. On CAT18x logs that omit it, falls back to the
+    inverter DC-bus input Σ `{w}_dc_current × {w}_dc_bus_voltage` — which is exactly
+    "power reaching the inverters". Returns ``None`` when neither source is present.
+    """
+    cols = set(df.columns)
+    if all(f"{w}_actualPower" in cols for w in WHEELS):
+        arr = cols_to_numpy(df, [f"{w}_actualPower" for w in WHEELS])
+        p = np.zeros(len(df))
+        for w in WHEELS:
+            p = p + arr[f"{w}_actualPower"]
+        return p, "actualPower"
+    dc = [f"{w}_dc_current" for w in WHEELS] + [f"{w}_dc_bus_voltage" for w in WHEELS]
+    if all(c in cols for c in dc):
+        arr = cols_to_numpy(df, dc)
+        p = np.zeros(len(df))
+        for w in WHEELS:
+            p = p + arr[f"{w}_dc_current"] * _clean_band(arr[f"{w}_dc_bus_voltage"], _PACK_V_BAND)
+        return p, "DC bus"
+    return None
+
+
 def power_per_wheel_fig(
     dfs: dict[str, pl.DataFrame],
     x_mode: str = "laps",
 ) -> tuple[go.Figure, dict]:
     """Power distribution per wheel figure + KPIs.
 
+    Uses the electrical `{w}_actualPower` when logged, else mechanical torque×ω
+    (CAT18x logs without `actualPower`); the title reflects which.
+
     kpis keys: mean_total_kw, fr_pct, lr_pct,
                wheel_mean_kw (dict), wheel_pct (dict),
                table (pl.DataFrame), warnings (list[str]).
     """
-    power_cols = [f"{w}_actualPower" for w in WHEELS]
-    cols_needed = ["laps", "laptime"] + power_cols
-
     laps_all: list[int] = []
     lt_all: list[float] = []
     pw_all: list[list[float]] = []
     run_all: list[str] = []
     warnings: list[str] = []
+    plabel = "Motor"
 
     for run_name, df in dfs.items():
         df = ensure_complete_laps_df(df)
-        missing = [c for c in cols_needed if c not in df.columns]
-        if missing:
-            warnings.append(f"{run_name}: missing {missing}")
+        resolved = _wheel_power(df)
+        if resolved is None:
+            warnings.append(
+                f"{run_name}: no per-wheel power ({{w}}_actualPower or torque+velocity)"
+            )
             continue
+        powers, plabel = resolved
 
-        cols = cols_to_numpy(df, ["laps", "laptime", *power_cols])
+        cols = cols_to_numpy(df, ["laps", "laptime"])
         laps = cols["laps"]
         laptime = cols["laptime"]
-        powers = {w: cols[f"{w}_actualPower"] for w in WHEELS}
 
         for lap in unique_laps(laps):
             idx = laps == lap
@@ -454,7 +501,7 @@ def power_per_wheel_fig(
     fr_pct = float(np.nanmean(p_front) / mean_total * 100) if mean_total > 0 else np.nan
     lr_pct = float(np.nanmean(p_left) / mean_total * 100) if mean_total > 0 else np.nan
 
-    title = f"Mean Electrical Power per Wheel vs {'Lap Time' if x_mode == 'laptime' else 'Lap'}"
+    title = f"Mean {plabel} Power per Wheel vs {'Lap Time' if x_mode == 'laptime' else 'Lap'}"
     run_names = list(dict.fromkeys(run_all))
     if len(run_names) > 1:
         grid_runs: dict[str, tuple[np.ndarray, dict[str, np.ndarray]]] = {}
@@ -514,12 +561,58 @@ def power_per_wheel_fig(
 # ── Inverter load (overload + i²t) ─────────────────────────────────────────────
 
 
+def _inverter_load(
+    df: pl.DataFrame,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], str] | None:
+    """Per-wheel (overload flag 0/1, load [·], mode) for the inverter-load figure.
+
+    Prefers the real firmware channels `{w}_OverloadActive` + `{w}_IxTLoad` (i²t
+    thermal budget, 1.0 = exhausted). On CAT18x logs that omit them, falls back to
+    the **AC-current budget**: load = `|actualSCurrent| / max_ac_current`
+    (1.0 = at the rated current) and overload = the inverter derating its own budget
+    (`available_max_ac_current < max_ac_current`). Returns ``None`` if neither set
+    is logged.
+    """
+    cols = set(df.columns)
+    if all(f"{w}_OverloadActive" in cols and f"{w}_IxTLoad" in cols for w in WHEELS):
+        arr = cols_to_numpy(
+            df, [f"{w}_OverloadActive" for w in WHEELS] + [f"{w}_IxTLoad" for w in WHEELS]
+        )
+        ov = {w: (arr[f"{w}_OverloadActive"] == 1.0).astype(float) for w in WHEELS}
+        load = {w: arr[f"{w}_IxTLoad"] for w in WHEELS}
+        return ov, load, "i2t"
+    if all(f"{w}_actualSCurrent" in cols and f"{w}_max_ac_current" in cols for w in WHEELS):
+        need = [f"{w}_actualSCurrent" for w in WHEELS] + [f"{w}_max_ac_current" for w in WHEELS]
+        need += [
+            f"{w}_available_max_ac_current"
+            for w in WHEELS
+            if f"{w}_available_max_ac_current" in cols
+        ]
+        arr = cols_to_numpy(df, need)
+        ov, load = {}, {}
+        for w in WHEELS:
+            imax = arr[f"{w}_max_ac_current"]
+            good = np.isfinite(imax) & (imax > 0.0)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                load[w] = np.where(good, np.abs(arr[f"{w}_actualSCurrent"]) / imax, np.nan)
+            av = f"{w}_available_max_ac_current"
+            ov[w] = (
+                np.where(good, arr[av] < imax - 1e-6, False).astype(float)
+                if av in cols
+                else np.zeros(len(imax))
+            )
+        return ov, load, "current"
+    return None
+
+
 def inverter_limits_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     """How much of each inverter's overload / i²t thermal budget is being used?
 
     Two per-lap reads: % time the OverloadActive flag is set, and the P95 i²t load
-    (IxTLoad, 1.0 = budget exhausted). The front inverters run markedly harder than
-    the rear in these logs. kpis: overload_pct / ixt_peak (per wheel, whole run),
+    (IxTLoad, 1.0 = budget exhausted). On CAT18x logs without those channels it
+    falls back to the AC-current budget (utilisation `|I|/Imax` + derating); the
+    titles/axes reflect which. The front inverters run markedly harder than the
+    rear in these logs. kpis: overload_pct / ixt_peak (per wheel, whole run),
     table, warnings. FWActive is flat-zero in these logs (not shown).
     """
     warnings: list[str] = []
@@ -529,29 +622,28 @@ def inverter_limits_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     run_all: list[str] = []
     ov_run: dict[str, list[np.ndarray]] = {w: [] for w in WHEELS}
     ixt_run: dict[str, list[np.ndarray]] = {w: [] for w in WHEELS}
+    mode = "i2t"
 
     for run_name, df in dfs.items():
         df = ensure_complete_laps_df(df)
-        needed = (
-            ["laps"] + [f"{w}_OverloadActive" for w in WHEELS] + [f"{w}_IxTLoad" for w in WHEELS]
-        )
-        missing = [c for c in needed if c not in df.columns]
-        if missing:
-            warnings.append(f"{run_name}: missing {missing}")
+        resolved = _inverter_load(df)
+        if resolved is None:
+            warnings.append(
+                f"{run_name}: no inverter-load channels "
+                "(OverloadActive+IxTLoad or actualSCurrent+max_ac_current)"
+            )
             continue
-        cols = cols_to_numpy(df, needed)
-        laps = cols["laps"]
+        ov_w, load_w, mode = resolved
+        laps = cols_to_numpy(df, ["laps"])["laps"]
         for w in WHEELS:
-            ov_run[w].append(cols[f"{w}_OverloadActive"])
-            ixt_run[w].append(cols[f"{w}_IxTLoad"])
+            ov_run[w].append(ov_w[w])
+            ixt_run[w].append(load_w[w])
         for lap in unique_laps(laps):
             idx = laps == lap
             if idx.sum() < 50:
                 continue
-            ov = [
-                float(np.nanmean(cols[f"{w}_OverloadActive"][idx] == 1.0) * 100.0) for w in WHEELS
-            ]
-            ix = [float(np.nanpercentile(cols[f"{w}_IxTLoad"][idx], 95)) for w in WHEELS]
+            ov = [float(np.nanmean(ov_w[w][idx]) * 100.0) for w in WHEELS]
+            ix = [float(np.nanpercentile(load_w[w][idx], 95)) for w in WHEELS]
             laps_all.append(int(lap))
             ov_all.append(ov)
             ixt_all.append(ix)
@@ -565,6 +657,18 @@ def inverter_limits_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     lp = np.array(laps_all)
     ov = np.array(ov_all)
     ix = np.array(ixt_all)
+
+    # Labels adapt to the source: real i²t budget vs the CAT18x current-budget fallback.
+    if mode == "current":
+        fig_title = "Inverter Current-Budget Utilisation"
+        y_ov, y_load = "Derating [% lap]", "|I|/Imax P95 [–]"
+        t_ov, t_load = "Time Derating per Lap", "Current Use per Lap (P95)"
+        col_ov, col_load = "derating [%]", "|I|/Imax P95"
+    else:
+        fig_title = "Inverter Overload & i²t Utilisation"
+        y_ov, y_load = "Overload [% lap]", "IxT P95 [–]"
+        t_ov, t_load = "Time in Overload per Lap", "i²t Load per Lap (P95)"
+        col_ov, col_load = "overload [%]", "IxT P95"
     lap_ticks = np.sort(np.unique(lp.astype(int)))
     run_names = list(dict.fromkeys(run_all))
     if len(run_names) > 1:
@@ -610,8 +714,8 @@ def inverter_limits_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
                     col=j,
                 )
                 fig.update_yaxes(gridcolor=_GRID, color=_AXIS, row=row, col=j)
-        fig.update_yaxes(title_text="Overload [% lap]", row=1, col=1)
-        fig.update_yaxes(title_text="IxT P95 [–]", row=2, col=1)
+        fig.update_yaxes(title_text=y_ov, row=1, col=1)
+        fig.update_yaxes(title_text=y_load, row=2, col=1)
         fig.update_layout(height=520)
         for ann in fig.layout.annotations:
             ann.font.color = _TEXT
@@ -619,8 +723,8 @@ def inverter_limits_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
     else:
         fig = _dark_subplots(
             rows=2,
-            titles=["Time in Overload per Lap", "i²t Load per Lap (P95)"],
-            ylabels=["Overload [% lap]", "IxT load [–]"],
+            titles=[t_ov, t_load],
+            ylabels=[y_ov, y_load],
         )
         for j, w in enumerate(WHEELS):
             fig.add_trace(
@@ -654,14 +758,14 @@ def inverter_limits_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
         fig.update_xaxes(title_text="Lap", tickvals=lap_ticks, row=2, col=1)
         fig.update_layout(height=560)
     fig.update_layout(
-        title_text="Inverter Overload & i²t Utilisation",
+        title_text=fig_title,
         title_font=dict(color=_TEXT, size=14),
     )
 
     table: dict[str, object] = {"Lap": lp}
     for j, w in enumerate(WHEELS):
-        table[f"{w} overload [%]"] = np.round(ov[:, j], 1)
-        table[f"{w} IxT P95"] = np.round(ix[:, j], 3)
+        table[f"{w} {col_ov}"] = np.round(ov[:, j], 1)
+        table[f"{w} {col_load}"] = np.round(ix[:, j], 3)
     if len(dfs) > 1:
         table["Run"] = run_all
     kpis = {
@@ -1035,20 +1139,21 @@ def hv_delivery_efficiency_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure,
     run_all: list[str] = []
     eff_pool: list[np.ndarray] = []
     loss_pool: list[np.ndarray] = []
-    power_cols = [f"{w}_actualPower" for w in WHEELS]
 
     for run_name, df in dfs.items():
         df = ensure_complete_laps_df(df)
-        needed = ["laps", "Vbat", "Current", *power_cols]
+        needed = ["laps", "Vbat", "Current"]
         missing = [c for c in needed if c not in df.columns]
-        if missing:
-            warnings.append(f"{run_name}: missing {missing}")
+        resolved = _inverter_input_power(df)
+        if missing or resolved is None:
+            miss = list(missing)
+            if resolved is None:
+                miss.append("inverter power (actualPower or dc_current×dc_bus_voltage)")
+            warnings.append(f"{run_name}: missing {miss}")
             continue
+        p_inv, _src = resolved
         cols = cols_to_numpy(df, needed)
         laps = cols["laps"]
-        p_inv = np.zeros(len(laps))
-        for c in power_cols:
-            p_inv = p_inv + cols[c]
         p_bat = _clean_band(cols["Vbat"], _PACK_V_BAND) * cols["Current"]  # W
         for lap in unique_laps(laps):
             idx = laps == lap

@@ -33,6 +33,7 @@ from utils import (
     phase_masks_for_map,
     per_lap_axis,
     radius_corner_mask,
+    CORNER_RADIUS_M,
     MU_TIRE,
     WHEEL_COLORS,
 )
@@ -161,7 +162,7 @@ def _radius_corner_mask(
     ay_mps2: np.ndarray,
     dt_s: float,
     *,
-    radius_threshold_m: float = 60.0,
+    radius_threshold_m: float = CORNER_RADIUS_M,
     min_speed_mps: float = MIN_SPEED,
     min_duration_s: float = MIN_CORNER_DURATION,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -212,7 +213,6 @@ def _compute_understeer(
             vx,
             ay_filt,
             dt,
-            radius_threshold_m=60.0,
             min_speed_mps=4.0,
             min_duration_s=MIN_CORNER_DURATION,
         )
@@ -377,7 +377,6 @@ def _lltd_mid_corner_table_for_run(
         arr["VN_vx"],
         arr["Filtering_VN_ay"],
         dt,
-        radius_threshold_m=60.0,
         min_speed_mps=4.0,
         min_duration_s=MIN_CORNER_DURATION,
     )
@@ -611,7 +610,7 @@ def _setup_phase_mask(arr: dict[str, np.ndarray], phase: str, dt: float) -> np.n
     throttle = arr["Throttle"]
     brake_m = (ax < -1.0) & (brake > 5.0)
     accel_m = (ax > 1.0) & (throttle > 5.0)
-    corner_m, _radius_m = _radius_corner_mask(vx, ay, dt, radius_threshold_m=60.0)
+    corner_m, _radius_m = _radius_corner_mask(vx, ay, dt)
     if phase == "brake":
         return brake_m
     if phase == "accel":
@@ -909,7 +908,7 @@ def roll_gradient_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
     dt = robust_dt(time_s)
     ay = arr["Filtering_VN_ay"]
     vx = arr["VN_vx"]
-    in_corner, _radius_m = _radius_corner_mask(vx, ay, dt, radius_threshold_m=60.0)
+    in_corner, _radius_m = _radius_corner_mask(vx, ay, dt)
 
     if t1_ok:
         roll_front = arr["Roll_Front"]
@@ -3326,9 +3325,7 @@ def lateral_load_transfer_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
     arr = {k: v[valid] for k, v in arr.items()}
     time_s = arr["TimeStamp"] - arr["TimeStamp"][0]
     dt = robust_dt(time_s)
-    cm, _radius_m = _radius_corner_mask(
-        arr["VN_vx"], arr["Filtering_VN_ay"], dt, radius_threshold_m=60.0
-    )
+    cm, _radius_m = _radius_corner_mask(arr["VN_vx"], arr["Filtering_VN_ay"], dt)
     dfz_front = arr["Est_FZFR"] - arr["Est_FZFL"]
     dfz_rear = arr["Est_FZRR"] - arr["Est_FZRL"]
     denom = np.abs(dfz_front) + np.abs(dfz_rear)
@@ -3768,7 +3765,7 @@ def steering_vs_ay_fig(df: pl.DataFrame) -> tuple[go.Figure, dict]:
     smooth_n = max(1, int(round(0.10 / dt)))
     day_dt = np.gradient(smooth_signal(ay, smooth_n), dt)
     dsteer_dt = np.gradient(smooth_signal(steer, smooth_n), dt)
-    radius_corner, _radius_m = _radius_corner_mask(vx, ay, dt, radius_threshold_m=60.0)
+    radius_corner, _radius_m = _radius_corner_mask(vx, ay, dt)
     raw_corner = radius_corner & (np.abs(day_dt) < 15.0) & (np.abs(dsteer_dt) < 1.5)
     cm = keep_min_duration_segments(raw_corner, MIN_CORNER_DURATION, dt)
     if not cm.any():

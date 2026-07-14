@@ -1592,7 +1592,7 @@ def _render_lap_detail_chart(
     fullscreen_track_figure: go.Figure | None = None,
     fullscreen_gg_figures: dict[str, go.Figure] | None = None,
 ) -> None:
-    """Render Lap Analysis detail with Video-Analysis-style crosshair labels."""
+    """Render Lap Analysis detail with a cursor line and fixed value readout."""
     fig_json = fig.to_json()
     fullscreen_payload = {
         str(label): json.loads(corner_fig.to_json())
@@ -1610,6 +1610,8 @@ def _render_lap_detail_chart(
         for label, gg_fig in (fullscreen_gg_figures or {}).items()
     }
     height_px = int(fig.layout.height or 900)
+    readout_height_px = 74
+    component_height_px = height_px + readout_height_px
     component_id = f"lap_detail_{abs(hash(key))}"
     wrapper_id = f"{component_id}_wrap"
     component_id_js = json.dumps(component_id)
@@ -1637,11 +1639,12 @@ def _render_lap_detail_chart(
 <style>
   html, body {{ margin:0; padding:0; background:#141417; overflow:hidden; }}
   #{wrapper_id} {{
-    position:relative; width:100%; height:{height_px}px; background:#141417;
+    position:relative; width:100%; height:{component_height_px}px; background:#141417;
     overflow:hidden; border:1px solid rgba(255,255,255,0.08); border-radius:8px;
+    display:grid; grid-template-rows:minmax(0, 1fr) auto;
   }}
   .lap_detail_shell {{
-    width:100%; height:100%; display:grid; grid-template-columns: minmax(0, 1fr);
+    width:100%; min-height:0; display:grid; grid-template-columns: minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr);
   }}
   .lap_detail_main {{ min-width:0; min-height:0; }}
@@ -1674,6 +1677,37 @@ def _render_lap_detail_chart(
   }}
   .lap_detail_toolbar label {{ display:none; align-items:center; gap:6px; }}
   #{wrapper_id}:fullscreen .lap_detail_toolbar label {{ display:flex; }}
+  .lap_detail_readout {{
+    min-height:{readout_height_px}px; display:flex; align-items:center; gap:12px;
+    padding:8px 12px; background:rgba(17,19,24,0.96);
+    border-top:1px solid rgba(255,255,255,0.10); color:#EBEBEB;
+    font:12px -apple-system, "Segoe UI", sans-serif; overflow:hidden;
+  }}
+  .lap_detail_readout_distance {{
+    flex:0 0 auto; min-width:128px; color:#D8DEE9; font-weight:650;
+    white-space:nowrap;
+  }}
+  .lap_detail_readout_items {{
+    min-width:0; display:flex; align-items:center; gap:6px 10px;
+    flex-wrap:wrap; max-height:54px; overflow:hidden;
+  }}
+  .lap_detail_readout_group {{
+    display:flex; align-items:center; gap:5px; min-width:0; max-width:100%;
+    padding:3px 7px; border:1px solid rgba(255,255,255,0.10);
+    border-radius:5px; background:rgba(255,255,255,0.035);
+  }}
+  .lap_detail_readout_label {{
+    color:#AAB2C0; max-width:160px; overflow:hidden; text-overflow:ellipsis;
+    white-space:nowrap;
+  }}
+  .lap_detail_readout_value {{
+    display:inline-flex; align-items:center; gap:3px; white-space:nowrap;
+    font-variant-numeric:tabular-nums;
+  }}
+  .lap_detail_readout_swatch {{
+    width:7px; height:7px; border-radius:50%; display:inline-block;
+    box-shadow:0 0 0 1px rgba(0,0,0,0.45);
+  }}
 </style>
 </head>
 <body>
@@ -1697,6 +1731,10 @@ def _render_lap_detail_chart(
       <div id="{component_id}_gg" class="lap_detail_side_plot"></div>
     </div>
   </div>
+  <div class="lap_detail_readout">
+    <div id="{component_id}_readout_distance" class="lap_detail_readout_distance">x --</div>
+    <div id="{component_id}_readout_items" class="lap_detail_readout_items"></div>
+  </div>
 </div>
 <script>
 (function() {{
@@ -1709,12 +1747,13 @@ def _render_lap_detail_chart(
   const ggGd = document.getElementById(CID + "_gg");
   const cornerSelect = document.getElementById(CID + "_corner_select");
   const fullscreenButton = document.getElementById(CID + "_fullscreen_btn");
+  const readoutDistance = document.getElementById(CID + "_readout_distance");
+  const readoutItems = document.getElementById(CID + "_readout_items");
   const fullscreenFigures = JSON.parse(document.getElementById(CID + "_fullscreen_json").textContent);
   const fullscreenTrackFigure = JSON.parse(document.getElementById(CID + "_fullscreen_track_json").textContent);
   const fullscreenGgFigures = JSON.parse(document.getElementById(CID + "_fullscreen_gg_json").textContent);
   let fig = JSON.parse(document.getElementById(CID + "_json").textContent);
   let baseShapes = [];
-  let baseAnnotations = [];
   let selectedDistanceM = null;
   let currentTrackFig = null;
   let currentGgFig = null;
@@ -1728,7 +1767,13 @@ def _render_lap_detail_chart(
     path: "M60 360V60H360V160H160V360Z M640 60H940V360H840V160H640Z M160 640V840H360V940H60V640Z M840 640V840H640V940H940V640Z",
   }};
   function targetHeight() {{
-    return document.fullscreenElement === wrap ? window.innerHeight - 24 : {height_px};
+    const parent = gd && gd.parentElement;
+    const rect = parent ? parent.getBoundingClientRect() : null;
+    const measured = rect && Number.isFinite(rect.height) ? Math.floor(rect.height) : 0;
+    if (measured > 0) return measured;
+    return document.fullscreenElement === wrap
+      ? Math.max(320, window.innerHeight - {readout_height_px + 36})
+      : {height_px};
   }}
   function resizePlotForMode() {{
     Plotly.relayout(gd, {{ height: targetHeight(), autosize: true }});
@@ -1774,9 +1819,9 @@ def _render_lap_detail_chart(
       trace.hovertemplate = null;
     }});
     baseShapes = Array.isArray(fig.layout.shapes) ? fig.layout.shapes.slice() : [];
-    baseAnnotations = Array.isArray(fig.layout.annotations) ? fig.layout.annotations.slice() : [];
     pendingCursorPoint = null;
     lastCursorXVal = null;
+    updateReadout([], NaN);
     if (cursorRaf) {{
       cancelAnimationFrame(cursorRaf);
       cursorRaf = 0;
@@ -2017,62 +2062,79 @@ def _render_lap_detail_chart(
     return ref === prefix ? prefix + "axis" : prefix + "axis" + ref.slice(1);
   }}
 
-  function screenYFromData(yref, yVal) {{
-    const fullLayout = gd._fullLayout;
-    if (!fullLayout) return null;
-    const axis = fullLayout[axisLayoutName(yref, "y")];
-    if (!axis || typeof axis.l2p !== "function") return null;
-    const pixel = Number(axis.l2p(yVal));
-    return isFinite(pixel) ? pixel : null;
+  function cleanLabel(text) {{
+    return String(text || "").replace(/<[^>]*>/g, "").replace(/\\s+/g, " ").trim();
   }}
 
-  function annotationOffsets(entries, nearRightEdge) {{
-    const yShifts = Array(entries.length).fill(0);
-    const xShifts = Array(entries.length).fill(nearRightEdge ? -6 : 6);
-    const groups = new Map();
-    entries.forEach((entry, idx) => {{
-      const screenY = screenYFromData(entry.yref, entry.y);
-      const key = entry.yref || "y";
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push({{ idx, screenY }});
-    }});
-    const minGapPx = 24;
-    const xStepPx = 42;
+  function axisTitle(axisRef, prefix) {{
+    const fullLayout = gd._fullLayout || {{}};
+    const axis = fullLayout[axisLayoutName(axisRef, prefix)] || {{}};
+    const title = axis.title && axis.title.text ? axis.title.text : "";
+    return cleanLabel(title);
+  }}
 
-    function applyCluster(cluster) {{
-      if (!cluster.length) return;
-      if (cluster.length === 1) {{
-        yShifts[cluster[0].idx] = 0;
-        return;
-      }}
-      const center = cluster.reduce((sum, item) => sum + item.screenY, 0) / cluster.length;
-      const start = center - (minGapPx * (cluster.length - 1)) / 2;
-      cluster.forEach((item, order) => {{
-        yShifts[item.idx] = start + order * minGapPx - item.screenY;
-        xShifts[item.idx] = (nearRightEdge ? -6 : 6) + (nearRightEdge ? -1 : 1) * order * xStepPx;
-      }});
+  function compactAxisTitle(title, fallback) {{
+    const text = cleanLabel(title);
+    if (!text) return fallback;
+    if (/distance/i.test(text)) return "Distance";
+    if (/time/i.test(text)) return "Time";
+    return text.length > 28 ? text.slice(0, 25) + "..." : text;
+  }}
+
+  function updateReadout(entries, xVal) {{
+    if (!readoutDistance || !readoutItems) return;
+    if (!isFinite(xVal)) {{
+      readoutDistance.textContent = "x --";
+      readoutItems.innerHTML = "";
+      return;
     }}
 
-    groups.forEach(group => {{
-      const valid = group
-        .filter(item => item.screenY !== null && isFinite(item.screenY))
-        .sort((a, b) => a.screenY - b.screenY);
-      let cluster = [];
-      valid.forEach(item => {{
-        if (!cluster.length) {{
-          cluster = [item];
-          return;
-        }}
-        if (item.screenY - cluster[cluster.length - 1].screenY < minGapPx) {{
-          cluster.push(item);
-          return;
-        }}
-        applyCluster(cluster);
-        cluster = [item];
-      }});
-      applyCluster(cluster);
+    const xTitle = compactAxisTitle(axisTitle("x", "x"), "x");
+    const distanceM = distanceAtGraphX(xVal);
+    let distanceText = xTitle + " " + formatValue(xVal);
+    if (isFinite(distanceM) && Math.abs(distanceM - xVal) > 0.05) {{
+      distanceText += " · s " + formatValue(distanceM) + " m";
+    }}
+    readoutDistance.textContent = distanceText;
+    readoutItems.innerHTML = "";
+
+    const grouped = new Map();
+    entries.forEach(entry => {{
+      const key = entry.yref || "y";
+      if (!grouped.has(key)) {{
+        grouped.set(key, {{
+          label: compactAxisTitle(axisTitle(key, "y"), entry.traceName || "Value"),
+          values: [],
+        }});
+      }}
+      grouped.get(key).values.push(entry);
     }});
-    return {{ yShifts, xShifts }};
+
+    grouped.forEach(group => {{
+      const item = document.createElement("div");
+      item.className = "lap_detail_readout_group";
+
+      const label = document.createElement("span");
+      label.className = "lap_detail_readout_label";
+      label.textContent = group.label;
+      label.title = group.label;
+      item.appendChild(label);
+
+      group.values.forEach(entry => {{
+        const value = document.createElement("span");
+        value.className = "lap_detail_readout_value";
+        value.style.color = entry.color;
+        value.title = entry.traceName || group.label;
+
+        const swatch = document.createElement("span");
+        swatch.className = "lap_detail_readout_swatch";
+        swatch.style.background = entry.color;
+        value.appendChild(swatch);
+        value.appendChild(document.createTextNode(entry.text));
+        item.appendChild(value);
+      }});
+      readoutItems.appendChild(item);
+    }});
   }}
 
   function plotAreaXFromEvent(event) {{
@@ -2225,51 +2287,23 @@ def _render_lap_detail_chart(
       }});
     }});
 
-    const annotations = baseAnnotations.slice();
-    const fullX = gd._fullLayout && gd._fullLayout.xaxis;
-    const xrange = fullX && Array.isArray(fullX.range) ? fullX.range : null;
-    const xFrac = xrange && isFinite(Number(xrange[0])) && isFinite(Number(xrange[1])) && Number(xrange[1]) !== Number(xrange[0])
-      ? (xVal - Number(xrange[0])) / (Number(xrange[1]) - Number(xrange[0]))
-      : 0.5;
-    const nearRightEdge = xFrac > 0.88;
     const entries = [];
     fig.data.forEach(trace => {{
       if (trace.visible === false || trace.visible === "legendonly") return;
       const y = valueAtX(trace.x, trace.y, xVal);
       if (!isFinite(y)) return;
       const color = colorForTrace(trace);
-      const xref = trace.xaxis || "x";
       const yref = trace.yaxis || "y";
       entries.push({{
-        x: xVal,
         y: y,
-        xref: xref,
         yref: yref,
         text: formatValue(y),
         color: color,
+        traceName: cleanLabel(trace.name || ""),
       }});
     }});
-    const offsets = annotationOffsets(entries, nearRightEdge);
-    entries.forEach((entry, idx) => {{
-      annotations.push({{
-        x: entry.x,
-        y: entry.y,
-        xref: entry.xref,
-        yref: entry.yref,
-        text: entry.text,
-        showarrow: false,
-        xanchor: nearRightEdge ? "right" : "left",
-        yanchor: "middle",
-        xshift: offsets.xShifts[idx],
-        yshift: offsets.yShifts[idx],
-        bgcolor: "rgba(20,20,23,0.96)",
-        bordercolor: entry.color,
-        borderwidth: 1,
-        borderpad: 2,
-        font: {{ color: entry.color, size: 11 }},
-      }});
-    }});
-    Plotly.relayout(gd, {{ shapes: shapes, annotations: annotations }});
+    updateReadout(entries, xVal);
+    Plotly.relayout(gd, {{ shapes: shapes }});
   }}
 
   function updateCursor(event) {{
@@ -2306,7 +2340,8 @@ def _render_lap_detail_chart(
       cancelAnimationFrame(cursorRaf);
       cursorRaf = 0;
     }}
-    Plotly.relayout(gd, {{ shapes: baseShapes, annotations: baseAnnotations }});
+    updateReadout([], NaN);
+    Plotly.relayout(gd, {{ shapes: baseShapes }});
   }}
 
   populateCornerSelect();
@@ -2326,7 +2361,7 @@ def _render_lap_detail_chart(
 </script>
 </body>
 </html>"""
-    components.html(component_html, height=height_px + 8, scrolling=False)
+    components.html(component_html, height=component_height_px + 8, scrolling=False)
 
 
 def _overlay_figures(figs_by_run: dict[str, list[go.Figure]]) -> list[go.Figure]:
@@ -2641,9 +2676,10 @@ def _dyn_ideal_braking_curve_fig_cached(
 def _driver_max_braking_g_per_lap_fig_cached(
     dfs: dict[str, pl.DataFrame],
     run_tokens: tuple[tuple[str, FileSignature, str], ...],
+    x_mode: str = "laps",
 ) -> tuple[go.Figure, dict]:
     _ = run_tokens
-    return drv.max_braking_g_per_lap_fig(dfs)
+    return drv.max_braking_g_per_lap_fig(dfs, x_mode=x_mode)
 
 
 @st.cache_resource(show_spinner=False, hash_funcs=_PL_HASH_FUNCS)
@@ -6317,8 +6353,16 @@ def _render_driver_brake_subtab(
     )
     for w in max_g_kpis.get("warnings", []):
         st.warning(w)
-    if max_g_fig is not None:
+    max_g_x_mode = _select_per_lap_axis("driver_max_braking_g_axis", default="laps")
+    try:
+        max_g_fig, _ = _driver_max_braking_g_per_lap_fig_cached(
+            dfs,
+            driver_run_tokens,
+            max_g_x_mode,
+        )
         _plotly_chart(max_g_fig, use_container_width=True, theme=None)
+    except Exception as exc:
+        st.error(f"Max braking G unavailable: {exc}")
 
 
 def _render_driver_steering_subtab(
@@ -6483,19 +6527,22 @@ def _format_cornering_turn_option(
     return labels.get(int(turn_id), f"Turn {int(turn_id)}")
 
 
+# "Balanced" is the global default: its radius MUST equal utils.CORNER_RADIUS_M
+# (50 m -> 1000/50 = 20.0 1/km) so Lap Analysis flags the same corners as the
+# Dynamics/grip radius masks. See CornerRadiusCoherenceTest.
 _LAP_ANALYSIS_PRESETS: dict[str, dict[str, float]] = {
     "Balanced": {
-        "curvature_thr_1pkm": 16.7,
+        "curvature_thr_1pkm": 20.0,  # R = 50 m == CORNER_RADIUS_M
         "min_dur_s": 0.5,
         "corner_merge_gap_m": 4.0,
     },
     "Tighter corners": {
-        "curvature_thr_1pkm": 22.0,
+        "curvature_thr_1pkm": 25.0,  # R = 40 m
         "min_dur_s": 0.4,
         "corner_merge_gap_m": 2.0,
     },
     "Open corners": {
-        "curvature_thr_1pkm": 12.5,
+        "curvature_thr_1pkm": 12.5,  # R = 80 m
         "min_dur_s": 0.7,
         "corner_merge_gap_m": 6.0,
     },
@@ -7428,6 +7475,7 @@ def _render_driver_video_subtab(
         compare_payload=compare_payload,
         compare_lap_id=compare_lap_id,
         height_px=920,
+        sync_key=Path(selected_run).stem,
     )
     components.html(html, height=940, scrolling=False)
 

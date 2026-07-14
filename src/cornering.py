@@ -13,6 +13,7 @@ from scipy.signal import savgol_filter
 
 import src.dynamics as dyn
 from utils import (
+    CORNER_RADIUS_M,
     driver_color,
     ensure_complete_laps_df,
     keep_min_duration_segments,
@@ -35,20 +36,17 @@ MIN_PEAK_AY_G = 0.18
 MIN_CORNER_LENGTH_M = 12.0
 R_RELEASE_FACTOR = 1.35
 SIGN_SPLIT_AY_G = 0.08
-SIGN_SPLIT_MIN_PARENT_LENGTH_M = 70.0
-SIGN_SPLIT_MIN_PART_LENGTH_M = 25.0
-SIGN_SPLIT_MIN_PART_PEAK_AY_G = 0.35
 
-# Same-sign chicane split: a single curvature seed segment is partitioned when
-# two distinct peaks of the same direction are separated by a valley whose
-# minimum drops below VALLEY_REL_FACTOR of the smaller peak.
-SAME_SIGN_SPLIT_MIN_PARENT_LENGTH_M = 80.0
-SAME_SIGN_SPLIT_MIN_PART_LENGTH_M = 22.0
-SAME_SIGN_SPLIT_MIN_PEAK_RATIO = 1.20  # peaks must be at least this ratio over the valley
-SAME_SIGN_SPLIT_VALLEY_REL_TO_PEAK = (
-    0.55  # valley must drop at least to this fraction of smaller peak
-)
-SAME_SIGN_SPLIT_MIN_PEAK_SEPARATION_M = 18.0
+# Curvature-valley split: a continuous corner region is one corner per curvature
+# peak. Two peaks become two corners only when the valley between them drops deep
+# enough (a real straightening or an ay sign change, where unsigned curvature
+# dips toward zero). The split point is the valley itself, so every metre stays
+# assigned to a corner — the region is never punched with a hole.
+CURV_SPLIT_MIN_PARENT_LENGTH_M = 44.0  # 2x min part; below this a valid split can't fit
+CURV_SPLIT_MIN_PART_LENGTH_M = 22.0
+CURV_SPLIT_MIN_PEAK_RATIO = 1.20  # peaks must be at least this ratio over the valley
+CURV_SPLIT_VALLEY_REL_TO_PEAK = 0.55  # valley must drop at least to this fraction of smaller peak
+CURV_SPLIT_MIN_PEAK_SEPARATION_M = 18.0
 
 _LAT_ACCEL_CANDIDATES = ("Filtering_VN_ay",)
 _SPEED_CANDIDATES = ("VN_vx",)
@@ -289,74 +287,6 @@ def _dominant_turn_sign(values: np.ndarray, start: int, end: int) -> int:
     return 0
 
 
-def _filled_direction_sign(values: np.ndarray, start: int, end: int) -> np.ndarray:
-    seg = values[start : end + 1]
-    raw = np.where(
-        np.isfinite(seg) & (np.abs(seg) >= SIGN_SPLIT_AY_G * G_MPS2),
-        np.sign(seg),
-        0.0,
-    ).astype(int)
-    if not np.any(raw != 0):
-        return raw
-
-    filled = raw.copy()
-    last = 0
-    for i, value in enumerate(filled):
-        if value != 0:
-            last = int(value)
-        elif last != 0:
-            filled[i] = last
-
-    next_value = 0
-    for i in range(len(filled) - 1, -1, -1):
-        if filled[i] != 0:
-            next_value = int(filled[i])
-        elif next_value != 0:
-            filled[i] = next_value
-    return filled
-
-
-def _split_segment_by_direction(
-    start: int,
-    end: int,
-    signed_lat_accel_mps2: np.ndarray,
-    s_lap_m: np.ndarray,
-    dt_s: float,
-    min_dur_s: float,
-) -> list[tuple[int, int]]:
-    """Split a continuous curvature zone when ay direction changes."""
-    parent_length_m = float(s_lap_m[end] - s_lap_m[start])
-    if not np.isfinite(parent_length_m) or parent_length_m < SIGN_SPLIT_MIN_PARENT_LENGTH_M:
-        return [(start, end)]
-
-    signs = _filled_direction_sign(signed_lat_accel_mps2, start, end)
-    if len(signs) == 0 or not np.any(signs != 0):
-        return [(start, end)]
-
-    min_samples = max(3, int(np.ceil(min(0.20, min_dur_s * 0.5) / dt_s)))
-    changes = np.where(np.diff(signs) != 0)[0] + 1
-    if len(changes) == 0:
-        return [(start, end)]
-
-    bounds = [0, *changes.tolist(), len(signs)]
-    parts: list[tuple[int, int]] = []
-    for local_start, local_end_excl in zip(bounds[:-1], bounds[1:]):
-        if local_end_excl - local_start < min_samples:
-            continue
-        part_start = start + local_start
-        part_end = start + local_end_excl - 1
-        part_length_m = float(s_lap_m[part_end] - s_lap_m[part_start])
-        part_peak_ay = float(np.nanmax(np.abs(signed_lat_accel_mps2[part_start : part_end + 1])))
-        if (
-            np.isfinite(part_length_m)
-            and part_length_m >= SIGN_SPLIT_MIN_PART_LENGTH_M
-            and np.isfinite(part_peak_ay)
-            and part_peak_ay >= SIGN_SPLIT_MIN_PART_PEAK_AY_G * G_MPS2
-        ):
-            parts.append((part_start, part_end))
-    return parts if len(parts) >= 2 else [(start, end)]
-
-
 def _expand_seeds_to_support(seed: np.ndarray, support: np.ndarray) -> np.ndarray:
     """Keep support segments that contain at least one stronger seed sample."""
     out = np.zeros(len(seed), dtype=bool)
@@ -364,6 +294,84 @@ def _expand_seeds_to_support(seed: np.ndarray, support: np.ndarray) -> np.ndarra
         if np.any(seed[start : end + 1]):
             out[start : end + 1] = True
     return out
+
+
+def _hold_fill_direction(raw: np.ndarray) -> np.ndarray:
+    """Fill 0s (below-threshold samples) by holding the last/next known sign."""
+    filled = raw.copy()
+    last = 0
+    for i, value in enumerate(filled):
+        if value != 0:
+            last = int(value)
+        elif last != 0:
+            filled[i] = last
+    nxt = 0
+    for i in range(len(filled) - 1, -1, -1):
+        if filled[i] != 0:
+            nxt = int(filled[i])
+        elif nxt != 0:
+            filled[i] = nxt
+    return filled
+
+
+def _split_segment_by_direction(
+    start: int,
+    end: int,
+    signed_ay_mps2: np.ndarray,
+    s_lap_m: np.ndarray,
+) -> list[tuple[int, int]]:
+    """Split a continuous corner region at ay direction changes.
+
+    Opposite lateral direction means a physically distinct corner, so the
+    region is cut wherever a strong left lobe meets a strong right lobe. The
+    cut lands on the |ay| minimum between the two peaks (the direction change),
+    so the parts stay adjacent and cover the whole region — no metre is dropped.
+    A weak opposite wiggle (never reaching the corner floor) is absorbed rather
+    than fragmenting a single corner; same-direction structure is left to the
+    curvature-valley split.
+    """
+    seg = np.asarray(signed_ay_mps2[start : end + 1], dtype=float)
+    n = len(seg)
+    if n < 3:
+        return [(start, end)]
+
+    dir_floor = SIGN_SPLIT_AY_G * G_MPS2  # hysteresis: assign a direction above this
+    corner_floor = MIN_PEAK_AY_G * G_MPS2  # a lobe must reach this to be a corner
+    raw = np.where(np.isfinite(seg) & (np.abs(seg) >= dir_floor), np.sign(seg), 0.0).astype(int)
+    if not np.any(raw != 0):
+        return [(start, end)]
+    dirn = _hold_fill_direction(raw)
+
+    # Contiguous same-direction runs; keep only lobes that reach the corner floor.
+    strong: list[tuple[int, int, int]] = []  # (peak_index, sign, run_start)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and dirn[j + 1] == dirn[i]:
+            j += 1
+        run = np.abs(seg[i : j + 1])
+        if dirn[i] != 0 and np.any(np.isfinite(run)) and float(np.nanmax(run)) >= corner_floor:
+            strong.append((i + int(np.nanargmax(run)), int(dirn[i]), i))
+        i = j + 1
+    if len(strong) < 2:
+        return [(start, end)]
+
+    cuts: list[int] = []
+    for (pk1, s1, _), (pk2, s2, _) in zip(strong[:-1], strong[1:]):
+        if s1 == s2:
+            continue  # same direction: leave to the curvature-valley split
+        between = np.abs(seg[pk1 : pk2 + 1])
+        cuts.append(pk1 + int(np.nanargmin(between)))
+    if not cuts:
+        return [(start, end)]
+
+    parts: list[tuple[int, int]] = []
+    prev = 0
+    for cut in cuts:
+        parts.append((start + prev, start + cut))
+        prev = cut + 1
+    parts.append((start + prev, end))
+    return parts
 
 
 def _peak_preserving_smooth(signal: np.ndarray, window_samples: int) -> np.ndarray:
@@ -437,20 +445,22 @@ def _refine_apex(
     return s_apex, apex_lat, apex_lng
 
 
-def _split_segment_same_sign(
+def _split_segment_by_curvature_valleys(
     start: int,
     end: int,
     curvature_smooth: np.ndarray,
     s_lap_m: np.ndarray,
 ) -> list[tuple[int, int]]:
-    """Split one same-sign curvature seed when it contains two distinct peaks.
+    """Split one continuous corner region into one corner per curvature peak.
 
-    Detects esses-like sequences where the valley between two peaks drops
-    deep enough to make them physically distinct corners even though ay never
-    changes sign.
+    Two curvature peaks become two corners only when the valley between them
+    drops deep enough (a real straightening, or an ay sign change where the
+    unsigned curvature dips toward zero). The cut is placed at the valley, so
+    the two parts stay adjacent and cover the whole region — no metre is ever
+    dropped. Recurses so a region with N peaks yields N contiguous corners.
     """
     parent_length_m = float(s_lap_m[end] - s_lap_m[start])
-    if not np.isfinite(parent_length_m) or parent_length_m < SAME_SIGN_SPLIT_MIN_PARENT_LENGTH_M:
+    if not np.isfinite(parent_length_m) or parent_length_m < CURV_SPLIT_MIN_PARENT_LENGTH_M:
         return [(start, end)]
 
     seg = np.asarray(curvature_smooth[start : end + 1], dtype=float)
@@ -473,7 +483,7 @@ def _split_segment_same_sign(
     peak_local = np.sort(peak_local[order])
     p1, p2 = int(peak_local[0]), int(peak_local[1])
     sep_m = float(s_lap_m[start + p2] - s_lap_m[start + p1])
-    if not np.isfinite(sep_m) or sep_m < SAME_SIGN_SPLIT_MIN_PEAK_SEPARATION_M:
+    if not np.isfinite(sep_m) or sep_m < CURV_SPLIT_MIN_PEAK_SEPARATION_M:
         return [(start, end)]
 
     valley_local_offset = int(np.argmin(sig[p1 : p2 + 1]))
@@ -482,9 +492,9 @@ def _split_segment_same_sign(
     smaller_peak = float(min(sig[p1], sig[p2]))
     if smaller_peak <= 0.0 or valley_value <= 0.0:
         return [(start, end)]
-    if smaller_peak / max(valley_value, 1.0e-9) < SAME_SIGN_SPLIT_MIN_PEAK_RATIO:
+    if smaller_peak / max(valley_value, 1.0e-9) < CURV_SPLIT_MIN_PEAK_RATIO:
         return [(start, end)]
-    if valley_value > SAME_SIGN_SPLIT_VALLEY_REL_TO_PEAK * smaller_peak:
+    if valley_value > CURV_SPLIT_VALLEY_REL_TO_PEAK * smaller_peak:
         return [(start, end)]
 
     cut_global = start + valley_local
@@ -495,7 +505,7 @@ def _split_segment_same_sign(
         if part_end <= part_start:
             continue
         part_length = float(s_lap_m[part_end] - s_lap_m[part_start])
-        if not np.isfinite(part_length) or part_length < SAME_SIGN_SPLIT_MIN_PART_LENGTH_M:
+        if not np.isfinite(part_length) or part_length < CURV_SPLIT_MIN_PART_LENGTH_M:
             return [(start, end)]
         parts.append((part_start, part_end))
     if len(parts) != 2:
@@ -504,7 +514,7 @@ def _split_segment_same_sign(
     split_parts: list[tuple[int, int]] = []
     for part_start, part_end in parts:
         split_parts.extend(
-            _split_segment_same_sign(
+            _split_segment_by_curvature_valleys(
                 part_start,
                 part_end,
                 curvature_smooth,
@@ -803,7 +813,7 @@ def detect_turns_on_lap(
     run_name: str,
     lap_id: int,
     *,
-    R_thr_m: float = 60.0,
+    R_thr_m: float = CORNER_RADIUS_M,
     min_dur_s: float = 0.5,
     merge_gap_m: float = 8.0,
 ) -> list[TurnDef]:
@@ -849,18 +859,16 @@ def detect_turns_on_lap(
     turns: list[TurnDef] = []
     segments: list[tuple[int, int]] = []
     for start, end in _segment_bounds(is_corner):
-        for sub_start, sub_end in _split_segment_by_direction(
+        for dir_start, dir_end in _split_segment_by_direction(
             start,
             end,
             lap["ay_smooth_mps2"],
             lap["s_lap_m"],
-            dt_s,
-            min_dur_s,
         ):
             segments.extend(
-                _split_segment_same_sign(
-                    sub_start,
-                    sub_end,
+                _split_segment_by_curvature_valleys(
+                    dir_start,
+                    dir_end,
                     lap["curvature_smooth_1pm"],
                     lap["s_lap_m"],
                 )

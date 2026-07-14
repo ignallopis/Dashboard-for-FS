@@ -626,6 +626,7 @@ def build_video_component_html(
     height_px: int = 720,
     show_video: bool = True,
     layout: str = "horizontal",
+    sync_key: str = "",
 ) -> str:
     """Return the full HTML string for the synced video+telemetry component."""
     _ = layout
@@ -642,6 +643,13 @@ def build_video_component_html(
         f'<video id="vid_{component_id}" controls preload="metadata" playsinline></video>'
         if has_video
         else '<div class="media_placeholder">No onboard video loaded.</div>'
+    )
+    align_button_html = (
+        f'<button type="button" id="align_{component_id}" '
+        f'title="Pause the video on a recognisable event, then click the matching '
+        f'telemetry point to set the offset automatically.">Align to video</button>'
+        if has_video
+        else ""
     )
     top_row_height_px = max(280, int(height_px * 0.42))
     chart_height_px = max(360, height_px - top_row_height_px - 86)
@@ -715,7 +723,16 @@ def build_video_component_html(
     border-radius:6px; padding:6px 10px; cursor:pointer; font-size:12px;
   }}
   .controls button:hover {{ background:#2D3036; }}
-  .controls input[type=range] {{ width:160px; }}
+  .controls input[type=range] {{ width:130px; }}
+  .offset_group {{ display:inline-flex; align-items:center; gap:6px; }}
+  .offset_num {{ width:64px; background:#111318; color:#EBEBEB;
+    border:1px solid rgba(255,255,255,0.12); border-radius:6px;
+    padding:4px 6px; font-size:12px; text-align:right; }}
+  .offset_num:focus {{ outline:none; border-color:#4DB3F2; }}
+  .nudge_btn {{ padding:4px 7px !important; font-variant-numeric:tabular-nums;
+    min-width:44px; }}
+  #align_{component_id} {{ font-weight:600; }}
+  #align_{component_id}.armed {{ background:#2A6FB0; border-color:#4DB3F2; color:#fff; }}
   .signal_slots {{ display:flex; flex-wrap:wrap; gap:8px; align-items:flex-start; }}
   .signal_select {{ display:inline-flex !important; flex-direction:column; align-items:flex-start !important; gap:4px !important; }}
   .signal_select span {{ color:#8A8F98; }}
@@ -759,12 +776,20 @@ def build_video_component_html(
     <label>Lap
       <select id="lap_select_{component_id}"></select>
     </label>
-    <label>Offset [s]
+    <label class="offset_group">Offset [s]
       <input id="offset_{component_id}" type="range"
              min="{-offset_range_s:.2f}" max="{offset_range_s:.2f}"
              step="0.05" value="{initial_offset_s:.2f}">
-      <span id="offset_val_{component_id}">{initial_offset_s:+.2f}</span>
+      <input id="offset_num_{component_id}" class="offset_num" type="number"
+             min="{-offset_range_s:.2f}" max="{offset_range_s:.2f}"
+             step="0.05" value="{initial_offset_s:.2f}"
+             title="Type an exact offset in seconds, then press Enter.">
+      <button type="button" class="nudge_btn" data-nudge="-0.5" title="Nudge −0.50 s">−0.5</button>
+      <button type="button" class="nudge_btn" data-nudge="-0.05" title="Nudge −0.05 s">−0.05</button>
+      <button type="button" class="nudge_btn" data-nudge="0.05" title="Nudge +0.05 s">+0.05</button>
+      <button type="button" class="nudge_btn" data-nudge="0.5" title="Nudge +0.50 s">+0.5</button>
     </label>
+    {align_button_html}
     <label>X-axis
       <select id="x_axis_mode_{component_id}">
         <option value="time">Time</option>
@@ -775,7 +800,7 @@ def build_video_component_html(
     <button id="reset_zoom_{component_id}" type="button">Reset zoom</button>
     <button id="fullscreen_{component_id}" type="button">Full screen</button>
     <span class="lap_info" id="lap_info_{component_id}">Lap —</span>
-    <span class="cursor_help">Left-click or left-drag on the charts to scrub video, cursor, and GPS.</span>
+    <span class="cursor_help" id="cursor_help_{component_id}">Left-click or left-drag on the charts to scrub video, cursor, and GPS.</span>
   </div>
   <div class="charts_box" id="charts_{component_id}"></div>
 </div>
@@ -790,6 +815,10 @@ def build_video_component_html(
   const VIDEO_SERVER_PORT = {("null" if video_server_port is None else str(int(video_server_port)))};
   const HAS_VIDEO = {str(has_video).lower()};
   const CID = "{component_id}";
+  const SYNC_KEY = {json.dumps(sync_key)};
+  const OFFSET_MIN = {-offset_range_s:.2f};
+  const OFFSET_MAX = {offset_range_s:.2f};
+  const OFFSET_STORAGE_KEY = "va_offset::" + SYNC_KEY;
   const HIDDEN_SIGNAL_KEY = "__hidden__";
   const SIGNAL_SLOT_COUNT = {SIGNAL_SLOT_COUNT};
   const DEFAULT_CHART_HEIGHT = {chart_height_px};
@@ -838,6 +867,8 @@ def build_video_component_html(
   }};
 
   let offset = parseFloat(document.getElementById("offset_" + CID).value);
+  let alignArmed = false;
+  let lastAlignAt = 0;
   let currentLapIdx = -1;
   let currentTelemetryTime = null;
   let currentCursorX = null;
@@ -861,6 +892,11 @@ def build_video_component_html(
   const xAxisModeEl = document.getElementById("x_axis_mode_" + CID);
   const signalSlotsEl = document.getElementById("signal_slots_" + CID);
   const chartEl = document.getElementById("charts_" + CID);
+  const offsetSliderEl = document.getElementById("offset_" + CID);
+  const offsetNumEl = document.getElementById("offset_num_" + CID);
+  const alignBtnEl = document.getElementById("align_" + CID);
+  const cursorHelpEl = document.getElementById("cursor_help_" + CID);
+  const CURSOR_HELP_DEFAULT = cursorHelpEl ? cursorHelpEl.textContent : "";
 
   function setStatus(message, isError) {{
     if (!statusEl) return;
@@ -1087,6 +1123,32 @@ def build_video_component_html(
     return videoTime + offset;
   }}
 
+  function formatOffset(v) {{
+    return (v >= 0 ? "+" : "") + v.toFixed(2);
+  }}
+
+  function clampOffset(v) {{
+    if (!isFinite(v)) return offset;
+    return Math.min(OFFSET_MAX, Math.max(OFFSET_MIN, v));
+  }}
+
+  function setOffset(value, opts) {{
+    opts = opts || {{}};
+    offset = clampOffset(value);
+    const text = offset.toFixed(2);
+    if (offsetSliderEl) offsetSliderEl.value = text;
+    if (offsetNumEl && document.activeElement !== offsetNumEl) offsetNumEl.value = text;
+    try {{ localStorage.setItem(OFFSET_STORAGE_KEY, text); }} catch (e) {{}}
+    if (opts.silent) return;
+    const lap = PAYLOAD.laps[currentLapIdx >= 0 ? currentLapIdx : 0];
+    renderCharts(true);
+    if (lap) updateMapForLap(lap);
+    if (HAS_VIDEO) {{
+      const vid = document.getElementById("vid_" + CID);
+      onVideoTime(vid.currentTime);
+    }}
+  }}
+
   function videoTimeFromXClick(lap, xVal) {{
     if (!lap || xVal === null || !isFinite(xVal)) return null;
     if (xAxisMode === "distance") {{
@@ -1138,9 +1200,46 @@ def build_video_component_html(
   }}
 
   function scrubChartToX(xVal) {{
+    if (Date.now() - lastAlignAt < 350) return;
     const lap = PAYLOAD.laps[currentLapIdx >= 0 ? currentLapIdx : 0];
     const videoTime = videoTimeFromXClick(lap, xVal);
     if (videoTime !== null && isFinite(videoTime)) applyVideoTime(videoTime);
+  }}
+
+  function tGlobalFromXClick(lap, xVal) {{
+    if (!lap || xVal === null || !isFinite(xVal)) return null;
+    if (xAxisMode === "distance") {{
+      const tg = interpolateAt(lap.distance, lap.t_global, xVal);
+      return isFinite(tg) ? tg : null;
+    }}
+    return xVal + offset;
+  }}
+
+  function setAlignArmed(armed) {{
+    alignArmed = Boolean(armed) && HAS_VIDEO;
+    if (alignBtnEl) {{
+      alignBtnEl.classList.toggle("armed", alignArmed);
+      alignBtnEl.textContent = alignArmed ? "Click a telemetry point…" : "Align to video";
+    }}
+    if (cursorHelpEl) {{
+      cursorHelpEl.textContent = alignArmed
+        ? "Align mode: click the telemetry point that matches the current video frame (Esc to cancel)."
+        : CURSOR_HELP_DEFAULT;
+    }}
+  }}
+
+  function performAlign(xVal) {{
+    const lap = PAYLOAD.laps[currentLapIdx >= 0 ? currentLapIdx : 0];
+    const tg = tGlobalFromXClick(lap, xVal);
+    setAlignArmed(false);
+    lastAlignAt = Date.now();
+    if (!HAS_VIDEO || tg === null) {{
+      setStatus("Align needs a video and a valid telemetry point.", true);
+      return;
+    }}
+    const vid = document.getElementById("vid_" + CID);
+    setOffset(tg - vid.currentTime);
+    setStatus("Aligned — offset " + formatOffset(offset) + " s.", false);
   }}
 
   function populateLapSelector() {{
@@ -1357,6 +1456,7 @@ def build_video_component_html(
     if (!gd || gd.dataset.listenersAttached === "1") return;
     gd.on("plotly_click", evt => {{
       if (!evt.points || !evt.points.length) return;
+      if (alignArmed) {{ performAlign(evt.points[0].x); return; }}
       scrubChartToX(evt.points[0].x);
     }});
 
@@ -1388,6 +1488,12 @@ def build_video_component_html(
       if (event.button !== 0) return;
       const xVal = chartXFromPointerEvent(gd, event);
       if (xVal === null || !isFinite(xVal)) return;
+      if (alignArmed) {{
+        event.preventDefault();
+        event.stopPropagation();
+        performAlign(xVal);
+        return;
+      }}
       isScrubbing = true;
       event.preventDefault();
       event.stopPropagation();
@@ -1831,6 +1937,12 @@ def build_video_component_html(
     if (lap) moveCursorTo(cursorXForTelemetryTime(lap, tg), tg, lap);
   }}
 
+  (function initOffset() {{
+    let stored = NaN;
+    try {{ stored = parseFloat(localStorage.getItem(OFFSET_STORAGE_KEY)); }} catch (e) {{}}
+    setOffset(isFinite(stored) ? stored : offset, {{ silent: true }});
+  }})();
+
   renderSignalSelectors();
   syncMapSourceSelector();
   renderCharts(true);
@@ -1846,16 +1958,23 @@ def build_video_component_html(
     renderCharts(true);
   }});
 
-  document.getElementById("offset_" + CID).addEventListener("input", e => {{
-    offset = parseFloat(e.target.value);
-    document.getElementById("offset_val_" + CID).textContent = (offset >= 0 ? "+" : "") + offset.toFixed(2);
-    const lap = PAYLOAD.laps[currentLapIdx >= 0 ? currentLapIdx : 0];
-    renderCharts(true);
-    if (lap) updateMapForLap(lap);
-    if (HAS_VIDEO) {{
-      const vid = document.getElementById("vid_" + CID);
-      onVideoTime(vid.currentTime);
-    }}
+  offsetSliderEl.addEventListener("input", e => setOffset(parseFloat(e.target.value)));
+  offsetNumEl.addEventListener("change", () => {{
+    const v = parseFloat(offsetNumEl.value);
+    if (isFinite(v)) setOffset(v);
+    offsetNumEl.value = offset.toFixed(2);
+  }});
+  document.querySelectorAll(".nudge_btn").forEach(btn => {{
+    btn.addEventListener("click", () => {{
+      const step = parseFloat(btn.dataset.nudge);
+      if (isFinite(step)) setOffset(offset + step);
+    }});
+  }});
+  if (alignBtnEl) {{
+    alignBtnEl.addEventListener("click", () => setAlignArmed(!alignArmed));
+  }}
+  document.addEventListener("keydown", e => {{
+    if (e.key === "Escape" && alignArmed) setAlignArmed(false);
   }});
 
   xAxisModeEl.addEventListener("change", e => {{

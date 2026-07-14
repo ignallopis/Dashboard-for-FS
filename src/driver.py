@@ -1647,7 +1647,11 @@ def run_phase_distribution_fig(
                 hovertemplate=(f"{_PHASE_LABELS[phase]}: " + "%{x:.1f} %<extra>%{y}</extra>"),
             )
         )
-    fig.update_layout(barmode="stack", legend=dict(orientation="h"))
+    fig.update_layout(
+        barmode="stack",
+        legend=dict(orientation="h", yanchor="top", y=-0.3, xanchor="center", x=0.5),
+        margin=dict(b=120),
+    )
     fig.update_xaxes(range=[0, 100])
     return fig, kpis
 
@@ -1700,6 +1704,9 @@ def fastest_lap_speed_map_fig(
     apply_dark_layout(fig)
     fig.update_xaxes(showgrid=False, zeroline=False, visible=False)
     fig.update_yaxes(showgrid=False, zeroline=False, visible=False, scaleanchor="x")
+    # Gate-line legend is overlaid later by the dashboard; anchor it below the
+    # map so it never collides with the centred title at the top.
+    fig.update_layout(legend=dict(orientation="h", yanchor="top", y=-0.02, xanchor="center", x=0.5))
 
     if best_run is None:
         # No valid lap yet (e.g. a manual/autocross file before its gate lines
@@ -4356,7 +4363,10 @@ def main() -> None:
     corner_curvature_fig(dfs).show()
 
 
-def max_braking_g_per_lap_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, dict]:
+def max_braking_g_per_lap_fig(
+    dfs: dict[str, pl.DataFrame],
+    x_mode: str = "laps",
+) -> tuple[go.Figure, dict]:
     """Per-lap peak braking g (robust) and its raising average.
 
     Driver-extraction metric: per lap, the robust hard-braking tail (5th
@@ -4367,7 +4377,11 @@ def max_braking_g_per_lap_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, 
     min_samples_per_lap = 5
     reference_g = -1.79
 
-    fig = make_dark_figure("Max Braking G per Lap", "Lap", "P5 ax during braking [g]")
+    fig = make_dark_figure(
+        "Max Braking G per Lap",
+        "Lap" if x_mode == "laps" else "Lap time [s]",
+        "P5 ax during braking [g]",
+    )
     warnings: list[str] = []
     runs: dict[str, dict[str, float | int]] = {}
     all_laps: list[np.ndarray] = []
@@ -4410,17 +4424,26 @@ def max_braking_g_per_lap_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, 
             warnings.append(f"{run_name}: no valid per-lap braking peaks.")
             continue
 
-        lap_ord = lap_ids[ok]
-        lt_ord = lap_times_s[ok]
-        y_ord = peak_braking_g[ok]
-        samples_ord = brake_samples[ok]
-        raising_avg = np.cumsum(y_ord) / np.arange(1, len(y_ord) + 1)
+        # Raising average is cumulative across laps, so compute it in lap order
+        # (lap_ids are already sorted ascending) before reordering for the axis.
+        lap_ok = lap_ids[ok]
+        lt_ok = lap_times_s[ok]
+        y_ok = peak_braking_g[ok]
+        samples_ok = brake_samples[ok]
+        raising_avg_lap = np.cumsum(y_ok) / np.arange(1, len(y_ok) + 1)
+
+        x_arr, order, _ = per_lap_axis(lap_ok, lt_ok, x_mode)
+        lap_ord = lap_ok[order]
+        lt_ord = lt_ok[order]
+        y_ord = y_ok[order]
+        samples_ord = samples_ok[order]
+        raising_avg = raising_avg_lap[order]
         color = driver_color(run_name)
         customdata = np.column_stack([lap_ord, lt_ord, samples_ord])
 
         fig.add_trace(
             go.Scatter(
-                x=lap_ord,
+                x=x_arr,
                 y=y_ord,
                 mode="lines+markers",
                 name=run_name,
@@ -4438,7 +4461,7 @@ def max_braking_g_per_lap_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, 
         )
         fig.add_trace(
             go.Scatter(
-                x=lap_ord,
+                x=x_arr,
                 y=raising_avg,
                 mode="lines+markers",
                 name=f"{run_name} raising avg",
@@ -4446,20 +4469,21 @@ def max_braking_g_per_lap_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, 
                 line=dict(color=color, width=1.7, dash="dash"),
                 marker=dict(color=color, size=6, symbol="diamond"),
                 opacity=0.90,
-                hovertemplate=("Lap=%{x:.0f}<br>Raising avg=%{y:.3f} g<extra></extra>"),
+                customdata=lap_ord,
+                hovertemplate=("Lap=%{customdata:.0f}<br>Raising avg=%{y:.3f} g<extra></extra>"),
             )
         )
 
-        best_idx = int(np.nanargmin(y_ord))
+        best_idx = int(np.nanargmin(y_ok))
         runs[run_name] = {
-            "valid_laps": int(len(lap_ord)),
-            "best_lap": int(lap_ord[best_idx]),
-            "best_max_braking_g": float(np.nanmin(y_ord)),
-            "mean_max_braking_g": float(np.nanmean(y_ord)),
-            "raising_avg_last_g": float(raising_avg[-1]),
-            "mean_brake_samples": float(np.nanmean(samples_ord)),
+            "valid_laps": int(len(lap_ok)),
+            "best_lap": int(lap_ok[best_idx]),
+            "best_max_braking_g": float(np.nanmin(y_ok)),
+            "mean_max_braking_g": float(np.nanmean(y_ok)),
+            "raising_avg_last_g": float(raising_avg_lap[-1]),
+            "mean_brake_samples": float(np.nanmean(samples_ok)),
         }
-        all_laps.append(lap_ord)
+        all_laps.append(lap_ok)
         y_min = min(y_min, float(np.nanmin(np.concatenate([y_ord, raising_avg]))))
         y_max = max(y_max, float(np.nanmax(np.concatenate([y_ord, raising_avg]))))
 
@@ -4469,7 +4493,7 @@ def max_braking_g_per_lap_fig(dfs: dict[str, pl.DataFrame]) -> tuple[go.Figure, 
         annotation_text="CAT17x design target -1.79 g",
         annotation_position="bottom right",
     )
-    if all_laps:
+    if x_mode == "laps" and all_laps:
         fig.update_xaxes(tickvals=np.unique(np.concatenate(all_laps)).astype(int))
     if np.isfinite(y_min) and np.isfinite(y_max):
         pad = max(0.04, 0.08 * (y_max - y_min))
